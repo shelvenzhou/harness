@@ -68,6 +68,10 @@ export class OpenAIProvider implements LlmProvider {
     const messages = toChatMessages(request.prefix, request.tail);
     const tools = toChatTools(request.prefix);
 
+    // OpenAI renamed `max_tokens` to `max_completion_tokens` for newer
+    // (reasoning) models. `max_completion_tokens` is accepted across all
+    // currently-supported chat-completions models, so we send that
+    // universally.
     const stream = (await this.client.chat.completions.create(
       {
         model: request.model ?? this.model,
@@ -75,7 +79,7 @@ export class OpenAIProvider implements LlmProvider {
         ...(tools.length > 0 ? { tools } : {}),
         stream: true,
         stream_options: { include_usage: true },
-        max_tokens: request.maxTokens ?? this.defaultMaxTokens,
+        max_completion_tokens: request.maxTokens ?? this.defaultMaxTokens,
         temperature: request.temperature ?? this.defaultTemperature,
       },
       { signal },
