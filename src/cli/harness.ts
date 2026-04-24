@@ -7,6 +7,11 @@ import type { LlmProvider } from '@harness/llm/provider.js';
 import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
+import {
+  JsonlDiagSink,
+  StderrDiagSink,
+  type DiagSink,
+} from '@harness/diag/index.js';
 
 /**
  * `harness` CLI. Reads .env for OpenAI credentials; CLI flags override.
@@ -47,10 +52,13 @@ async function main(): Promise<void> {
       ? values['store-root']
       : process.env['HARNESS_STORE_ROOT'];
 
+  const diagSinks = buildDiagSinks();
+
   const runtime = await bootstrap({
     provider,
     systemPrompt,
     ...(storeRoot !== undefined ? { storeRoot } : {}),
+    ...(diagSinks.length > 0 ? { diagSinks } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -96,6 +104,30 @@ function buildProvider(args: BuildProviderArgs): LlmProvider {
   }
 }
 
+/**
+ * Diagnostics are on by default. Disable with HARNESS_DIAG=off.
+ *
+ *   HARNESS_DIAG=off              disable everything
+ *   HARNESS_DIAG_DIR=./diag       JSONL sink root (default .harness/diag)
+ *   HARNESS_DIAG_STDERR=off       disable the stderr summary sink
+ *   HARNESS_DIAG_STDERR=verbose   include replies / reasoning in stderr
+ */
+function buildDiagSinks(): DiagSink[] {
+  if (process.env['HARNESS_DIAG'] === 'off') return [];
+  const sinks: DiagSink[] = [];
+  const dir = process.env['HARNESS_DIAG_DIR'] ?? '.harness/diag';
+  if (dir !== 'off') sinks.push(new JsonlDiagSink({ root: dir }));
+  const stderr = process.env['HARNESS_DIAG_STDERR'];
+  if (stderr !== 'off') {
+    sinks.push(
+      new StderrDiagSink({
+        level: stderr === 'verbose' ? 'verbose' : 'summary',
+      }),
+    );
+  }
+  return sinks;
+}
+
 function envNumber(key: string): number | undefined {
   const raw = process.env[key];
   if (raw === undefined || raw === '') return undefined;
@@ -117,6 +149,9 @@ function printUsage(): void {
       '  HARNESS_PROVIDER     default openai',
       '  HARNESS_SYSTEM_PROMPT',
       '  HARNESS_STORE_ROOT   persist session events to this directory',
+      '  HARNESS_DIAG         off to disable diagnostics',
+      '  HARNESS_DIAG_DIR     JSONL + prompt-dump root (default .harness/diag)',
+      '  HARNESS_DIAG_STDERR  off | summary (default) | verbose',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

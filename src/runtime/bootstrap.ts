@@ -8,6 +8,11 @@ import { createDefaultRegistry } from '@harness/tools/index.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import { ToolExecutor } from '@harness/tools/executor.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
+import {
+  attachDiag,
+  composePromptHook,
+  type DiagSink,
+} from '@harness/diag/index.js';
 
 import { AgentRunner } from './agentRunner.js';
 import { SubagentPool } from './subagentPool.js';
@@ -31,6 +36,10 @@ export interface BootstrapOptions {
   storeRoot?: string;
   registry?: ToolRegistry;
   pinnedMemory?: string[];
+  /**
+   * Diagnostic sinks. Each sees every bus event and the prompt hook.
+   */
+  diagSinks?: DiagSink[];
 }
 
 export interface Runtime {
@@ -42,6 +51,7 @@ export interface Runtime {
   subagents: SubagentPool;
   rootThreadId: ThreadId;
   runner: AgentRunner;
+  diag?: { stop: () => Promise<void> };
 }
 
 export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
@@ -58,6 +68,15 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     rootTraceparent: newRootTraceparent(),
   });
 
+  const diag =
+    opts.diagSinks && opts.diagSinks.length > 0
+      ? attachDiag({ bus, sinks: opts.diagSinks })
+      : undefined;
+  const onPromptBuilt =
+    opts.diagSinks && opts.diagSinks.length > 0
+      ? composePromptHook(opts.diagSinks)
+      : undefined;
+
   const subagents = new SubagentPool({
     bus,
     store,
@@ -65,9 +84,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     executor,
     provider: opts.provider,
     systemPromptFor: (role) =>
-      role
-        ? `${opts.systemPrompt}\n\n[role: ${role}]`
-        : opts.systemPrompt,
+      role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
   });
 
   const runner = new AgentRunner({
@@ -79,9 +96,20 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPrompt: opts.systemPrompt,
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
+    ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
     onSpawn: (req) => subagents.spawn(req),
   });
   runner.start();
 
-  return { bus, store, registry, executor, provider: opts.provider, subagents, rootThreadId, runner };
+  return {
+    bus,
+    store,
+    registry,
+    executor,
+    provider: opts.provider,
+    subagents,
+    rootThreadId,
+    runner,
+    ...(diag !== undefined ? { diag } : {}),
+  };
 }

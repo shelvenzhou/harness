@@ -27,6 +27,7 @@ export type EventKind =
   | 'timer_fired'
   | 'external_event'
   | 'turn_complete'
+  | 'sampling_complete'
   | 'compaction_event'
   | 'rollback_marker';
 
@@ -155,6 +156,27 @@ export interface TurnCompletePayload {
 }
 export type TurnCompleteEvent = EventBase<'turn_complete', TurnCompletePayload>;
 
+export interface SamplingCompletePayload {
+  samplingIndex: number;
+  providerId: string;
+  model?: string;
+  promptTokens: number;
+  cachedPromptTokens: number;
+  completionTokens: number;
+  wallMs: number;
+  ttftMs?: number;
+  stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error';
+  projection: {
+    projectedItems: number;
+    elidedCount: number;
+    estimatedTokens: number;
+    pinnedHandles: number;
+  };
+  toolCallCount: number;
+  promptDumpPath?: string;
+}
+export type SamplingCompleteEvent = EventBase<'sampling_complete', SamplingCompletePayload>;
+
 export interface CompactionEventPayload {
   reason: 'auto' | 'manual' | 'tool-change';
   tokensBefore: number;
@@ -191,6 +213,7 @@ export type HarnessEvent =
   | TimerFiredEvent
   | ExternalEventEvent
   | TurnCompleteEvent
+  | SamplingCompleteEvent
   | CompactionEventEvent
   | RollbackMarkerEvent;
 
@@ -217,6 +240,7 @@ export const DATA_PLANE_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
   'timer_fired',
   'external_event',
   'turn_complete',
+  'sampling_complete',
   'compaction_event',
   'rollback_marker',
 ]);

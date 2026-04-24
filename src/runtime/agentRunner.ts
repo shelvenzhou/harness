@@ -52,6 +52,16 @@ export interface AgentRunnerOptions {
   systemPrompt: string;
   pinnedMemory?: string[];
   /**
+   * Called before each sampling request. Use to persist or tee the
+   * exact prompt going to the provider. Return a path (or any id) and
+   * the runner will include it in the `sampling_complete` event.
+   */
+  onPromptBuilt?: (
+    ctx: { threadId: ThreadId; turnId: TurnId; samplingIndex: number },
+    request: SamplingRequest,
+    stats: { projectedItems: number; elidedCount: number; estimatedTokens: number; pinnedHandles: number },
+  ) => Promise<string | undefined> | string | undefined;
+  /**
    * Called when the runner wants to spawn a child. Injected so subagent-
    * pool behaviour (budgets, shared bus, traceparent propagation) is
    * decided externally.
@@ -76,6 +86,7 @@ export class AgentRunner {
   private tickInFlight = false;
   private tickPending = false;
   private abortCtl: AbortController | undefined;
+  private samplingIndex = 0;
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
@@ -157,11 +168,22 @@ export class AgentRunner {
     const at = this.activeTurn;
     at.toRunning();
     this.abortCtl = new AbortController();
+    this.samplingIndex += 1;
 
-    const request = await this.buildRequest();
+    const { request, stats } = await this.buildRequestWithStats();
+    const promptDumpPath = this.opts.onPromptBuilt
+      ? await this.opts.onPromptBuilt(
+          { threadId: this.opts.threadId, turnId: at.turnId, samplingIndex: this.samplingIndex },
+          request,
+          stats,
+        )
+      : undefined;
+
+    const startedAt = Date.now();
     const parsed = await parseSampling(
       this.opts.provider.sample(request, this.abortCtl.signal),
     );
+    const wallMs = Date.now() - startedAt;
     this.handles.clearPins();
 
     // Record reasoning if emitted.
@@ -179,6 +201,26 @@ export class AgentRunner {
       at.pushActionInFlight(action);
       await this.dispatchAction(action, pendingToolCalls);
     }
+
+    // Emit sampling_complete with usage + projection stats so the diag
+    // layer (and anyone else subscribed) can build a full trace.
+    await this.appendEvent({
+      kind: 'sampling_complete',
+      payload: {
+        samplingIndex: this.samplingIndex,
+        providerId: this.opts.provider.id,
+        promptTokens: parsed.usage?.promptTokens ?? 0,
+        cachedPromptTokens: parsed.usage?.cachedPromptTokens ?? 0,
+        completionTokens: parsed.usage?.completionTokens ?? 0,
+        wallMs,
+        ...(parsed.ttftMs !== undefined ? { ttftMs: parsed.ttftMs } : {}),
+        ...(parsed.stopReason !== undefined ? { stopReason: parsed.stopReason } : {}),
+        projection: stats,
+        toolCallCount: pendingToolCalls.length,
+        ...(promptDumpPath !== undefined ? { promptDumpPath } : {}),
+      },
+      ...(at.turnId !== undefined ? { turnId: at.turnId } : {}),
+    });
 
     if (pendingToolCalls.length > 0) {
       at.toAwaitingTools(pendingToolCalls.map((p) => p.toolCallId));
@@ -202,8 +244,11 @@ export class AgentRunner {
     }
   }
 
-  private async buildRequest(): Promise<SamplingRequest> {
-    const { request } = await buildSamplingRequest({
+  private async buildRequestWithStats(): Promise<{
+    request: SamplingRequest;
+    stats: { projectedItems: number; elidedCount: number; estimatedTokens: number; pinnedHandles: number };
+  }> {
+    const built = await buildSamplingRequest({
       threadId: this.opts.threadId,
       store: this.opts.store,
       registry: this.opts.registry,
@@ -211,7 +256,7 @@ export class AgentRunner {
       systemPrompt: this.opts.systemPrompt,
       pinnedMemory: this.opts.pinnedMemory ?? [],
     });
-    return request;
+    return { request: built.request, stats: built.stats };
   }
 
   private async dispatchAction(

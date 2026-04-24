@@ -17,6 +17,8 @@ export interface ParsedSampling {
   /** Concatenated reasoning text (if any). Kept separate from reply actions. */
   reasoningText: string;
   stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error';
+  usage?: { promptTokens: number; cachedPromptTokens: number; completionTokens: number };
+  ttftMs?: number;
 }
 
 export async function parseSampling(
@@ -28,6 +30,9 @@ export async function parseSampling(
   const toolCallsInFlight = new Map<ToolCallId, { name: string; args?: unknown }>();
   const actions: Action[] = [];
   let stopReason: ParsedSampling['stopReason'];
+  let usage: ParsedSampling['usage'];
+  const startedAt = Date.now();
+  let firstByteAt: number | undefined;
 
   const flushReply = (): void => {
     if (!replyBuf) return;
@@ -41,6 +46,9 @@ export async function parseSampling(
   };
 
   for await (const delta of stream) {
+    if (firstByteAt === undefined && delta.kind !== 'usage' && delta.kind !== 'end') {
+      firstByteAt = Date.now();
+    }
     switch (delta.kind) {
       case 'text_delta': {
         // Channel change forces a flush so the two chunks don't merge.
@@ -76,7 +84,7 @@ export async function parseSampling(
         break;
       }
       case 'usage':
-        // Usage is collected by the diagnostics layer; ignored here.
+        usage = { ...delta.tokens };
         break;
       case 'end':
         stopReason = delta.stopReason;
@@ -102,6 +110,8 @@ export async function parseSampling(
     actions,
     reasoningText: reasoningBuf,
     ...(stopReason !== undefined ? { stopReason } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+    ...(firstByteAt !== undefined ? { ttftMs: firstByteAt - startedAt } : {}),
   };
 }
 

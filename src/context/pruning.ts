@@ -141,6 +141,7 @@ function projectEvent(
     case 'timer_fired':
     case 'external_event':
     case 'turn_complete':
+    case 'sampling_complete':
     case 'compaction_event':
     case 'rollback_marker':
       return null;
