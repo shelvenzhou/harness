@@ -4,18 +4,23 @@ import type { LlmProvider } from '@harness/llm/provider.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
-import type { ThreadId } from '@harness/core/ids.js';
+import { newEventId, newThreadId } from '@harness/core/ids.js';
+import type { ThreadId, TurnId } from '@harness/core/ids.js';
+import type { HarnessEvent, SubtaskCompletePayload } from '@harness/core/events.js';
 
 import { AgentRunner, type SpawnRequestInfo } from './agentRunner.js';
 
 /**
- * Subagent pool skeleton. Phase 1 behaviour: `spawn` creates a child
- * thread + AgentRunner, wires it to the same bus/store/provider, and
- * returns its threadId. The parent receives `subtask_complete` via the
- * bus when the child's turn ends.
+ * Subagent pool.
+ *
+ * `spawn` creates a child thread + AgentRunner sharing the parent's
+ * bus/store/provider/registry, seeds it with a `user_turn_start`, and
+ * returns its threadId. When the child emits `turn_complete`, the pool
+ * translates it into a `subtask_complete` event on the *parent* thread
+ * so the parent's AgentRunner can pick it up on its next tick.
  *
  * Budgets (`maxTurns / maxToolCalls / maxWallMs`) are recorded but not
- * yet enforced. That lands in phase 2.
+ * yet enforced. `inheritTurns` not yet implemented.
  */
 
 export interface SubagentPoolDeps {
@@ -27,13 +32,34 @@ export interface SubagentPoolDeps {
   systemPromptFor: (role: string | undefined) => string;
 }
 
+interface ChildRecord {
+  runner: AgentRunner;
+  parentThreadId: ThreadId;
+  parentTurnId: TurnId;
+  role?: string;
+  startedAt: number;
+}
+
 export class SubagentPool {
-  private children = new Map<ThreadId, AgentRunner>();
+  private children = new Map<ThreadId, ChildRecord>();
+  private subscribed = false;
 
   constructor(private readonly deps: SubagentPoolDeps) {}
 
+  private ensureSubscribed(): void {
+    if (this.subscribed) return;
+    this.subscribed = true;
+    // One global subscription; it filters for turn_complete on known
+    // child threads and routes a subtask_complete event to the parent.
+    this.deps.bus.subscribe(
+      (ev) => this.onEvent(ev),
+      { kinds: ['turn_complete'] },
+    );
+  }
+
   async spawn(req: SpawnRequestInfo): Promise<ThreadId> {
-    const childThreadId = (`thr_${randomSuffix()}` as string) as ThreadId;
+    this.ensureSubscribed();
+    const childThreadId = newThreadId();
     const traceparent = req.parentTraceparent ?? newRootTraceparent();
     await this.deps.store.createThread({
       id: childThreadId,
@@ -42,8 +68,7 @@ export class SubagentPool {
       ...(req.role !== undefined ? { title: req.role } : {}),
     });
 
-    // Seed the child with the task as a user_turn_start.
-    await this.deps.store.append({
+    const seed = await this.deps.store.append({
       threadId: childThreadId,
       kind: 'user_turn_start',
       payload: { text: req.task },
@@ -61,20 +86,51 @@ export class SubagentPool {
       onSpawn: (inner) => this.spawn(inner),
     });
     runner.start();
-    this.children.set(childThreadId, runner);
+    this.children.set(childThreadId, {
+      runner,
+      parentThreadId: req.parentThreadId,
+      parentTurnId: req.parentTurnId,
+      ...(req.role !== undefined ? { role: req.role } : {}),
+      startedAt: Date.now(),
+    });
 
-    // Nudge the child runner by republishing the seed event on the bus.
-    const seeds = await this.deps.store.readAll(childThreadId);
-    if (seeds.length > 0) this.deps.bus.publish(seeds[seeds.length - 1]!);
-
+    // Nudge the child runner by publishing the seed event.
+    this.deps.bus.publish(seed);
     return childThreadId;
+  }
+
+  private async onEvent(event: HarnessEvent): Promise<void> {
+    if (event.kind !== 'turn_complete') return;
+    const record = this.children.get(event.threadId);
+    if (!record) return; // Not one of our children — probably a root turn.
+    this.children.delete(event.threadId);
+
+    const p = event.payload as { status: string; summary?: string };
+    const status: SubtaskCompletePayload['status'] =
+      p.status === 'completed'
+        ? 'completed'
+        : p.status === 'errored'
+          ? 'errored'
+          : 'interrupted';
+
+    const evOut: HarnessEvent = {
+      id: newEventId(),
+      threadId: record.parentThreadId,
+      turnId: record.parentTurnId,
+      kind: 'subtask_complete',
+      payload: {
+        childThreadId: event.threadId,
+        status,
+        ...(p.summary !== undefined ? { summary: p.summary } : {}),
+      } satisfies SubtaskCompletePayload,
+      createdAt: new Date().toISOString(),
+    } as HarnessEvent;
+
+    await this.deps.store.append(evOut);
+    this.deps.bus.publish(evOut);
   }
 
   get childCount(): number {
     return this.children.size;
   }
-}
-
-function randomSuffix(): string {
-  return Math.random().toString(16).slice(2, 14);
 }
