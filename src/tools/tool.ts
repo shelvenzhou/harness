@@ -62,9 +62,17 @@ import { zodToJsonSchema } from './zodToJsonSchema.js';
 import type { ToolSpec } from '@harness/llm/provider.js';
 
 export function toToolSpec(tool: Tool): ToolSpec {
+  const raw = zodToJsonSchema(tool.schema) as Record<string, unknown>;
+  // OpenAI function-calling (and most tool-use APIs) require the top-level
+  // parameters schema to be an object. If a tool's root schema produced
+  // something else (e.g. a union), wrap it.
+  const argsSchema =
+    raw && typeof raw === 'object' && raw['type'] === 'object'
+      ? raw
+      : { type: 'object', properties: {}, additionalProperties: true };
   return {
     name: tool.name,
     description: tool.description,
-    argsSchema: zodToJsonSchema(tool.schema),
+    argsSchema,
   };
 }
