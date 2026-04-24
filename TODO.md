@@ -10,7 +10,8 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 
 ## LLM providers
 
-- 🟡 **OpenAIProvider** — real streaming + tool calls working. Missing:
+- 🟡 **OpenAIProvider** — real streaming + tool calls + usage reporting
+  (prompt/completion/cached tokens) working. Missing:
   - ⚪ `reasoning_delta` emission (newer reasoning models have a
     `reasoning` field; currently dropped).
   - ⚪ preamble heuristic: channel is always `reply`; detect the
@@ -53,31 +54,36 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     sampling request is not cancelled with user-visible feedback yet.
   - ⚪ `rollback` / `fork` event handling — events are filtered out of
     projection but the runner does not respond to them.
-- 🟡 **SubagentPool** — `spawn` creates a child and returns its id.
+- 🟡 **SubagentPool** — `spawn` creates a child, returns its id, and
+  parent receives `subtask_complete` when the child's turn ends.
   Missing:
   - ⚪ Budget enforcement (`maxTurns`/`maxToolCalls`/`maxWallMs`).
   - ⚪ `inheritTurns` — currently unused; child always starts fresh.
-  - ⚪ Parent `subtask_complete` delivery — child emits `turn_complete`
-    but the pool doesn't translate that into the parent's event stream.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
+  - ⚪ Child abort when parent is interrupted / its turn ends first.
 - ⚪ **Scheduler** — class exists, not wired to `wait(timer)` actions;
   no cron.
 
 ## Tools
 
-- 🔴 **`shell`** — stub; returns `[stub-shell] would run: …`. Phase 2:
-  `child_process.spawn` with cwd / env / timeout / byte-cap.
+- 🟡 **`shell`** — real. `child_process.spawn` with cwd / timeout / byte-cap
+  / signal-group kill / handle elision. Missing: custom env passthrough,
+  stream progress events (tools can't emit intermediate events today),
+  explicit stdin support.
 - 🟡 **`write`** — overwrite mode real; `mode: 'patch'` returns
   `not_implemented`.
-- 🔴 **`web_fetch`** — stub; returns placeholder body.
-- 🔴 **`web_search`** — stub; returns empty results.
+- 🟡 **`web_fetch`** — real (undici fetch). GET/HEAD, byte cap, timeout,
+  handle elision. Missing: auth headers, POST body, pluggable transport.
+- 🔴 **`web_search`** — still a stub; needs a search backend adapter
+  (Brave / Google / DDG).
 - 🟡 **`memory`** — in-process kv + `list` real; `search` is a stub.
   Not persistent; does not survive process restart.
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟡 **`wait`** — schema + tool-call accepted; actual yield semantics
   missing (see runtime).
-- 🟡 **`spawn`** — composition works; budget / inheritTurns unused.
+- 🟡 **`spawn`** — composition works, parent sees subtask_complete.
+  Missing: budget enforcement, `inheritTurns`.
 
 ## Store
 
@@ -116,12 +122,11 @@ See commit B for what just landed. Still missing:
 
 ## Testing
 
-- 🟡 **Unit tests** — 23 passing; gaps:
+- 🟡 **Unit + smoke tests** — 41 active, 2 e2e skipped. Gaps:
   - ⚪ `HandleRegistry` pinning / clearPins semantics.
   - ⚪ `promptDebug.renderPromptText` snapshot.
   - ⚪ `Scheduler` timer firing + cancellation.
-  - ⚪ `SubagentPool.spawn` end-to-end (parent sees `subtask_complete`).
-- 🟡 **Smoke tests** — 2 passing; needs one for compaction round-trip.
+  - ⚪ Compaction round-trip smoke test.
 - 🟡 **E2E** — 1 real OpenAI round-trip; add one that exercises a tool
   call through the model.
 
