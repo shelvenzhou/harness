@@ -14,10 +14,26 @@ This repository is the implementation sibling of the design notes in
 
 ## Status
 
-Scaffolding phase. The goal at this stage is to land the **full architecture
-surface + interfaces**, with a single working terminal adapter and a mock LLM
-provider, so that subsequent work (real LLM integration, Discord adapter, real
-shell tools, sandboxing) slots into stable extension points.
+**Phase 1 — architecture landing.** Every box in the diagram exists in code
+with a typed interface. Current state:
+
+- ✅ Event bus, session store (memory + JSONL), action / event protocol types
+- ✅ `ActiveTurn` state machine + two-phase mailbox (`CurrentTurn` /
+  `NextTurn`) matching Codex's model
+- ✅ LLM provider interface; mock provider works end-to-end; Anthropic skeleton
+- ✅ 9 primitive tools stubbed or minimally real (`shell`/`web_*` are stubs;
+  `read`/`write`/`memory` are real enough for tests)
+- ✅ Context projection + handle registry; deterministic Level-1 pruning
+  rules; static compactor stub
+- ✅ AgentRunner: event-driven action loop with spawn / wait / restore
+  intercepted as transport tools
+- ✅ Terminal adapter + CLI; smoke-tested end-to-end
+- ✅ 28 unit/smoke tests green; e2e scaffolding skipped behind `HARNESS_E2E=1`
+
+**Phase 2** (next) implements real streaming Anthropic support, real `shell`
+via `child_process`, unified-patch mode for `write`, and replaces the static
+compactor with a subagent-spawn compactor. See
+[design-docs/08-roadmap.md](design-docs/08-roadmap.md).
 
 ## Architecture at a glance
 
@@ -83,25 +99,76 @@ E2E tests that hit real LLMs are skipped unless you set `HARNESS_E2E=1`:
 HARNESS_E2E=1 ANTHROPIC_API_KEY=sk-... pnpm test:e2e
 ```
 
+## Walkthrough: what happens on a user turn
+
+Phase 1 mock-provider path, end-to-end:
+
+1. User types `hello` in the terminal.
+2. [`TerminalAdapter`](src/adapters/terminal.ts) appends a `user_turn_start`
+   event to the [`SessionStore`](src/store/sessionStore.ts) and publishes it
+   on the [`EventBus`](src/bus/eventBus.ts).
+3. [`AgentRunner`](src/runtime/agentRunner.ts) is subscribed for that thread.
+   Its tick loads the store, runs
+   [`buildSamplingRequest`](src/context/projection.ts) to produce a
+   cache-friendly `SamplingRequest` (stable prefix + pruned tail), and calls
+   the [`LlmProvider.sample`](src/llm/provider.ts) async iterable.
+4. [`parseSampling`](src/llm/actionParser.ts) turns the delta stream into an
+   `Action[]` — `reply`, `preamble`, `tool_call`, etc.
+5. For each action the runner appends an event AND publishes it. Tool calls
+   go through the [`ToolExecutor`](src/tools/executor.ts); `tool_result`
+   events come back asynchronously and drive the next tick.
+6. Terminal adapter's subscription renders replies/preambles to stdout.
+
+No hard-coded loop in the runner — each tick is driven by a matching event.
+
 ## Tutorial: adding a new tool
 
 See [design-docs/03-tools.md](design-docs/03-tools.md#adding-a-tool). The short
 version:
 
-1. Create `src/tools/<name>.ts` exporting a `Tool` object with `name`, `schema`
-   (zod), `description` (including LLM-facing decision hints), and an `execute`
-   implementation.
-2. Register it in `src/tools/registry.ts`.
-3. Unit-test it under `tests/unit/tools/<name>.test.ts`.
+1. Create `src/tools/impl/<name>.ts` exporting a `Tool` object with `name`,
+   `schema` (zod), `description` (including LLM-facing decision hints), and
+   an `execute` implementation. Use `ctx.registerHandle()` to stash large
+   payloads so the tool result can be elided with a handle.
+2. Re-export it from [`src/tools/impl/index.ts`](src/tools/impl/index.ts) and
+   add it to [`createDefaultRegistry`](src/tools/index.ts) (or a per-turn
+   registry if the tool is opt-in).
+3. Unit-test under `tests/unit/tools/<name>.test.ts`; exercise schema,
+   execution, and elision.
 
 Tools are the extension surface. The harness itself should not grow new hard
 wiring — new capabilities compose existing primitives or register as a tool.
 
 ## Tutorial: adding a new adapter (e.g. Discord)
 
-See [design-docs/06-adapters.md](design-docs/06-adapters.md). The adapter
-implements a small interface (`inbox` produces user events, `deliver` consumes
-reply events) and is wired up by the CLI or a dedicated entry binary.
+See [design-docs/06-adapters.md](design-docs/06-adapters.md). The shape:
+
+```ts
+import type { Adapter, AdapterStartOptions } from '@harness/adapters';
+
+export class DiscordAdapter implements Adapter {
+  readonly id = 'discord';
+  async start(opts: AdapterStartOptions): Promise<void> {
+    // 1. connect to Discord
+    // 2. on incoming message: append user_turn_start or user_input to
+    //    the SessionStore and publish on opts.bus
+    // 3. subscribe to reply / preamble / turn_complete for your threads
+    //    and render them back to Discord
+  }
+  async stop(): Promise<void> { /* tear down */ }
+}
+```
+
+The runtime never learns Discord exists. A new entry binary under `src/cli/`
+wires `bootstrap()` to an instance of your adapter.
+
+## Tutorial: swapping the LLM provider
+
+Implement [`LlmProvider`](src/llm/provider.ts) — one method, `sample(request,
+signal)` returning an `AsyncIterable<SamplingDelta>`. See
+[`MockProvider`](src/llm/mockProvider.ts) for the minimal shape. The phase-2
+[`AnthropicProvider`](src/llm/anthropicProvider.ts) lands streaming +
+`cache_control` + `cache_edits`.
 
 ## Layout
 
