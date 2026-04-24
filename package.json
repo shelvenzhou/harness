@@ -1,0 +1,39 @@
+{
+  "name": "@harness/runtime",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AI-native general-purpose agent runtime. LLM is the router; harness provides minimal tools, async loops, context management.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "harness": "./dist/cli/harness.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli/harness.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --max-warnings=0 \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:smoke": "vitest run tests/smoke",
+    "test:e2e": "HARNESS_E2E=1 vitest run tests/e2e"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@typescript-eslint/eslint-plugin": "^7.10.0",
+    "@typescript-eslint/parser": "^7.10.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.11.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
