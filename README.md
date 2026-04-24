@@ -20,7 +20,8 @@ with a typed interface. Current state:
 - ✅ Event bus, session store (memory + JSONL), action / event protocol types
 - ✅ `ActiveTurn` state machine + two-phase mailbox (`CurrentTurn` /
   `NextTurn`) matching Codex's model
-- ✅ LLM provider interface; mock provider works end-to-end; Anthropic skeleton
+- ✅ LLM provider interface; OpenAI-compatible provider (real streaming +
+  tool calls), works against any OpenAI-compatible endpoint via `OPENAI_BASE_URL`
 - ✅ 9 primitive tools stubbed or minimally real (`shell`/`web_*` are stubs;
   `read`/`write`/`memory` are real enough for tests)
 - ✅ Context projection + handle registry; deterministic Level-1 pruning
@@ -87,16 +88,29 @@ anchor points.
 
 ```bash
 pnpm install
+cp .env.example .env      # fill in OPENAI_API_KEY at minimum
 pnpm typecheck
 pnpm test:unit
-pnpm dev                 # terminal REPL against mock LLM provider
+pnpm dev                  # terminal REPL against the configured provider
 ```
 
-Set `HARNESS_PROVIDER=anthropic` and `ANTHROPIC_API_KEY=…` to use Claude.
-E2E tests that hit real LLMs are skipped unless you set `HARNESS_E2E=1`:
+Configuration is read from `.env` (see [.env.example](.env.example)):
+
+| var                  | purpose                                               |
+|----------------------|-------------------------------------------------------|
+| `OPENAI_API_KEY`     | required                                              |
+| `OPENAI_MODEL`       | default `gpt-4o-mini`                                 |
+| `OPENAI_BASE_URL`    | override for Azure / OpenRouter / vLLM / Ollama etc.  |
+| `OPENAI_MAX_TOKENS`  | default 1024                                          |
+| `OPENAI_TEMPERATURE` | default 0.7                                           |
+| `HARNESS_STORE_ROOT` | persist session events to this directory              |
+
+CLI flags override env: `pnpm dev -- --model gpt-4o --base-url https://…`.
+
+E2E tests that hit the real API are skipped unless you set `HARNESS_E2E=1`:
 
 ```bash
-HARNESS_E2E=1 ANTHROPIC_API_KEY=sk-... pnpm test:e2e
+HARNESS_E2E=1 pnpm test:e2e
 ```
 
 ## Walkthrough: what happens on a user turn

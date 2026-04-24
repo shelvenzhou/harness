@@ -23,7 +23,8 @@
     "test:e2e": "HARNESS_E2E=1 vitest run tests/e2e"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.40.0",
+    "dotenv": "^17.4.2",
+    "openai": "^6.34.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

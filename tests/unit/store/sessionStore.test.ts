@@ -43,7 +43,7 @@ describe('MemorySessionStore', () => {
     const ev = await store.append({
       threadId: tid,
       kind: 'tool_result',
-      payload: { toolCallId: 'tc_1', ok: true, output: 'x' },
+      payload: { toolCallId: 'tc_1' as never, ok: true, output: 'x' },
     });
     await store.attachElision(tid, ev.id, {
       handle: newHandleRef(),

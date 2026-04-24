@@ -26,7 +26,7 @@ export interface BootstrapOptions {
   /**
    * If set, events are persisted to <storeRoot>/<threadId>/events.jsonl in
    * addition to the in-memory store; otherwise the store is purely
-   * in-memory (fine for the mock REPL).
+   * in-memory (fine for short-lived REPL sessions).
    */
   storeRoot?: string;
   registry?: ToolRegistry;

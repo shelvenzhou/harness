@@ -1,17 +1,15 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 
-import { AnthropicProvider } from '@harness/llm/anthropicProvider.js';
-import { MockProvider } from '@harness/llm/mockProvider.js';
-import type { LlmProvider, SamplingDelta } from '@harness/llm/provider.js';
+import 'dotenv/config';
+
+import type { LlmProvider } from '@harness/llm/provider.js';
+import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
 
 /**
- * `harness` CLI.
- *
- * Phase 1: a thin REPL that wires MockProvider (or AnthropicProvider)
- * through a terminal adapter. Enough to verify the full event path.
+ * `harness` CLI. Reads .env for OpenAI credentials; CLI flags override.
  */
 
 async function main(): Promise<void> {
@@ -19,6 +17,7 @@ async function main(): Promise<void> {
     options: {
       provider: { type: 'string' },
       model: { type: 'string' },
+      'base-url': { type: 'string' },
       system: { type: 'string' },
       'store-root': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -31,17 +30,27 @@ async function main(): Promise<void> {
     return;
   }
 
-  const providerName = values.provider ?? process.env['HARNESS_PROVIDER'] ?? 'mock';
-  const provider = buildProvider(providerName, typeof values.model === 'string' ? values.model : undefined);
+  const providerName = values.provider ?? process.env['HARNESS_PROVIDER'] ?? 'openai';
+  const provider = buildProvider({
+    name: providerName,
+    ...(typeof values.model === 'string' ? { model: values.model } : {}),
+    ...(typeof values['base-url'] === 'string' ? { baseURL: values['base-url'] } : {}),
+  });
+
   const systemPrompt =
     typeof values.system === 'string'
       ? values.system
-      : 'You are a helpful agent. Respond concisely.';
+      : (process.env['HARNESS_SYSTEM_PROMPT'] ?? 'You are a helpful agent. Respond concisely.');
+
+  const storeRoot =
+    typeof values['store-root'] === 'string'
+      ? values['store-root']
+      : process.env['HARNESS_STORE_ROOT'];
 
   const runtime = await bootstrap({
     provider,
     systemPrompt,
-    ...(typeof values['store-root'] === 'string' ? { storeRoot: values['store-root'] } : {}),
+    ...(storeRoot !== undefined ? { storeRoot } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -55,54 +64,59 @@ async function main(): Promise<void> {
   );
 }
 
-function buildProvider(name: string, model?: string): LlmProvider {
-  switch (name) {
-    case 'mock':
-      return demoMockProvider();
-    case 'anthropic': {
-      const apiKey = process.env['ANTHROPIC_API_KEY'];
+interface BuildProviderArgs {
+  name: string;
+  model?: string;
+  baseURL?: string;
+}
+
+function buildProvider(args: BuildProviderArgs): LlmProvider {
+  switch (args.name) {
+    case 'openai': {
+      const apiKey = process.env['OPENAI_API_KEY'];
       if (!apiKey) {
-        throw new Error('ANTHROPIC_API_KEY is required for provider=anthropic');
+        throw new Error(
+          'OPENAI_API_KEY is required. Copy .env.example to .env and fill it in.',
+        );
       }
-      return new AnthropicProvider({
+      const model = args.model ?? process.env['OPENAI_MODEL'];
+      const baseURL = args.baseURL ?? process.env['OPENAI_BASE_URL'];
+      const maxTokens = envNumber('OPENAI_MAX_TOKENS');
+      const temperature = envNumber('OPENAI_TEMPERATURE');
+      return new OpenAIProvider({
         apiKey,
         ...(model !== undefined ? { model } : {}),
+        ...(baseURL !== undefined ? { baseURL } : {}),
+        ...(maxTokens !== undefined ? { defaultMaxTokens: maxTokens } : {}),
+        ...(temperature !== undefined ? { defaultTemperature: temperature } : {}),
       });
     }
     default:
-      throw new Error(`unknown provider: ${name}`);
+      throw new Error(`unknown provider: ${args.name}`);
   }
 }
 
-/**
- * Scripted mock provider that echoes the user's latest text and ends the
- * turn. Good enough to verify the event loop end-to-end without a real API.
- */
-function demoMockProvider(): MockProvider {
-  return new MockProvider({
-    react: (req) => {
-      const last = req.tail[req.tail.length - 1];
-      const text =
-        last?.content.find(
-          (c): c is { kind: 'text'; text: string } => c.kind === 'text',
-        )?.text ?? '(no input)';
-      const deltas: SamplingDelta[] = [
-        { kind: 'text_delta', text: `mock: I heard "${text}".`, channel: 'reply' },
-        { kind: 'end', stopReason: 'end_turn' },
-      ];
-      return deltas;
-    },
-  });
+function envNumber(key: string): number | undefined {
+  const raw = process.env[key];
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function printUsage(): void {
   process.stdout.write(
     [
-      'Usage: harness [--provider mock|anthropic] [--model <id>] [--system <prompt>] [--store-root <dir>]',
+      'Usage: harness [--provider openai] [--model <id>] [--base-url <url>] [--system <prompt>] [--store-root <dir>]',
       '',
-      'Environment:',
-      '  HARNESS_PROVIDER     default provider id',
-      '  ANTHROPIC_API_KEY    required when provider=anthropic',
+      'Environment (also loaded from .env):',
+      '  OPENAI_API_KEY       required',
+      '  OPENAI_MODEL         default gpt-4o-mini',
+      '  OPENAI_BASE_URL      override endpoint (OpenAI-compatible)',
+      '  OPENAI_MAX_TOKENS    default 1024',
+      '  OPENAI_TEMPERATURE   default 0.7',
+      '  HARNESS_PROVIDER     default openai',
+      '  HARNESS_SYSTEM_PROMPT',
+      '  HARNESS_STORE_ROOT   persist session events to this directory',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',
