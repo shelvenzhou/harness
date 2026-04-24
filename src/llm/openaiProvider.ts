@@ -94,16 +94,39 @@ export class OpenAIProvider implements LlmProvider {
       began: boolean;
     }
     const partials = new Map<number, PartialToolCall>();
-    let finalUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+    // With `stream_options.include_usage: true`, OpenAI sends the usage
+    // chunk AFTER the chunk that carries finish_reason (as a standalone
+    // chunk with no `choices`). Defer the `end` delta until the loop
+    // closes so we can emit `usage` first.
+    let finalUsage:
+      | {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          prompt_tokens_details?: { cached_tokens?: number };
+        }
+      | undefined;
+    let pendingStop: ReturnType<typeof mapStopReason> | undefined;
+    let toolEndsEmitted = false;
+
+    const emitToolEndsOnce = function* (): Generator<SamplingDelta> {
+      if (toolEndsEmitted) return;
+      toolEndsEmitted = true;
+      for (const p of partials.values()) {
+        if (!p.began) continue;
+        yield {
+          kind: 'tool_call_end',
+          toolCallId: p.id,
+          args: tryParseJson(p.argsText),
+        };
+      }
+    };
 
     try {
       for await (const chunk of stream) {
         if (signal.aborted) return;
+        if (chunk.usage) finalUsage = chunk.usage;
         const choice = chunk.choices[0];
-        if (!choice) {
-          if (chunk.usage) finalUsage = chunk.usage;
-          continue;
-        }
+        if (!choice) continue;
         const delta = choice.delta;
         if (delta?.content) {
           yield { kind: 'text_delta', text: delta.content, channel: 'reply' };
@@ -139,32 +162,30 @@ export class OpenAIProvider implements LlmProvider {
           }
         }
         if (choice.finish_reason) {
-          for (const p of partials.values()) {
-            if (!p.began) continue;
-            yield {
-              kind: 'tool_call_end',
-              toolCallId: p.id,
-              args: tryParseJson(p.argsText),
-            };
-          }
-          if (finalUsage) {
-            yield {
-              kind: 'usage',
-              tokens: {
-                promptTokens: finalUsage.prompt_tokens ?? 0,
-                cachedPromptTokens: 0,
-                completionTokens: finalUsage.completion_tokens ?? 0,
-              },
-            };
-          }
-          yield { kind: 'end', stopReason: mapStopReason(choice.finish_reason) };
+          pendingStop = mapStopReason(choice.finish_reason);
+          for (const d of emitToolEndsOnce()) yield d;
+          // Don't yield `end` yet — wait for the trailing usage chunk.
         }
-        if (chunk.usage) finalUsage = chunk.usage;
       }
     } catch (err) {
       if ((err as { name?: string }).name === 'AbortError') return;
       throw err;
     }
+
+    // Stream closed — emit any tool_call_ends we missed (defensive), the
+    // usage if it arrived, and the terminal `end`.
+    for (const d of emitToolEndsOnce()) yield d;
+    if (finalUsage) {
+      yield {
+        kind: 'usage',
+        tokens: {
+          promptTokens: finalUsage.prompt_tokens ?? 0,
+          cachedPromptTokens: finalUsage.prompt_tokens_details?.cached_tokens ?? 0,
+          completionTokens: finalUsage.completion_tokens ?? 0,
+        },
+      };
+    }
+    yield { kind: 'end', stopReason: pendingStop ?? 'end_turn' };
   }
 }
 
