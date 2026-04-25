@@ -6,6 +6,7 @@ import 'dotenv/config';
 import type { LlmProvider } from '@harness/llm/provider.js';
 import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
 import { JsonlMemoryStore } from '@harness/memory/jsonlMemoryStore.js';
+import { Mem0Store } from '@harness/memory/mem0Store.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
@@ -142,9 +143,17 @@ function envNumber(key: string): number | undefined {
 }
 
 function buildMemoryStore(): MemoryStore | undefined {
+  const apiKey = process.env['MEM0_API_KEY'];
+  if (apiKey) {
+    return new Mem0Store({
+      apiKey,
+      ...(process.env['MEM0_BASE_URL'] ? { baseURL: process.env['MEM0_BASE_URL'] } : {}),
+      ...(process.env['MEM0_USER_ID'] ? { defaultUserId: process.env['MEM0_USER_ID'] } : {}),
+    });
+  }
   const path = process.env['HARNESS_MEMORY_FILE'];
-  if (!path) return undefined;
-  return new JsonlMemoryStore({ path });
+  if (path) return new JsonlMemoryStore({ path });
+  return undefined;
 }
 
 function buildMicroCompactOptions():
@@ -187,6 +196,9 @@ function printUsage(): void {
       '  HARNESS_MICRO_COMPACT_TRIGGER_EVERY   default 10',
       '  HARNESS_MICRO_COMPACT_MIN_BYTES       default 256',
       '  HARNESS_MEMORY_FILE  path to JSONL memory log (cross-session memory; off if unset)',
+      '  MEM0_API_KEY         enable mem0 backend (overrides HARNESS_MEMORY_FILE if both set)',
+      '  MEM0_BASE_URL        self-hosted mem0 server (omit for cloud)',
+      '  MEM0_USER_ID         fallback userId for mem0 (default \'harness\')',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

@@ -22,19 +22,30 @@ with a typed interface. Current state:
   `NextTurn`) matching Codex's model
 - ✅ LLM provider interface; OpenAI-compatible provider (real streaming +
   tool calls), works against any OpenAI-compatible endpoint via `OPENAI_BASE_URL`
-- ✅ 9 primitive tools stubbed or minimally real (`shell`/`web_*` are stubs;
-  `read`/`write`/`memory` are real enough for tests)
-- ✅ Context projection + handle registry; deterministic Level-1 pruning
-  rules; static compactor stub
+- ✅ Real `shell` (process-group kill, byte cap, handle elision) and
+  `web_fetch` (undici); `read`/`write`(overwrite) real; `memory` real
+  with three backends (in-memory / JSONL / mem0); `web_search` stub
+- ✅ Context projection + handle registry + deterministic Level-1
+  pruning + **hot-path micro-compaction** (sliding window, no LLM
+  call); static cold-path compactor stub
+- ✅ Pluggable `MemoryStore`: KV path (`get`/`set`/...) **and**
+  ingestion path (`ingest(messages)`); pinned entries auto-injected
+  into the system prefix on every sampling
 - ✅ AgentRunner: event-driven action loop with spawn / wait / restore
-  intercepted as transport tools
-- ✅ Terminal adapter + CLI; smoke-tested end-to-end
-- ✅ 28 unit/smoke tests green; e2e scaffolding skipped behind `HARNESS_E2E=1`
+  intercepted as transport tools; tool-call ↔ tool-result pairing
+  preserved through elision
+- ✅ SubagentPool with hard budget enforcement
+  (`maxTurns`/`maxToolCalls`/`maxWallMs`) + parent → descendant
+  interrupt propagation
+- ✅ Terminal adapter + CLI; three-layer diagnostics (prompt dumps,
+  JSONL trace, stderr summary)
+- ✅ 58 unit/smoke tests green; live e2e (OpenAI + mem0) skipped
+  behind `HARNESS_E2E=1`
 
-**Phase 2** (next) implements real streaming Anthropic support, real `shell`
-via `child_process`, unified-patch mode for `write`, and replaces the static
-compactor with a subagent-spawn compactor. See
-[design-docs/08-roadmap.md](design-docs/08-roadmap.md).
+**Phase 2** (next) replaces the static compactor with a subagent-spawn
+compactor, lands `write(patch)` unified-diff mode, adds an Anthropic
+provider with `cache_control` + `cache_edits`, and wires `web_search`
+to a real backend. See [design-docs/08-roadmap.md](design-docs/08-roadmap.md).
 
 ## Architecture at a glance
 
@@ -81,6 +92,7 @@ anchor points.
 - [06-adapters.md](design-docs/06-adapters.md) — adapter interface, terminal, future Discord/TG
 - [07-diagnostics.md](design-docs/07-diagnostics.md) — prompt_debug, tracing, compaction events
 - [08-roadmap.md](design-docs/08-roadmap.md) — phased implementation order
+- [09-memory.md](design-docs/09-memory.md) — MemoryStore interface, backends (in-memory / JSONL / mem0), pinning
 
 ## Quick start
 
@@ -104,6 +116,10 @@ Configuration is read from `.env` (see [.env.example](.env.example)):
 | `OPENAI_MAX_TOKENS`  | default 1024                                          |
 | `OPENAI_TEMPERATURE` | default 0.7                                           |
 | `HARNESS_STORE_ROOT` | persist session events to this directory              |
+| `HARNESS_MEMORY_FILE`| JSONL memory log path (cross-session memory; off if unset) |
+| `MEM0_API_KEY`       | enable mem0 backend (cloud or self-hosted) — overrides `HARNESS_MEMORY_FILE` |
+| `MEM0_BASE_URL`      | self-hosted mem0 server (omit for cloud)              |
+| `MEM0_USER_ID`       | fallback userId for mem0 (default `harness`)          |
 
 CLI flags override env: `pnpm dev -- --model gpt-4o --base-url https://…`.
 

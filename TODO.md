@@ -80,15 +80,20 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   handle elision. Missing: auth headers, POST body, pluggable transport.
 - 🔴 **`web_search`** — still a stub; needs a search backend adapter
   (Brave / Google / DDG).
-- 🟡 **`memory`** — refactored onto a `MemoryStore` interface
-  (`src/memory/types.ts`). Default `InMemoryStore` backend covers KV +
-  pinning + keyword search; pinned entries auto-injected into the
-  system prefix. Children share the parent store. Missing:
-  - ⚪ **JSONL backend** — for on-disk persistence across sessions.
-  - ⚪ **mem0 backend** — stubbed in `src/memory/mem0Store.ts`; needs
-    SDK wiring and namespace mapping. Adds semantic search + LLM-based
-    fact extraction via `ingest()`.
+- 🟢 **`memory`** — refactored onto a `MemoryStore` interface
+  (`src/memory/types.ts`). Three backends ship:
+  - `InMemoryStore` — KV + pinning + keyword search; process-scoped.
+  - `JsonlMemoryStore` — append-only WAL on disk; persistent,
+    single-process. CLI: `HARNESS_MEMORY_FILE=...`.
+  - `Mem0Store` — semantic search + LLM fact extraction; cross-
+    process. CLI: `MEM0_API_KEY=...` (+ optional `MEM0_BASE_URL`,
+    `MEM0_USER_ID`). Live e2e in `tests/e2e/mem0Live.test.ts`,
+    skipped unless `HARNESS_E2E=1` + key present.
+  Pinned entries auto-injected into the system prefix on every
+  sampling. Children share the parent store.
+  Missing:
   - ⚪ Auto-`ingest` of recent turns into memory at turn boundaries.
+  - ⚪ Pagination over mem0 `getAll` (currently first page only).
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟡 **`wait`** — schema + tool-call accepted; actual yield semantics
