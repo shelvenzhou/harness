@@ -93,6 +93,7 @@ anchor points.
 - [07-diagnostics.md](design-docs/07-diagnostics.md) — prompt_debug, tracing, compaction events
 - [08-roadmap.md](design-docs/08-roadmap.md) — phased implementation order
 - [09-memory.md](design-docs/09-memory.md) — MemoryStore interface, backends (in-memory / JSONL / mem0), pinning
+- [10-actor-mode.md](design-docs/10-actor-mode.md) — **deferred**; actor / mailbox mode for multi-agent, with explicit trigger conditions
 
 ## Quick start
 

@@ -59,6 +59,18 @@ Exit criteria:
 - Plugin model (skills / MCP / connectors, borrowing the Codex layering).
 - App-server-style JSON-RPC + SSE for rich clients.
 
+## Deferred — actor mode
+
+Documented in [10-actor-mode.md](10-actor-mode.md). **Do not schedule into
+a phase until a trigger condition fires:** a long-lived LLM-driven service
+(Discord watcher with its own loop, file watcher, MCP long-poll), peer
+agents that must talk without a parent/child relationship, mailbox-replay
+recovery becoming structurally necessary, or a workflow that keeps
+re-asking "what state am I in?" every turn. Until one of those lands, the
+spawn tree + per-thread mailbox is sufficient and actor mode is pure
+overhead. When the trigger arrives, the PR introducing actor mode must
+state which trigger justified it.
+
 ## What phase 1 deliberately punts
 
 - No real sandboxing. Every side-effect tool trusts its caller.

@@ -60,6 +60,24 @@ The bus supports multiple adapters at once. A single runtime can serve a
 terminal REPL, a Discord bot, and an HTTP endpoint simultaneously. Thread
 bindings keep them isolated.
 
+## Adapters vs. actor mode
+
+An adapter is an I/O bridge: it translates external events into bus events
+on a target thread and renders bus events back out. It does **not** run its
+own LLM loop. When an external integration needs its own LLM-driven loop,
+its own state, or peer-to-peer communication with other agents, it crosses
+into actor territory — see [10-actor-mode.md](10-actor-mode.md). That
+document is deferred and should not be implemented until a concrete
+multi-agent use case lands; until then, every external surface is an
+adapter.
+
+If/when actor mode lands, untrusted external inputs (Discord, webhooks)
+must be projected with an explicit untrusted-source frame so prompt
+injection from a public channel cannot be confused with a local user
+instruction. This boundary is called out in
+[10-actor-mode.md](10-actor-mode.md#5-untrusted-input-boundary-in-projection)
+and must precede any actor-mode external endpoint exposure.
+
 ## Adding an adapter — checklist
 
 1. Create `src/adapters/<name>.ts` implementing `Adapter`.
