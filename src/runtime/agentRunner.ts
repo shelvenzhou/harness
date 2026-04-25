@@ -284,7 +284,25 @@ export class AgentRunner {
         break;
       case 'tool_call': {
         const toolCallId = action.toolCallId;
-        // Intercept the three "transport" tools (spawn/wait/restore).
+        // The canonical conversation pair for ANY tool — including the
+        // transport tools (spawn / wait / restore) — is `tool_call` →
+        // `tool_result`. We always persist the tool_call event first so
+        // projection produces a consistent assistant{tool_calls:[id]} →
+        // tool{tool_call_id: id} sequence; otherwise OpenAI rejects the
+        // next request as "tool_calls without responses".
+        await this.appendEvent({
+          kind: 'tool_call',
+          payload: {
+            toolCallId,
+            name: action.name,
+            args: action.args,
+          } satisfies ToolCallPayload,
+          ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
+        });
+
+        // Intercept the three transport tools — they need access to the
+        // runner's internals (subagent pool / handle registry) and so
+        // can't be expressed as ordinary Tool.execute().
         if (action.name === 'spawn') {
           await this.handleSpawnRequest(toolCallId, action.args);
           break;
@@ -298,15 +316,6 @@ export class AgentRunner {
           break;
         }
         collectToolCalls.push({ toolCallId, call: action });
-        await this.appendEvent({
-          kind: 'tool_call',
-          payload: {
-            toolCallId,
-            name: action.name,
-            args: action.args,
-          } satisfies ToolCallPayload,
-          ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
-        });
         break;
       }
       case 'spawn':

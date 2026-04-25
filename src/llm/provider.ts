@@ -45,7 +45,18 @@ export type ProjectedContent =
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; toolCallId: ToolCallId; name: string; args: unknown }
   | { kind: 'tool_result'; toolCallId: ToolCallId; ok: boolean; output?: unknown; error?: string }
-  | { kind: 'elided'; handle: string; originKind: string; summary?: string };
+  | {
+      kind: 'elided';
+      handle: string;
+      originKind: string;
+      summary?: string;
+      /**
+       * Set when the elided block stands in for a `tool_result` event. The
+       * provider must still emit a `tool` role message with this id so the
+       * provider API's tool-call/response pairing invariant holds.
+       */
+      toolCallId?: ToolCallId;
+    };
 
 export interface CacheEdits {
   clearToolUses?: ToolCallId[];

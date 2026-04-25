@@ -168,6 +168,7 @@ function projectToolResult(ev: HarnessEvent, opts: ProjectOneOpts): ProjectedIte
       handle: elided.handle,
       originKind: elided.kind,
       summary: describeElision(elided.kind, elided.meta),
+      toolCallId: p.toolCallId as never,
     };
   } else {
     const body = p.ok ? p.output : { error: p.error };

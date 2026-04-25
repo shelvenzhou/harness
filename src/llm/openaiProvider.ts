@@ -221,12 +221,32 @@ function toChatMessages(
             content: JSON.stringify(c.ok ? (c.output ?? null) : { error: c.error ?? 'error' }),
           });
         } else if (c.kind === 'elided') {
-          // Elided tool_result — inject as a user message with handle hint,
-          // since OpenAI's tool role expects a concrete tool_call_id.
-          messages.push({
-            role: 'user',
-            content: `[elided tool result handle=${c.handle} kind=${c.originKind}] ${c.summary ?? ''}`,
-          });
+          // Elided tool_result. We MUST still emit a `tool` role message
+          // with the original tool_call_id so OpenAI's pairing invariant
+          // holds — otherwise the next request errors with
+          // "tool_calls did not have response messages". Body becomes a
+          // compact placeholder; the LLM can `restore(handle)` to inline
+          // the full content on the next sampling.
+          if (c.toolCallId) {
+            messages.push({
+              role: 'tool',
+              tool_call_id: c.toolCallId,
+              content: JSON.stringify({
+                elided: true,
+                handle: c.handle,
+                kind: c.originKind,
+                summary: c.summary,
+                hint: 'call restore(handle) to rehydrate full content',
+              }),
+            });
+          } else {
+            // Elided block that wasn't standing in for a tool_result —
+            // safe to render as plain user text.
+            messages.push({
+              role: 'user',
+              content: `[elided handle=${c.handle} kind=${c.originKind}] ${c.summary ?? ''}`,
+            });
+          }
         }
       }
       continue;
