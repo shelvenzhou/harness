@@ -32,10 +32,14 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     dropped reasoning.
   - ⚪ inline-vs-elide decision respects `inlineToolResultLimit` but does
     not consider the *next* sampling's estimated token budget.
-- 🔴 **StaticCompactor** — replaces prior events with a placeholder
-  summary. Phase 2: replace with a `spawn({role: 'compactor'})` subagent
-  producing a real `CompactedSummary`.
-- ⚪ **Compaction triggers** — threshold computation exists
+- 🟢 **MicroCompactor** (`src/context/microCompactor.ts`) — hot-path
+  sliding-window micro-compaction; runs deterministically before each
+  sampling step, elides oversized tool_results in the warm zone via
+  attachElision + handle. Restore-recoverable.
+- 🔴 **StaticCompactor** — placeholder semantic compactor. Phase 2:
+  replace with a `spawn({role: 'compactor'})` subagent producing a real
+  `CompactedSummary` for cold-path / threshold-triggered compaction.
+- ⚪ **Compaction triggers (cold path)** — threshold computation exists
   (`estimateTokens`) but nothing subscribes + triggers `compact_request`.
 - ⚪ **Cache-edits path** — `cacheEdits` field on SamplingRequest is
   plumbed but no provider consumes it; no logic decides when to use hot
@@ -56,11 +60,11 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     projection but the runner does not respond to them.
 - 🟡 **SubagentPool** — `spawn` creates a child, returns its id, and
   parent receives `subtask_complete` when the child's turn ends.
+  Budgets (`maxTurns`/`maxToolCalls`/`maxWallMs`) enforced as hard caps;
+  parent → descendant interrupt propagation works.
   Missing:
-  - ⚪ Budget enforcement (`maxTurns`/`maxToolCalls`/`maxWallMs`).
-  - ⚪ `inheritTurns` — currently unused; child always starts fresh.
+  - ⚪ `inheritTurns` — currently recorded but never copies parent turns.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
-  - ⚪ Child abort when parent is interrupted / its turn ends first.
 - ⚪ **Scheduler** — class exists, not wired to `wait(timer)` actions;
   no cron.
 

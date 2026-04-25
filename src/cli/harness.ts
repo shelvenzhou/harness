@@ -53,12 +53,14 @@ async function main(): Promise<void> {
       : process.env['HARNESS_STORE_ROOT'];
 
   const diagSinks = buildDiagSinks();
+  const microCompact = buildMicroCompactOptions();
 
   const runtime = await bootstrap({
     provider,
     systemPrompt,
     ...(storeRoot !== undefined ? { storeRoot } : {}),
     ...(diagSinks.length > 0 ? { diagSinks } : {}),
+    ...(microCompact !== undefined ? { microCompact } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -135,6 +137,24 @@ function envNumber(key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function buildMicroCompactOptions():
+  | false
+  | { keepRecent?: number; triggerEvery?: number; minBytes?: number }
+  | undefined {
+  if (process.env['HARNESS_MICRO_COMPACT'] === 'off') return false;
+  const keepRecent = envNumber('HARNESS_MICRO_COMPACT_KEEP_RECENT');
+  const triggerEvery = envNumber('HARNESS_MICRO_COMPACT_TRIGGER_EVERY');
+  const minBytes = envNumber('HARNESS_MICRO_COMPACT_MIN_BYTES');
+  if (keepRecent === undefined && triggerEvery === undefined && minBytes === undefined) {
+    return undefined;
+  }
+  return {
+    ...(keepRecent !== undefined ? { keepRecent } : {}),
+    ...(triggerEvery !== undefined ? { triggerEvery } : {}),
+    ...(minBytes !== undefined ? { minBytes } : {}),
+  };
+}
+
 function printUsage(): void {
   process.stdout.write(
     [
@@ -152,6 +172,10 @@ function printUsage(): void {
       '  HARNESS_DIAG         off to disable diagnostics',
       '  HARNESS_DIAG_DIR     JSONL + prompt-dump root (default .harness/diag)',
       '  HARNESS_DIAG_STDERR  off | summary (default) | verbose',
+      '  HARNESS_MICRO_COMPACT  off to disable hot-path micro-compaction',
+      '  HARNESS_MICRO_COMPACT_KEEP_RECENT     default 20',
+      '  HARNESS_MICRO_COMPACT_TRIGGER_EVERY   default 10',
+      '  HARNESS_MICRO_COMPACT_MIN_BYTES       default 256',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

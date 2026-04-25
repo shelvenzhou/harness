@@ -103,6 +103,30 @@ When a user sends input while a turn is running:
 These are **operations on the bus**, not direct calls into the runner. The
 runner sees them as events. Uniform treatment simplifies audit + replay.
 
+## Subagent budgets and interrupt propagation
+
+`spawn` accepts a `budget` envelope: `{maxTurns, maxToolCalls, maxWallMs}`.
+The pool tracks per-child counters and enforces them as **hard caps**:
+
+- `maxTurns` — sampling step count; counted by `sampling_complete` events.
+- `maxToolCalls` — `tool_call` events appended to the child thread.
+- `maxWallMs` — wall time since `spawn`.
+
+When any cap trips, the pool publishes `interrupt` to the child's bus
+filter. The child runner cancels in-flight sampling (its `AbortController`
+fires) and pending tool calls; the pool then translates the resulting
+`turn_complete{status: 'interrupted'}` into `subtask_complete{status:
+'budget_exceeded'}` for the parent.
+
+**Parent → child interrupt propagation.** When the parent receives an
+`interrupt`, the pool propagates it to every descendant thread it tracks.
+Without this, killing the parent leaves orphan children burning provider
+quota. Propagation walks the `parentThreadId` tree maintained by the pool.
+
+`inheritTurns` (parameter recorded today, not yet enforced): when set,
+the spawn seeds the child thread with the last N turns of the parent log
+copied verbatim. Carries handles forward.
+
 ## Concurrency model
 
 - Node.js single-threaded; concurrency is async I/O.

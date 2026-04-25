@@ -26,6 +26,7 @@ import type { Tool, ToolExecutionContext } from '@harness/tools/tool.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { HandleRegistry } from '@harness/context/handleRegistry.js';
 import { buildSamplingRequest } from '@harness/context/projection.js';
+import { MicroCompactor, type MicroCompactorOptions } from '@harness/context/microCompactor.js';
 
 import { ActiveTurn } from './activeTurn.js';
 
@@ -51,6 +52,11 @@ export interface AgentRunnerOptions {
   provider: LlmProvider;
   systemPrompt: string;
   pinnedMemory?: string[];
+  /**
+   * Hot-path micro-compaction. Disabled when undefined.
+   * When set, runs deterministically before each sampling step.
+   */
+  microCompact?: MicroCompactorOptions | false;
   /**
    * Called before each sampling request. Use to persist or tee the
    * exact prompt going to the provider. Return a path (or any id) and
@@ -87,9 +93,13 @@ export class AgentRunner {
   private tickPending = false;
   private abortCtl: AbortController | undefined;
   private samplingIndex = 0;
+  private microCompactor?: MicroCompactor;
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
+    if (opts.microCompact !== false) {
+      this.microCompactor = new MicroCompactor(opts.microCompact ?? {});
+    }
   }
 
   /** Wire this runner's subscription to its thread. */
@@ -169,6 +179,10 @@ export class AgentRunner {
     at.toRunning();
     this.abortCtl = new AbortController();
     this.samplingIndex += 1;
+
+    if (this.microCompactor) {
+      await this.microCompactor.maybeRun(this.opts.threadId, this.opts.store, this.handles);
+    }
 
     const { request, stats } = await this.buildRequestWithStats();
     const promptDumpPath = this.opts.onPromptBuilt

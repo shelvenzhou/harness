@@ -14,6 +14,8 @@ import {
   type DiagSink,
 } from '@harness/diag/index.js';
 
+import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
+
 import { AgentRunner } from './agentRunner.js';
 import { SubagentPool } from './subagentPool.js';
 
@@ -36,6 +38,11 @@ export interface BootstrapOptions {
   storeRoot?: string;
   registry?: ToolRegistry;
   pinnedMemory?: string[];
+  /**
+   * Hot-path micro-compaction options. Pass `false` to disable.
+   * When omitted, defaults are used (keepRecent=20, triggerEvery=10).
+   */
+  microCompact?: MicroCompactorOptions | false;
   /**
    * Diagnostic sinks. Each sees every bus event and the prompt hook.
    */
@@ -85,6 +92,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPromptFor: (role) =>
       role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
+    ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
   });
 
   const runner = new AgentRunner({
@@ -96,6 +104,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPrompt: opts.systemPrompt,
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
+    ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
     onSpawn: (req) => subagents.spawn(req),
   });

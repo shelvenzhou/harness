@@ -32,6 +32,59 @@ Per event kind, at projection time:
 | `user_input`  | keep verbatim                                             |
 | `user_turn_start` | keep verbatim                                         |
 
+### Level 1.5 — micro-compaction (sliding window, deterministic, hot path)
+
+Inspired by Claude Code's micro-compact + Manus's "minimal recoverable
+state" principle. Runs at the start of every sampling step, **without an
+LLM call**.
+
+**Window model.** Three zones in the event log:
+
+```
+[ cold zone (already micro-compacted) | warm zone (this pass) | hot tail (untouched) ]
+                                       ↑                       ↑
+                                       checkpoint              -keepRecent
+```
+
+- `keepRecent` (default 20): events at the tail left fully verbatim.
+- `triggerEvery` (default 10): minimum new events past the previous
+  checkpoint before a new pass runs. Without this gate the boundary would
+  shift every tick and break prefix caching.
+- A pass advances the checkpoint and processes the new warm zone.
+
+**Per-tool_result transformation.** For each `tool_result` in the warm
+zone whose serialised body exceeds `minBytes` (default 256) and is not
+already elided:
+
+1. Register a handle in `HandleRegistry` carrying the full payload.
+2. Synthesise a one-line summary derived from the preceding `tool_call`
+   (e.g. `[shell exit=0 stdout=12kb truncated]`).
+3. `store.attachElision(threadId, eventId, {handle, kind: 'micro_compact', meta: {summary}})`.
+
+After this, projection emits the event as a normal elided block; the
+existing `restore(handle)` flow already pins it for inline rehydration on
+the next sampling — no new code path needed.
+
+**Why this preserves cache.** The checkpoint advances in chunks of
+`triggerEvery`, not one event at a time. Between checkpoint advances the
+projected prefix bytes are byte-identical, so the provider's KV cache
+keeps hitting. Each advance pays one cache miss for the newly-frozen
+chunk, then stabilises again.
+
+**What stays untouched.** `tool_call` events themselves (the model needs
+to see what it asked for); user turns; assistant replies/preambles;
+reasoning blocks (Level 1's last-N rule already governs them); already-
+elided events (idempotent).
+
+**Recoverability.** Because the original `payload.output` stays in the
+event log and the handle is in the registry, `restore(handle)` rehydrates
+the full body on demand. The summary line preserves enough invariants
+(tool name, exit/error, byte count) that the model can usually decide
+whether to restore or move on.
+
+**Trigger event.** Each non-empty pass appends a `compaction_event` with
+`reason: 'auto'` so the diag layer surfaces what was compacted.
+
 ### Level 2 — LLM compaction (expensive, threshold-triggered)
 
 Trigger when:
