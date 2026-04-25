@@ -27,6 +27,7 @@ import type { ToolExecutor } from '@harness/tools/executor.js';
 import { HandleRegistry } from '@harness/context/handleRegistry.js';
 import { buildSamplingRequest } from '@harness/context/projection.js';
 import { MicroCompactor, type MicroCompactorOptions } from '@harness/context/microCompactor.js';
+import type { MemoryStore } from '@harness/memory/types.js';
 
 import { ActiveTurn } from './activeTurn.js';
 
@@ -52,6 +53,8 @@ export interface AgentRunnerOptions {
   provider: LlmProvider;
   systemPrompt: string;
   pinnedMemory?: string[];
+  /** Persistent memory backend; injected into every tool ctx.services. */
+  memory?: MemoryStore;
   /**
    * Hot-path micro-compaction. Disabled when undefined.
    * When set, runs deterministically before each sampling step.
@@ -262,13 +265,17 @@ export class AgentRunner {
     request: SamplingRequest;
     stats: { projectedItems: number; elidedCount: number; estimatedTokens: number; pinnedHandles: number };
   }> {
+    const staticPinned = this.opts.pinnedMemory ?? [];
+    const memoryPinned = this.opts.memory
+      ? (await this.opts.memory.pinned()).map(formatPinnedEntry)
+      : [];
     const built = await buildSamplingRequest({
       threadId: this.opts.threadId,
       store: this.opts.store,
       registry: this.opts.registry,
       handles: this.handles,
       systemPrompt: this.opts.systemPrompt,
-      pinnedMemory: this.opts.pinnedMemory ?? [],
+      pinnedMemory: [...staticPinned, ...memoryPinned],
     });
     return { request: built.request, stats: built.stats };
   }
@@ -362,7 +369,9 @@ export class AgentRunner {
       signal: this.abortCtl?.signal ?? new AbortController().signal,
       log: () => void 0,
       registerHandle: (kind, payload, meta) => this.handles.register(kind, payload, meta ?? {}),
-      services: {},
+      services: {
+        ...(this.opts.memory !== undefined ? { memory: this.opts.memory } : {}),
+      },
     };
 
     const result = await this.opts.executor.execute({
@@ -520,6 +529,10 @@ function synthEvent(threadId: ThreadId, reason: string): HarnessEvent {
     payload: { source: 'runner', data: { reason } },
     createdAt: new Date().toISOString(),
   } as HarnessEvent;
+}
+
+function formatPinnedEntry(e: { key?: string; content: string }): string {
+  return e.key ? `${e.key}: ${e.content}` : e.content;
 }
 
 // re-export for convenience

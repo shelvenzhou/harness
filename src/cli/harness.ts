@@ -5,6 +5,8 @@ import 'dotenv/config';
 
 import type { LlmProvider } from '@harness/llm/provider.js';
 import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
+import { JsonlMemoryStore } from '@harness/memory/jsonlMemoryStore.js';
+import type { MemoryStore } from '@harness/memory/types.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
 import {
@@ -54,6 +56,7 @@ async function main(): Promise<void> {
 
   const diagSinks = buildDiagSinks();
   const microCompact = buildMicroCompactOptions();
+  const memory = buildMemoryStore();
 
   const runtime = await bootstrap({
     provider,
@@ -61,6 +64,7 @@ async function main(): Promise<void> {
     ...(storeRoot !== undefined ? { storeRoot } : {}),
     ...(diagSinks.length > 0 ? { diagSinks } : {}),
     ...(microCompact !== undefined ? { microCompact } : {}),
+    ...(memory !== undefined ? { memory } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -137,6 +141,12 @@ function envNumber(key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function buildMemoryStore(): MemoryStore | undefined {
+  const path = process.env['HARNESS_MEMORY_FILE'];
+  if (!path) return undefined;
+  return new JsonlMemoryStore({ path });
+}
+
 function buildMicroCompactOptions():
   | false
   | { keepRecent?: number; triggerEvery?: number; minBytes?: number }
@@ -176,6 +186,7 @@ function printUsage(): void {
       '  HARNESS_MICRO_COMPACT_KEEP_RECENT     default 20',
       '  HARNESS_MICRO_COMPACT_TRIGGER_EVERY   default 10',
       '  HARNESS_MICRO_COMPACT_MIN_BYTES       default 256',
+      '  HARNESS_MEMORY_FILE  path to JSONL memory log (cross-session memory; off if unset)',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

@@ -15,6 +15,8 @@ import {
 } from '@harness/diag/index.js';
 
 import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
+import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
+import type { MemoryStore } from '@harness/memory/types.js';
 
 import { AgentRunner } from './agentRunner.js';
 import { SubagentPool } from './subagentPool.js';
@@ -39,6 +41,12 @@ export interface BootstrapOptions {
   registry?: ToolRegistry;
   pinnedMemory?: string[];
   /**
+   * Memory backend. Defaults to a fresh InMemoryStore (process-scoped,
+   * lost on exit). Pass a persistent backend (JSONL, mem0, …) for
+   * cross-session memory.
+   */
+  memory?: MemoryStore;
+  /**
    * Hot-path micro-compaction options. Pass `false` to disable.
    * When omitted, defaults are used (keepRecent=20, triggerEvery=10).
    */
@@ -52,6 +60,7 @@ export interface BootstrapOptions {
 export interface Runtime {
   bus: EventBus;
   store: SessionStore;
+  memory: MemoryStore;
   registry: ToolRegistry;
   executor: ToolExecutor;
   provider: LlmProvider;
@@ -68,6 +77,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     : new MemorySessionStore();
   const registry = opts.registry ?? createDefaultRegistry();
   const executor = new ToolExecutor(registry);
+  const memory: MemoryStore = opts.memory ?? new InMemoryStore();
 
   const rootThreadId = newThreadId();
   await store.createThread({
@@ -92,6 +102,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPromptFor: (role) =>
       role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
+    memory,
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
   });
 
@@ -103,6 +114,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     executor,
     provider: opts.provider,
     systemPrompt: opts.systemPrompt,
+    memory,
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
@@ -113,6 +125,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   return {
     bus,
     store,
+    memory,
     registry,
     executor,
     provider: opts.provider,

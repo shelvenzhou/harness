@@ -1,6 +1,7 @@
 import type { EventBus } from '@harness/bus/eventBus.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
+import type { MemoryStore } from '@harness/memory/types.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
@@ -44,6 +45,8 @@ export interface SubagentPoolDeps {
   executor: ToolExecutor;
   provider: LlmProvider;
   systemPromptFor: (role: string | undefined) => string;
+  /** Children share the parent's memory backend. */
+  memory?: MemoryStore;
   /** Provided to children so micro-compaction is consistent across the tree. */
   microCompact?: ConstructorParameters<typeof AgentRunner>[0]['microCompact'];
 }
@@ -108,6 +111,7 @@ export class SubagentPool {
       executor: this.deps.executor,
       provider: this.deps.provider,
       systemPrompt,
+      ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       ...(this.deps.microCompact !== undefined ? { microCompact: this.deps.microCompact } : {}),
       onSpawn: (inner) => this.spawn(inner),
     });

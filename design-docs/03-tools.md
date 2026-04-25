@@ -17,7 +17,7 @@ research pipeline) is built by the model composing these primitives plus
 | `web_fetch` | `{url, maxOutputBytes?}`                          | Fetch only. No crawling. |
 | `web_search`| `{query, topK?}`                                  | Thin wrapper over a configurable search backend. |
 | `spawn`     | `{task, budget, inheritTurns?, role?, policy?}`   | Forks a subagent. **Composition primitive.** |
-| `memory`    | `{op: 'get'\|'set'\|'delete'\|'search', key?, value?, query?}` | Key/value + semantic search. |
+| `memory`    | `{op, key?, value?, query?, pinned?, tags?}`      | KV + ingestion + search; pinned entries auto-injected into the system prompt. See `src/memory/types.ts` for the `MemoryStore` backend interface. |
 | `restore`   | `{handle}`                                        | Rehydrate an elided event. |
 | `wait`      | `{eventSpec, timeoutMs?}`                         | Yield until a matching event arrives. |
 

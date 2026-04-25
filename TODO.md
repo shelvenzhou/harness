@@ -80,8 +80,15 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   handle elision. Missing: auth headers, POST body, pluggable transport.
 - 🔴 **`web_search`** — still a stub; needs a search backend adapter
   (Brave / Google / DDG).
-- 🟡 **`memory`** — in-process kv + `list` real; `search` is a stub.
-  Not persistent; does not survive process restart.
+- 🟡 **`memory`** — refactored onto a `MemoryStore` interface
+  (`src/memory/types.ts`). Default `InMemoryStore` backend covers KV +
+  pinning + keyword search; pinned entries auto-injected into the
+  system prefix. Children share the parent store. Missing:
+  - ⚪ **JSONL backend** — for on-disk persistence across sessions.
+  - ⚪ **mem0 backend** — stubbed in `src/memory/mem0Store.ts`; needs
+    SDK wiring and namespace mapping. Adds semantic search + LLM-based
+    fact extraction via `ingest()`.
+  - ⚪ Auto-`ingest` of recent turns into memory at turn boundaries.
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟡 **`wait`** — schema + tool-call accepted; actual yield semantics
