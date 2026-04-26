@@ -93,7 +93,14 @@ export class AgentRunner {
   private activeTurn?: ActiveTurn;
   private handles = new HandleRegistry();
   private tickInFlight = false;
-  private tickPending = false;
+  /**
+   * Seeds that arrived while a tick was in flight. Drained in FIFO order
+   * after the tick completes. A boolean flag here is not enough: the actual
+   * seed kind matters (user_turn_start for a new turn vs. internal_resume
+   * to recheck mid-turn), and dropping seeds caused new turns to be lost
+   * when they arrived during the previous turn's wind-down.
+   */
+  private pendingSeeds: HarnessEvent[] = [];
   private abortCtl: AbortController | undefined;
   private samplingIndex = 0;
   private microCompactor?: MicroCompactor;
@@ -135,7 +142,7 @@ export class AgentRunner {
 
   private scheduleTick(seed: HarnessEvent): void {
     if (this.tickInFlight) {
-      this.tickPending = true;
+      this.pendingSeeds.push(seed);
       return;
     }
     void this.tick(seed).catch((err) => {
@@ -159,9 +166,12 @@ export class AgentRunner {
       }
     } finally {
       this.tickInFlight = false;
-      if (this.tickPending && this.activeTurn && !this.activeTurn.isTerminal()) {
-        this.tickPending = false;
-        this.scheduleTick(synthEvent(this.opts.threadId, 'internal_resume'));
+      // Drain any seeds that arrived while we were busy. Each seed gets a
+      // fresh tick so its kind is honoured (user_turn_start starts a new
+      // turn; tool_result / subtask_complete resumes the active turn).
+      const next = this.pendingSeeds.shift();
+      if (next !== undefined) {
+        this.scheduleTick(next);
       }
     }
   }
