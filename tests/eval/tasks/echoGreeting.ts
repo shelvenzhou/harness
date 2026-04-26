@@ -1,4 +1,4 @@
-import type { EvalTask } from '../types.js';
+import type { EvalTask } from '../index.js';
 
 /**
  * Smoke-grade task: agent must echo a marker phrase. Tests the

@@ -10,10 +10,11 @@ import type {
   SamplingRequest,
 } from '@harness/llm/provider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
-import { runEval, builtinTasks, getTask } from '@harness/eval/index.js';
-import { echoGreetingTask } from '@harness/eval/tasks/echoGreeting.js';
-import { writeFileTask } from '@harness/eval/tasks/writeFile.js';
-import type { EvalTask } from '@harness/eval/types.js';
+import { runEval } from '../../eval/index.js';
+import { builtinTasks, getTask } from '../../eval/tasks/index.js';
+import { echoGreetingTask } from '../../eval/tasks/echoGreeting.js';
+import { writeFileTask } from '../../eval/tasks/writeFile.js';
+import type { EvalTask } from '../../eval/types.js';
 
 /**
  * Eval runner unit tests, driven by scripted providers so we exercise the
@@ -187,8 +188,14 @@ describe('eval/runner', () => {
     await expect(readFile(path.join(captured, 'whatever'), 'utf8')).rejects.toThrow();
   });
 
-  it('built-in registry exposes both bundled tasks by id', () => {
-    expect(builtinTasks.map((t) => t.id).sort()).toEqual(['echo-greeting', 'write-file']);
+  it('built-in registry exposes the bundled tasks by id', () => {
+    expect(builtinTasks.map((t) => t.id).sort()).toEqual([
+      'echo-greeting',
+      'harness-spawn-verify',
+      'harness-usage-aware',
+      'self-verify-write',
+      'write-file',
+    ]);
     expect(getTask('echo-greeting')).toBeDefined();
     expect(getTask('does-not-exist')).toBeUndefined();
   });

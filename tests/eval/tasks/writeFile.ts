@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import type { EvalTask } from '../types.js';
+import type { EvalTask } from '../index.js';
 
 /**
  * Tool-using task: agent must write a specified file via the `write` tool.
