@@ -147,6 +147,29 @@ export class AgentRunner {
     );
   }
 
+  /**
+   * Rebuild in-memory accounting from the store. Used by `resume()`:
+   * after construction the runner's tokensThisThread / samplingIndex
+   * counters are zero; this scans existing sampling_complete events and
+   * seeds them so the hard-wall token budget remains accurate across
+   * process restarts. Does not replay turns or alter activeTurn — a
+   * fresh user_turn_start drives the next turn as usual.
+   */
+  async hydrateFromStore(): Promise<void> {
+    const events = await this.opts.store.readAll(this.opts.threadId);
+    let total = 0;
+    let lastSamplingIndex = 0;
+    for (const ev of events) {
+      if (ev.kind !== 'sampling_complete') continue;
+      total += ev.payload.promptTokens + ev.payload.completionTokens;
+      if (ev.payload.samplingIndex > lastSamplingIndex) {
+        lastSamplingIndex = ev.payload.samplingIndex;
+      }
+    }
+    this.tokensThisThread = total;
+    this.samplingIndex = lastSamplingIndex;
+  }
+
   private async onEvent(ev: HarnessEvent): Promise<void> {
     // Ignore events this runner just emitted (they'll cause a tick storm).
     // The runner re-enters on control/data events it reacts to.
