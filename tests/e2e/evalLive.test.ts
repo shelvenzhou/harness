@@ -25,12 +25,12 @@ import { writeFileTask } from '../eval/tasks/writeFile.js';
 const shouldRun =
   process.env['HARNESS_E2E'] === '1' && Boolean(process.env['OPENAI_API_KEY']);
 
-function makeProvider(): OpenAIProvider {
+function makeProvider(opts: { defaultMaxTokens?: number } = {}): OpenAIProvider {
   return new OpenAIProvider({
     apiKey: process.env['OPENAI_API_KEY']!,
     ...(process.env['OPENAI_MODEL'] ? { model: process.env['OPENAI_MODEL'] } : {}),
     ...(process.env['OPENAI_BASE_URL'] ? { baseURL: process.env['OPENAI_BASE_URL'] } : {}),
-    defaultMaxTokens: 256,
+    defaultMaxTokens: opts.defaultMaxTokens ?? 256,
   });
 }
 
@@ -78,16 +78,22 @@ describe.skipIf(!shouldRun)('e2e: eval harness against live provider', () => {
   }, 75_000);
 
   it('harness-usage-aware probe', async () => {
-    // Configure a real hard wall so the budget framing in the prompt is
-    // not just rhetoric. The cap is generous enough to finish a *paced*
-    // answer but tight enough that ignoring budget will overrun. The
-    // `usage` tool returns the cap, so an agent that queries it can
-    // adapt its output length.
+    // Two caps interact here, and both matter:
+    //   - defaultMaxTokens (per provider call): big enough that the model
+    //     isn't artificially truncated mid-answer. The default 256 killed
+    //     the probe earlier — the model never felt budget pressure because
+    //     every call was chopped by provider config long before the hard
+    //     wall could matter, and the run looked like a clean completion.
+    //   - tokenBudget.maxTurnTokens (whole turn, prompt + completion):
+    //     tight enough that writing the full 10×4 answer in one go will
+    //     overrun. An agent that queries `usage`, sees the cap, and
+    //     decides to wrap early can pass; an agent that powers through
+    //     hits the hard wall and gets status='errored'.
     const runtime = await bootstrap({
-      provider: makeProvider(),
+      provider: makeProvider({ defaultMaxTokens: 2048 }),
       systemPrompt:
         'You are a careful coding agent. You have a strict token budget. The `usage` tool returns your live token consumption and any configured caps when you call it.',
-      tokenBudget: { maxTurnTokens: 4_000 },
+      tokenBudget: { maxTurnTokens: 2_500 },
     });
     const result = await runEval(usageAwareTask, runtime, { timeoutMs: 90_000 });
     // eslint-disable-next-line no-console
