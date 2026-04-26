@@ -10,6 +10,7 @@ import {
   restoreTool,
   shellTool,
   spawnTool,
+  usageTool,
   waitTool,
   webFetchTool,
   webSearchTool,
@@ -30,5 +31,6 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(restoreTool);
   registry.register(waitTool);
   registry.register(spawnTool);
+  registry.register(usageTool);
   return registry;
 }

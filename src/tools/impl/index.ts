@@ -6,3 +6,4 @@ export { memoryTool } from './memory.js';
 export { restoreTool } from './restore.js';
 export { waitTool } from './wait.js';
 export { spawnTool } from './spawn.js';
+export { usageTool } from './usage.js';
