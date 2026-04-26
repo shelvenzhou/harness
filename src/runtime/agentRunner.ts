@@ -44,6 +44,25 @@ import { ActiveTurn } from './activeTurn.js';
  * See design-docs/01-runtime.md.
  */
 
+/**
+ * Hard-wall token budget. The runtime enforces this as a *cap*, not as
+ * advice injected into the prompt — design principle: runtime mechanism,
+ * LLM policy. When tripped, the turn terminates with status='errored'
+ * and a summary indicating which cap fired. Tools already in flight
+ * are not aborted; the cap takes effect at the next sampling boundary.
+ *
+ * Tokens counted are `promptTokens + completionTokens` from each
+ * `sampling_complete`. `cachedPromptTokens` is included in `promptTokens`
+ * by convention, so it counts toward the prompt total too (cost-control
+ * framing); use compaction for context-window framing.
+ */
+export interface TokenBudget {
+  /** Hard cap on cumulative tokens for the current user turn. */
+  maxTurnTokens?: number;
+  /** Hard cap on cumulative tokens over the lifetime of this thread. */
+  maxThreadTokens?: number;
+}
+
 export interface AgentRunnerOptions {
   threadId: ThreadId;
   bus: EventBus;
@@ -60,6 +79,12 @@ export interface AgentRunnerOptions {
    * When set, runs deterministically before each sampling step.
    */
   microCompact?: MicroCompactorOptions | false;
+  /**
+   * Hard-wall token caps. Omitted (or all-undefined) means no enforcement.
+   * Counters are in-memory; on resume they should be rebuilt from
+   * sampling_complete events in the store.
+   */
+  tokenBudget?: TokenBudget;
   /**
    * Called before each sampling request. Use to persist or tee the
    * exact prompt going to the provider. Return a path (or any id) and
@@ -104,6 +129,8 @@ export class AgentRunner {
   private abortCtl: AbortController | undefined;
   private samplingIndex = 0;
   private microCompactor?: MicroCompactor;
+  private tokensThisTurn = 0;
+  private tokensThisThread = 0;
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
@@ -181,6 +208,7 @@ export class AgentRunner {
     this.activeTurn = new ActiveTurn(this.opts.threadId, turnId);
     this.activeTurn.setPhase('CurrentTurn');
     this.activeTurn.toRunning();
+    this.tokensThisTurn = 0;
     void payload; // payload already persisted as the seed event.
     void seedEventId;
     await this.runSamplingStep();
@@ -189,6 +217,16 @@ export class AgentRunner {
   private async runSamplingStep(): Promise<void> {
     if (!this.activeTurn) return;
     const at = this.activeTurn;
+
+    // Hard-wall token budget check, evaluated at the sampling boundary.
+    // Caps are checked *before* committing to another provider call; tools
+    // already in flight from the previous step run to completion.
+    const tripped = this.checkTokenBudget();
+    if (tripped) {
+      await this.completeTurn('errored', tripped);
+      return;
+    }
+
     at.toRunning();
     this.abortCtl = new AbortController();
     this.samplingIndex += 1;
@@ -228,6 +266,14 @@ export class AgentRunner {
       at.pushActionInFlight(action);
       await this.dispatchAction(action, pendingToolCalls);
     }
+
+    // Accumulate tokens for hard-wall budget enforcement. Counted on the
+    // sum of prompt + completion (cost-control framing). Cached prompt
+    // tokens are already part of promptTokens by convention.
+    const stepTokens =
+      (parsed.usage?.promptTokens ?? 0) + (parsed.usage?.completionTokens ?? 0);
+    this.tokensThisTurn += stepTokens;
+    this.tokensThisThread += stepTokens;
 
     // Emit sampling_complete with usage + projection stats so the diag
     // layer (and anyone else subscribed) can build a full trace.
@@ -269,6 +315,24 @@ export class AgentRunner {
       // runaway empty loop. Provider-specific handling can improve later.
       await this.completeTurn('completed');
     }
+  }
+
+  /**
+   * Returns a non-empty summary string when the token budget would be
+   * exceeded by the next sampling, otherwise undefined. The caller uses
+   * the string as the turn_complete summary so the cap reason is visible
+   * in the trace.
+   */
+  private checkTokenBudget(): string | undefined {
+    const b = this.opts.tokenBudget;
+    if (!b) return undefined;
+    if (b.maxTurnTokens !== undefined && this.tokensThisTurn >= b.maxTurnTokens) {
+      return `tokens_exceeded:turn used=${this.tokensThisTurn} cap=${b.maxTurnTokens}`;
+    }
+    if (b.maxThreadTokens !== undefined && this.tokensThisThread >= b.maxThreadTokens) {
+      return `tokens_exceeded:thread used=${this.tokensThisThread} cap=${b.maxThreadTokens}`;
+    }
+    return undefined;
   }
 
   private async buildRequestWithStats(): Promise<{

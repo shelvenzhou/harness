@@ -13,7 +13,7 @@ import type {
   SubtaskCompletePayload,
 } from '@harness/core/events.js';
 
-import { AgentRunner, type SpawnRequestInfo } from './agentRunner.js';
+import { AgentRunner, type SpawnRequestInfo, type TokenBudget } from './agentRunner.js';
 
 /**
  * Subagent pool.
@@ -49,6 +49,12 @@ export interface SubagentPoolDeps {
   memory?: MemoryStore;
   /** Provided to children so micro-compaction is consistent across the tree. */
   microCompact?: ConstructorParameters<typeof AgentRunner>[0]['microCompact'];
+  /**
+   * Hard-wall token budget applied to every spawned child runner. Per-spawn
+   * override is not yet plumbed through `spawn`; this is the pool-wide
+   * default.
+   */
+  tokenBudget?: TokenBudget;
 }
 
 interface ChildRecord {
@@ -113,6 +119,7 @@ export class SubagentPool {
       systemPrompt,
       ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       ...(this.deps.microCompact !== undefined ? { microCompact: this.deps.microCompact } : {}),
+      ...(this.deps.tokenBudget !== undefined ? { tokenBudget: this.deps.tokenBudget } : {}),
       onSpawn: (inner) => this.spawn(inner),
     });
     runner.start();

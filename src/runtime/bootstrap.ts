@@ -18,7 +18,7 @@ import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 
-import { AgentRunner } from './agentRunner.js';
+import { AgentRunner, type TokenBudget } from './agentRunner.js';
 import { SubagentPool } from './subagentPool.js';
 
 /**
@@ -55,6 +55,17 @@ export interface BootstrapOptions {
    * Diagnostic sinks. Each sees every bus event and the prompt hook.
    */
   diagSinks?: DiagSink[];
+  /**
+   * Hard-wall token caps for the root runner. Subagents inherit through
+   * the pool's `subagentTokenBudget` (separate option).
+   */
+  tokenBudget?: TokenBudget;
+  /**
+   * Hard-wall token caps applied to every spawned subagent. Per-spawn
+   * override is not yet plumbed through `spawn`; this is the global
+   * default for children of this runtime.
+   */
+  subagentTokenBudget?: TokenBudget;
 }
 
 export interface Runtime {
@@ -104,6 +115,9 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
       role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
     memory,
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
+    ...(opts.subagentTokenBudget !== undefined
+      ? { tokenBudget: opts.subagentTokenBudget }
+      : {}),
   });
 
   const runner = new AgentRunner({
@@ -117,6 +131,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     memory,
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
+    ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
     ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
     onSpawn: (req) => subagents.spawn(req),
   });
