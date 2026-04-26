@@ -43,7 +43,7 @@ async function runTurn(
   threadId: import('@harness/core/ids.js').ThreadId,
   text: string,
 ): Promise<void> {
-  await new Promise<void>(async (resolve, reject) => {
+  const completion = new Promise<void>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('timeout')), 3_000);
     const sub = bus.subscribe(
       (ev) => {
@@ -55,9 +55,10 @@ async function runTurn(
       },
       { threadId },
     );
-    const seed = await store.append({ threadId, kind: 'user_turn_start', payload: { text } });
-    bus.publish(seed);
   });
+  const seed = await store.append({ threadId, kind: 'user_turn_start', payload: { text } });
+  bus.publish(seed);
+  await completion;
 }
 
 describe('tools: usage', () => {

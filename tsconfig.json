@@ -17,9 +17,8 @@
     "sourceMap": true,
     "incremental": true,
     "skipLibCheck": true,
-    "baseUrl": ".",
     "paths": {
-      "@harness/*": ["src/*"]
+      "@harness/*": ["./src/*"]
     }
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"],
