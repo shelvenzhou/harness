@@ -15,6 +15,10 @@ import {
 } from '@harness/diag/index.js';
 
 import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
+import {
+  CompactionTrigger,
+  type CompactionTriggerOptions,
+} from '@harness/context/compactionTrigger.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 
@@ -66,6 +70,14 @@ export interface BootstrapOptions {
    * default for children of this runtime.
    */
   subagentTokenBudget?: TokenBudget;
+  /**
+   * Cold-path compaction trigger. When set, the runtime watches
+   * sampling_complete events and publishes `compact_request` once the
+   * projection's estimatedTokens crosses the threshold. The trigger is a
+   * mechanism only — actual compaction handling lives in the runner /
+   * compactor stack.
+   */
+  compactionTrigger?: CompactionTriggerOptions;
 }
 
 export interface Runtime {
@@ -79,6 +91,8 @@ export interface Runtime {
   rootThreadId: ThreadId;
   runner: AgentRunner;
   diag?: { stop: () => Promise<void> };
+  /** Cold-path compaction trigger (only present if `compactionTrigger` opt was passed). */
+  compactionTrigger?: CompactionTrigger;
 }
 
 export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
@@ -137,6 +151,12 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   });
   runner.start();
 
+  let compactionTrigger: CompactionTrigger | undefined;
+  if (opts.compactionTrigger) {
+    compactionTrigger = new CompactionTrigger(opts.compactionTrigger);
+    compactionTrigger.start(bus, store);
+  }
+
   return {
     bus,
     store,
@@ -148,5 +168,6 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     rootThreadId,
     runner,
     ...(diag !== undefined ? { diag } : {}),
+    ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
   };
 }
