@@ -105,12 +105,17 @@ runner sees them as events. Uniform treatment simplifies audit + replay.
 
 ## Subagent budgets and interrupt propagation
 
-`spawn` accepts a `budget` envelope: `{maxTurns, maxToolCalls, maxWallMs}`.
-The pool tracks per-child counters and enforces them as **hard caps**:
+`spawn` accepts a `budget` envelope:
+`{maxTurns, maxToolCalls, maxWallMs, maxTokens}`. The pool tracks
+per-child counters and enforces them as **hard caps**:
 
 - `maxTurns` — sampling step count; counted by `sampling_complete` events.
 - `maxToolCalls` — `tool_call` events appended to the child thread.
 - `maxWallMs` — wall time since `spawn`.
+- `maxTokens` — cumulative prompt + completion tokens reported by
+  `SamplingResult.usage`. The most direct cost signal; without it a
+  child can stay within turn / tool-call caps yet quietly burn quota
+  via large contexts. Soft warning at 80%, hard interrupt at 100%.
 
 When any cap trips, the pool publishes `interrupt` to the child's bus
 filter. The child runner cancels in-flight sampling (its `AbortController`
@@ -126,6 +131,28 @@ quota. Propagation walks the `parentThreadId` tree maintained by the pool.
 `inheritTurns` (parameter recorded today, not yet enforced): when set,
 the spawn seeds the child thread with the last N turns of the parent log
 copied verbatim. Carries handles forward.
+
+### Structural caps (anti spawn-bomb)
+
+Per-child budgets bound *individual* cost; they do not bound *how many*
+children can exist. A single LLM turn can legally emit eight `spawn`
+actions; recursively that's a fan-out bomb whose cost trips the API
+quota long before any individual child's budget fires.
+
+`SubagentPool` therefore enforces three structural caps configured at
+runtime bootstrap (not under LLM control):
+
+- `maxDepth` — longest `parentThreadId` chain (default 4).
+- `maxSiblingsPerParent` — concurrent active children of one parent
+  (default 4).
+- `maxConcurrentTotal` — process-wide active subagents + actors
+  (default 32).
+
+When a `spawn` would violate any cap, the pool **rejects it as a
+tool-call error** (`{ ok: false, error: 'spawn_limit', limit, value }`).
+The LLM sees the rejection and adapts. Hard structural limits, not
+soft warnings — soft warnings get ignored. See [10-actor-mode.md §3b](10-actor-mode.md)
+for the same rule applied to long-lived actors.
 
 ## Concurrency model
 

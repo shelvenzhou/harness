@@ -88,6 +88,15 @@ interface SendOpts {
   phase?: 'CurrentTurn' | 'NextTurn'; // default NextTurn
   interrupt?: boolean;                // default false
   asKind?: 'user_input' | 'external_event'; // default external_event
+
+  // Cognitive snapshot (see §1a). Optional but strongly recommended for
+  // request/response patterns where the sender will need to interpret
+  // the reply in the context of the goal that motivated the request.
+  senderState?: {
+    correlationId: string;            // echoed back on the reply
+    goalKey: string;                  // memory/handle key restorable by sender
+    goalSnapshot?: string;            // inline copy if too small to be worth a handle
+  };
 }
 ```
 
@@ -96,6 +105,35 @@ target thread's `ActiveTurn` → call `deliver(event, {interrupt})`. Phase
 controls whether the receiver sees it before its next sampling or only
 after the current turn closes — exactly the same semantics as the
 existing per-thread mailbox phase, lifted to inter-actor scope.
+
+#### 1a. Correlation IDs and cognitive snapshots
+
+`traceparent` already gives the runtime a way to stitch a reply back to
+its originating request, but it does not solve a different problem:
+when B's reply arrives at A, A's *projected* context may have moved on
+(new user input, compaction). A may no longer "remember" what it asked
+B for, or why.
+
+The pattern: A includes a `senderState` on the outbound `send`. The
+runtime persists `goalKey` / `goalSnapshot` so the sender can `restore`
+the original goal alongside the reply. The receiver echoes
+`correlationId` on its response (whether a `subtask_complete`-style
+return or a fresh `send`). The sender's projection layer renders the
+reply with an inline reference to the snapshot:
+
+```
+<reply correlation="req-7c">
+  [goal: "find prior incident reports matching pattern X"]
+  [restore goal-7c for full context]
+  result: …
+</reply>
+```
+
+This is voluntary — small synchronous-shaped exchanges don't need it —
+but it is the canonical fix for the "B replied but A forgot why" failure
+mode in async actor systems. The `goalKey` integrates with the existing
+`restore(handle)` machinery from [04-context.md](04-context.md), so no
+new persistence path is required: the snapshot is just another handle.
 
 ### 2. Actor registry
 
@@ -134,6 +172,76 @@ shape:
 A new `ActorPool` (sibling of `SubagentPool`) owns this. `SubagentPool`
 keeps its existing semantics; the two pools share the registry but not
 the lifecycle code.
+
+#### 3a. Circuit breaker (lifetime caps for long-lived actors)
+
+Per-turn budgets prevent a single turn from running away, but they do
+not stop a long-lived actor from quietly burning quota across thousands
+of turns. The "digital black hole" failure mode: an idle-then-active
+watcher that wakes once a minute, samples the LLM, and goes back to
+sleep — perfectly within per-turn budget yet expensive over a week.
+
+`ActorPool` therefore enforces three orthogonal caps in addition to the
+per-turn budget:
+
+```ts
+interface ActorBudget {
+  // per-turn (already present)
+  maxToolCallsPerTurn?: number;
+  maxWallMsPerTurn?: number;
+
+  // lifetime — circuit breakers
+  maxLifetimeTokens?: number;   // soft: warn at 80%, hard-stop at 100%
+  maxLifetimeUsd?: number;      // alternative framing for cost-capped envs
+  ttlMs?: number;               // hard: actor terminated after wall-clock
+  idleTtlMs?: number;           // hibernate after this many ms with no inbound
+}
+```
+
+- **Token / cost cap** is the primary defence. Token usage is already
+  reported by the provider per sampling (`SamplingResult.usage`); the
+  pool sums it across the actor's lifetime. At 80% the pool publishes
+  `actor_budget_warning` so the actor can self-trim or escalate; at
+  100% it publishes `actor_stop` with reason `budget_exceeded`.
+- **TTL** is wall-clock based and uncoupled from work done — useful for
+  "this watcher should not exist past midnight" or for scheduling
+  hygiene. Distinct from `idleTtlMs` (which triggers hibernation, not
+  termination).
+- **Token counting must also exist for spawn-tree mode.** Today
+  `SubagentPool` only counts turns / tool-calls / wall time; tokens are
+  the most direct cost signal and should be added as a fourth
+  dimension of `SubagentBudget` so the same circuit-breaker logic
+  applies to ephemeral subtrees.
+
+#### 3b. Depth and fan-out caps (anti spawn-bomb)
+
+Per-actor and per-subagent budgets do not bound *how many* actors /
+children can exist. A single LLM turn can legally emit eight `spawn`
+actions; recursively that's a fan-out bomb that exhausts the API
+quota before any single actor's budget trips.
+
+Both pools enforce three structural caps, configured at runtime
+bootstrap and **not** under LLM control:
+
+```ts
+interface PoolStructuralLimits {
+  maxDepth: number;              // longest parent→child chain (default 4)
+  maxSiblingsPerParent: number;  // concurrent active children of one parent (default 4)
+  maxConcurrentTotal: number;    // process-wide active actors+subagents (default 32)
+}
+```
+
+When a `spawn` or `actor_register` would exceed any cap, the pool
+**rejects the call** and returns a `tool_call` error like
+`{ ok: false, error: 'spawn_limit', limit: 'maxDepth', value: 4 }`.
+The LLM sees the rejection like any other tool failure and adapts.
+This is intentionally a hard structural limit, not a soft warning:
+soft warnings are easy for the model to ignore.
+
+`maxDepth` is measured along `parentThreadId`; cross-actor `send`
+does not count toward depth (peers are not parents). `actor_register`
+counts against `maxConcurrentTotal` but not against any parent's
+sibling cap, since actors live outside the spawn tree.
 
 ### 4. Optional state machine layer
 

@@ -65,6 +65,12 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   Missing:
   - ⚪ `inheritTurns` — currently recorded but never copies parent turns.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
+  - ⚪ `maxTokens` budget dimension — track cumulative
+    `SamplingResult.usage` against a cap; warn at 80%, interrupt at
+    100%. See [01-runtime.md](design-docs/01-runtime.md#subagent-budgets-and-interrupt-propagation).
+  - ⚪ Structural caps (`maxDepth`, `maxSiblingsPerParent`,
+    `maxConcurrentTotal`) — reject `spawn` as tool-call error when
+    exceeded. Anti spawn-bomb. See same section.
 - ⚪ **Scheduler** — class exists, not wired to `wait(timer)` actions;
   no cron.
 
@@ -94,6 +100,13 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   Missing:
   - ⚪ Auto-`ingest` of recent turns into memory at turn boundaries.
   - ⚪ Pagination over mem0 `getAll` (currently first page only).
+  - ⚪ `confidence` + `provenance` metadata on entries; runtime-assigned
+    (LLM `memory.set` → `speculative`, trusted-adapter ingest →
+    `user_asserted`, verifier subagent → `verified`). Projection layer
+    must render `<memory confidence="…">` framing. See
+    [09-memory.md](design-docs/09-memory.md#confidence-and-provenance).
+  - ⚪ Async verifier subagent — sweeps speculative entries on a
+    cadence, promotes to `verified` or downgrades / deletes.
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟡 **`wait`** — schema + tool-call accepted; actual yield semantics
@@ -128,6 +141,22 @@ See commit B for what just landed. Still missing:
   counts; OpenAI reports `cached_tokens` when long prefixes hit.
 - ⚪ Compaction metrics plumbing: `CompactionEvent` type exists and is
   accepted by the bus, but StaticCompactor doesn't emit one.
+
+## Actor mode (deferred — see [10-actor-mode.md](design-docs/10-actor-mode.md))
+
+Whole document is deferred until a trigger condition lands; gaps
+listed here so the TODO is the single source of truth.
+
+- ⚪ `ActorPool` (sibling of SubagentPool) with per-turn budget,
+  hibernation idle policy, explicit stop.
+- ⚪ Actor registry + `send(actorRef, msg)` primitive.
+- ⚪ Lifetime circuit breakers on `ActorBudget`:
+  `maxLifetimeTokens` / `maxLifetimeUsd` / `ttlMs` / `idleTtlMs`.
+- ⚪ `senderState` on `SendOpts` — correlation id + goal snapshot
+  restorable via `restore(handle)`. Fixes "B replied but A forgot why".
+- ⚪ Optional state machine layer over `AgentRunner`.
+- ⚪ `external_event` framing in projection (untrusted-input boundary).
+- ⚪ `forkTree` / `rewindTree` with effect-classified tool tags.
 
 ## Sandbox / permissions
 
