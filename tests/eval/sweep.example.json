@@ -1,0 +1,19 @@
+{
+  "systemPrompt": "You are a careful coding agent. The tools `read`, `write`, `shell`, `usage`, `spawn` are available; use them when appropriate.",
+  "perTaskTimeoutMs": 60000,
+  "tasks": "all",
+  "models": [
+    {
+      "label": "gpt-4o-mini",
+      "apiKey": "${OPENAI_API_KEY}",
+      "model": "gpt-4o-mini",
+      "defaultMaxTokens": 512
+    },
+    {
+      "label": "gpt-4.1-mini",
+      "apiKey": "${OPENAI_API_KEY}",
+      "model": "gpt-4.1-mini",
+      "defaultMaxTokens": 512
+    }
+  ]
+}
