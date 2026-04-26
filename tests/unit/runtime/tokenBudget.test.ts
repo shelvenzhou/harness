@@ -98,6 +98,36 @@ async function runUntilTerminal(
 }
 
 describe('runtime: token budget hard-wall', () => {
+  it('errors the turn when a single sampling overruns the cap (no follow-up sampling)', async () => {
+    // Single LLM call yields end_turn with usage > cap. There is no
+    // "next sampling" to gate, so the post-sampling check has to be
+    // the one that fires. Pre-fix this slipped through as 'completed'.
+    const provider = new BudgetTestProvider([
+      {
+        deltas: [
+          { kind: 'text_delta', text: 'huge', channel: 'reply' },
+          { kind: 'end', stopReason: 'end_turn' },
+        ],
+        promptTokens: 1_500,
+        completionTokens: 1_500, // total 3000 > cap 2000
+      },
+    ]);
+    const runtime = await bootstrap({
+      provider,
+      systemPrompt: 'sys',
+      tokenBudget: { maxTurnTokens: 2_000 },
+    });
+    const result = await runUntilTerminal(
+      runtime.bus,
+      runtime.store,
+      runtime.rootThreadId,
+      'go',
+    );
+    expect(result.status).toBe('errored');
+    expect(result.summary).toMatch(/tokens_exceeded:turn used=3000 cap=2000/);
+    expect(result.samplingCount).toBe(1);
+  });
+
   it('completes normally when no cap is configured', async () => {
     const provider = new BudgetTestProvider([
       {
@@ -170,26 +200,29 @@ describe('runtime: token budget hard-wall', () => {
     expect(replies).not.toContain('should-not-appear');
   });
 
-  it('errors the turn when maxThreadTokens is exceeded across turns', async () => {
+  it('errors a later turn when maxThreadTokens is exceeded across turns', async () => {
+    // Turn 1 banks under the cap; turn 2's first sampling pushes the
+    // thread total over and the post-sampling check fires within turn 2.
+    // (Pre-fix this test was written for "cap fires at the top of
+    // turn 2 before sampling" with samplingCount=0 — but with the
+    // post-sampling check, the cap fires precisely when crossed, so a
+    // hop into the next turn now requires turn 1 to stay strictly under.)
     const provider = new BudgetTestProvider([
       {
         deltas: [
           { kind: 'text_delta', text: 'first', channel: 'reply' },
           { kind: 'end', stopReason: 'end_turn' },
         ],
-        promptTokens: 500,
-        completionTokens: 500,
+        promptTokens: 400,
+        completionTokens: 400,
       },
-      // Second turn: the very first sampling should still run (cap is
-      // checked BEFORE sampling, but at the start of turn 2 we have 1000
-      // banked, so the check fires and we error out without sampling).
       {
         deltas: [
           { kind: 'text_delta', text: 'second', channel: 'reply' },
           { kind: 'end', stopReason: 'end_turn' },
         ],
-        promptTokens: 500,
-        completionTokens: 500,
+        promptTokens: 400,
+        completionTokens: 400,
       },
     ]);
     const runtime = await bootstrap({
@@ -214,7 +247,67 @@ describe('runtime: token budget hard-wall', () => {
     );
     expect(second.status).toBe('errored');
     expect(second.summary).toMatch(/tokens_exceeded:thread/);
-    expect(second.samplingCount).toBe(0); // cap fired before any sample.
+    expect(second.samplingCount).toBe(1);
+  });
+
+  it('errors at the start of the next turn when thread cap is already saturated', async () => {
+    // Turn 1 saturates exactly to the cap → errored (post-sampling check).
+    // A *new* user_turn_start arrives, runner starts turn 2, the
+    // pre-sampling check at the top of runSamplingStep now fires before
+    // any sampling — samplingCount stays 0.
+    const provider = new BudgetTestProvider([
+      {
+        deltas: [
+          { kind: 'text_delta', text: 'first', channel: 'reply' },
+          { kind: 'end', stopReason: 'end_turn' },
+        ],
+        promptTokens: 500,
+        completionTokens: 500, // total exactly 1000 = cap
+      },
+      {
+        deltas: [
+          { kind: 'text_delta', text: 'should-not-run', channel: 'reply' },
+          { kind: 'end', stopReason: 'end_turn' },
+        ],
+        promptTokens: 100,
+        completionTokens: 100,
+      },
+    ]);
+    const runtime = await bootstrap({
+      provider,
+      systemPrompt: 'sys',
+      tokenBudget: { maxThreadTokens: 1_000 },
+    });
+
+    const first = await runUntilTerminal(
+      runtime.bus,
+      runtime.store,
+      runtime.rootThreadId,
+      'one',
+    );
+    // Post-sampling check: 1000 >= 1000 → errored at end of turn 1.
+    expect(first.status).toBe('errored');
+    expect(first.summary).toMatch(/tokens_exceeded:thread/);
+
+    // Turn 2 is a brand-new user_turn_start. Pre-sampling check fires
+    // before the model is ever invoked.
+    const second = await runUntilTerminal(
+      runtime.bus,
+      runtime.store,
+      runtime.rootThreadId,
+      'two',
+    );
+    expect(second.status).toBe('errored');
+    expect(second.summary).toMatch(/tokens_exceeded:thread/);
+    expect(second.samplingCount).toBe(0);
+
+    // The "should-not-run" reply must not have been emitted.
+    const events = await runtime.store.readAll(runtime.rootThreadId);
+    const replies = events
+      .filter((e) => e.kind === 'reply')
+      .map((e) => (e.payload as { text: string }).text)
+      .join('');
+    expect(replies).not.toContain('should-not-run');
   });
 
   it('resets per-turn counter at the start of each turn', async () => {

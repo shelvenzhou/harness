@@ -48,8 +48,19 @@ import { ActiveTurn } from './activeTurn.js';
  * Hard-wall token budget. The runtime enforces this as a *cap*, not as
  * advice injected into the prompt — design principle: runtime mechanism,
  * LLM policy. When tripped, the turn terminates with status='errored'
- * and a summary indicating which cap fired. Tools already in flight
- * are not aborted; the cap takes effect at the next sampling boundary.
+ * and a summary indicating which cap fired.
+ *
+ * Enforcement points:
+ *   1. *Before* each sampling step — protects accumulated state from
+ *      prior steps / prior turns (for thread-cap).
+ *   2. *After* each sampling step that does NOT emit tool calls —
+ *      catches the case where a single oversized response would
+ *      otherwise close the turn as 'completed' before the wall could
+ *      gate a "next" sampling. Without this the wall silently fails on
+ *      one-shot responses.
+ *   3. The multi-step (tool-using) path relies on (1): tools dispatched
+ *      from a step are allowed to finish; the next sampling boundary
+ *      then trips the cap.
  *
  * Tokens counted are `promptTokens + completionTokens` from each
  * `sampling_complete`. `cachedPromptTokens` is included in `promptTokens`
@@ -321,13 +332,27 @@ export class AgentRunner {
     if (pendingToolCalls.length > 0) {
       at.toAwaitingTools(pendingToolCalls.map((p) => p.toolCallId));
       // Kick off all tool calls concurrently; results arrive as events.
+      // Cap enforcement for the multi-step path is handled by the
+      // checkTokenBudget at the top of the *next* runSamplingStep —
+      // tools dispatched here are allowed to finish first.
       for (const { toolCallId, call } of pendingToolCalls) {
         void this.runToolCall(toolCallId, call);
       }
       return;
     }
 
-    // No tool calls emitted. Decide turn fate.
+    // No tool calls emitted. Re-check the cap *now*: if this single
+    // sampling overran the budget, there is no "next sampling" to gate
+    // — the turn would otherwise close as 'completed' and the wall
+    // would silently fail. The pre-sampling check at the top of this
+    // method only catches accumulated state from prior steps; this
+    // post-sampling check catches a single oversized response.
+    const trippedAfter = this.checkTokenBudget();
+    if (trippedAfter) {
+      await this.completeTurn('errored', trippedAfter);
+      return;
+    }
+
     const lastReply = [...parsed.actions]
       .reverse()
       .find((a): a is Action & { kind: 'reply' } => a.kind === 'reply');
