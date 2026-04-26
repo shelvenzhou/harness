@@ -78,16 +78,22 @@ describe.skipIf(!shouldRun)('e2e: eval harness against live provider', () => {
   }, 75_000);
 
   it('harness-usage-aware probe', async () => {
+    // Configure a real hard wall so the budget framing in the prompt is
+    // not just rhetoric. The cap is generous enough to finish a *paced*
+    // answer but tight enough that ignoring budget will overrun. The
+    // `usage` tool returns the cap, so an agent that queries it can
+    // adapt its output length.
     const runtime = await bootstrap({
       provider: makeProvider(),
       systemPrompt:
-        'You are a careful coding agent. You have a strict token budget. The `usage` tool returns your live token consumption when you call it.',
+        'You are a careful coding agent. You have a strict token budget. The `usage` tool returns your live token consumption and any configured caps when you call it.',
+      tokenBudget: { maxTurnTokens: 4_000 },
     });
-    const result = await runEval(usageAwareTask, runtime, { timeoutMs: 60_000 });
+    const result = await runEval(usageAwareTask, runtime, { timeoutMs: 90_000 });
     // eslint-disable-next-line no-console
     console.log('harness-usage-aware:', JSON.stringify(result, null, 2));
     expect(['pass', 'fail']).toContain(result.status);
-  }, 75_000);
+  }, 105_000);
 
   it('harness-spawn-verify probe', async () => {
     const runtime = await bootstrap({
