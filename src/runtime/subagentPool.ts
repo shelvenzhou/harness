@@ -28,15 +28,30 @@ import { AgentRunner, type SpawnRequestInfo, type TokenBudget } from './agentRun
  *   - maxTurns      → counted by sampling_complete events
  *   - maxToolCalls  → counted by tool_call events on the child thread
  *   - maxWallMs     → wall time since spawn
+ *   - maxTokens     → cumulative prompt+completion tokens across all
+ *                     sampling_complete events on the child thread
  *
  * When any cap trips, the pool publishes `interrupt` to the child;
  * the resulting turn_complete{interrupted} is rewritten to
  * subtask_complete{budget_exceeded}.
  *
+ * Structural caps (maxDepth, maxSiblingsPerParent, maxConcurrentTotal)
+ * are evaluated *at spawn time* and reject the spawn before any child
+ * thread is created, by throwing `SpawnRefused`. Anti spawn-bomb / cost
+ * runaway. The runner converts the rejection into a tool_result.ok=false
+ * so the LLM sees a clear error and can retry with smaller scope.
+ *
  * Parent → descendant interrupt propagation: when an interrupt fires on
  * any thread we track, every descendant child also gets interrupted so
  * orphan agents don't keep burning provider quota.
  */
+
+export class SpawnRefused extends Error {
+  constructor(readonly reason: string, message: string) {
+    super(message);
+    this.name = 'SpawnRefused';
+  }
+}
 
 export interface SubagentPoolDeps {
   bus: EventBus;
@@ -55,6 +70,34 @@ export interface SubagentPoolDeps {
    * default.
    */
   tokenBudget?: TokenBudget;
+  /**
+   * Structural caps. Pre-flight check at `spawn` time. Each cap, when
+   * exceeded, throws `SpawnRefused` so the runner can surface a tool
+   * error instead of silently allowing a runaway spawn tree.
+   *
+   * - maxDepth: how deep the spawn tree can grow. Depth 1 = root spawns
+   *   a child. Depth 2 = that child spawns a grandchild. Default
+   *   undefined (no limit).
+   * - maxSiblingsPerParent: how many concurrent direct children any
+   *   single parent may have at once. Bounds fan-out per node.
+   * - maxConcurrentTotal: how many child threads the pool may track at
+   *   once across the entire tree. Bounds total in-flight work.
+   */
+  maxDepth?: number;
+  maxSiblingsPerParent?: number;
+  maxConcurrentTotal?: number;
+}
+
+/** Per-child budget. `maxTokens` is the cumulative prompt+completion
+ * tokens across the child thread (mirrors the runner's
+ * `tokenBudget.maxThreadTokens` framing but is enforced from the pool
+ * so the child exits via the same `subtask_complete{budget_exceeded}`
+ * path as the other dimensions). */
+export interface ChildBudget {
+  maxTurns?: number;
+  maxToolCalls?: number;
+  maxWallMs?: number;
+  maxTokens?: number;
 }
 
 interface ChildRecord {
@@ -62,13 +105,16 @@ interface ChildRecord {
   parentThreadId: ThreadId;
   parentTurnId: TurnId;
   role?: string;
+  /** Depth in the spawn tree; root spawns a child at depth 1. */
+  depth: number;
   startedAt: number;
-  budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number };
+  budget: ChildBudget;
   turnsUsed: number;
   toolCallsUsed: number;
+  tokensUsed: number;
   wallTimer?: ReturnType<typeof setTimeout>;
   budgetExceeded: boolean;
-  exceededReason?: 'maxTurns' | 'maxToolCalls' | 'maxWallMs';
+  exceededReason?: 'maxTurns' | 'maxToolCalls' | 'maxWallMs' | 'maxTokens';
 }
 
 export class SubagentPool {
@@ -93,7 +139,36 @@ export class SubagentPool {
 
   async spawn(req: SpawnRequestInfo): Promise<ThreadId> {
     this.ensureSubscribed();
-    const childThreadId = newThreadId();
+    // Structural caps first: fail fast before we touch the store. Each
+    // throws `SpawnRefused` so the runner can convert into a
+    // tool_result.ok=false instead of leaking the exception.
+    const parentDepth = this.depthOf(req.parentThreadId);
+    const childDepth = parentDepth + 1;
+    if (this.deps.maxDepth !== undefined && childDepth > this.deps.maxDepth) {
+      throw new SpawnRefused(
+        'maxDepth',
+        `spawn rejected: depth ${childDepth} would exceed maxDepth=${this.deps.maxDepth}`,
+      );
+    }
+    if (this.deps.maxSiblingsPerParent !== undefined) {
+      const siblings = this.directChildrenOf(req.parentThreadId).length;
+      if (siblings >= this.deps.maxSiblingsPerParent) {
+        throw new SpawnRefused(
+          'maxSiblingsPerParent',
+          `spawn rejected: parent already has ${siblings} live children (cap=${this.deps.maxSiblingsPerParent})`,
+        );
+      }
+    }
+    if (this.deps.maxConcurrentTotal !== undefined) {
+      if (this.children.size >= this.deps.maxConcurrentTotal) {
+        throw new SpawnRefused(
+          'maxConcurrentTotal',
+          `spawn rejected: ${this.children.size} children already live (cap=${this.deps.maxConcurrentTotal})`,
+        );
+      }
+    }
+
+    const childThreadId = req.childThreadId ?? newThreadId();
     const traceparent = req.parentTraceparent ?? newRootTraceparent();
     await this.deps.store.createThread({
       id: childThreadId,
@@ -129,10 +204,12 @@ export class SubagentPool {
       parentThreadId: req.parentThreadId,
       parentTurnId: req.parentTurnId,
       ...(req.role !== undefined ? { role: req.role } : {}),
+      depth: childDepth,
       startedAt: Date.now(),
-      budget: req.budget ?? {},
+      budget: (req.budget ?? {}) as ChildBudget,
       turnsUsed: 0,
       toolCallsUsed: 0,
+      tokensUsed: 0,
       budgetExceeded: false,
     };
     if (record.budget.maxWallMs && record.budget.maxWallMs > 0) {
@@ -151,7 +228,7 @@ export class SubagentPool {
   private async onEvent(event: HarnessEvent): Promise<void> {
     switch (event.kind) {
       case 'sampling_complete':
-        return this.onSamplingComplete(event.threadId);
+        return this.onSamplingComplete(event.threadId, event);
       case 'tool_call':
         return this.onToolCall(event.threadId);
       case 'interrupt':
@@ -163,12 +240,18 @@ export class SubagentPool {
     }
   }
 
-  private onSamplingComplete(threadId: ThreadId): void {
+  private onSamplingComplete(threadId: ThreadId, ev: HarnessEvent): void {
     const r = this.children.get(threadId);
     if (!r || r.budgetExceeded) return;
     r.turnsUsed += 1;
+    const usage = ev.payload as { promptTokens: number; completionTokens: number };
+    r.tokensUsed += (usage.promptTokens ?? 0) + (usage.completionTokens ?? 0);
     if (r.budget.maxTurns !== undefined && r.turnsUsed >= r.budget.maxTurns) {
       this.tripBudget(threadId, 'maxTurns');
+      return;
+    }
+    if (r.budget.maxTokens !== undefined && r.tokensUsed >= r.budget.maxTokens) {
+      this.tripBudget(threadId, 'maxTokens');
     }
   }
 
@@ -183,7 +266,7 @@ export class SubagentPool {
 
   private tripBudget(
     threadId: ThreadId,
-    reason: 'maxTurns' | 'maxToolCalls' | 'maxWallMs',
+    reason: 'maxTurns' | 'maxToolCalls' | 'maxWallMs' | 'maxTokens',
   ): void {
     const r = this.children.get(threadId);
     if (!r || r.budgetExceeded) return;
@@ -199,6 +282,22 @@ export class SubagentPool {
     for (const child of descendants) {
       this.publishInterrupt(child, 'parent_interrupt');
     }
+  }
+
+  private depthOf(threadId: ThreadId): number {
+    // The given thread is itself a "node" in the spawn tree; if it's
+    // tracked, its `depth` is authoritative. If it's not tracked, it's
+    // a root (parent that was never a child of this pool), depth 0.
+    const r = this.children.get(threadId);
+    return r ? r.depth : 0;
+  }
+
+  private directChildrenOf(parentThreadId: ThreadId): ChildRecord[] {
+    const out: ChildRecord[] = [];
+    for (const r of this.children.values()) {
+      if (r.parentThreadId === parentThreadId) out.push(r);
+    }
+    return out;
   }
 
   private descendantsOf(threadId: ThreadId): ThreadId[] {
@@ -248,7 +347,7 @@ export class SubagentPool {
     }
 
     const summary = record.budgetExceeded
-      ? `budget exceeded (${record.exceededReason}); turns=${record.turnsUsed} toolCalls=${record.toolCallsUsed}`
+      ? `budget exceeded (${record.exceededReason}); turns=${record.turnsUsed} toolCalls=${record.toolCallsUsed} tokens=${record.tokensUsed}`
       : p.summary;
 
     const evOut: HarnessEvent = {

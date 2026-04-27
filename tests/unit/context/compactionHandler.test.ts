@@ -69,7 +69,12 @@ describe('context: compaction handler', () => {
     handler.start(bus, store);
 
     const observed: HarnessEvent[] = [];
-    bus.subscribe((ev) => observed.push(ev), { kinds: ['compaction_event'] });
+    bus.subscribe(
+      (ev) => {
+        observed.push(ev);
+      },
+      { kinds: ['compaction_event'] },
+    );
 
     bus.publish(compactRequest(tid));
     await flush();
@@ -93,7 +98,12 @@ describe('context: compaction handler', () => {
     handler.start(bus, store);
 
     const requests: HarnessEvent[] = [];
-    bus.subscribe((ev) => requests.push(ev), { kinds: ['compact_request'] });
+    bus.subscribe(
+      (ev) => {
+        requests.push(ev);
+      },
+      { kinds: ['compact_request'] },
+    );
 
     // First sampling crosses the threshold — trigger publishes a
     // compact_request, handler runs the compactor, then acknowledge()
@@ -171,7 +181,12 @@ describe('context: compaction handler', () => {
     handler.start(bus, store);
 
     const observed: HarnessEvent[] = [];
-    bus.subscribe((ev) => observed.push(ev), { kinds: ['compaction_event'] });
+    bus.subscribe(
+      (ev) => {
+        observed.push(ev);
+      },
+      { kinds: ['compaction_event'] },
+    );
 
     bus.publish(compactRequest(tid));
     bus.publish(compactRequest(tid));

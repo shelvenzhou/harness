@@ -75,6 +75,15 @@ export interface BootstrapOptions {
    */
   subagentTokenBudget?: TokenBudget;
   /**
+   * Structural caps on the spawn tree. See SubagentPoolDeps for shape.
+   * Keeping these undefined gives the existing unbounded behaviour;
+   * for any production / long-running setup at least `maxDepth` and
+   * `maxConcurrentTotal` should be set.
+   */
+  subagentMaxDepth?: number;
+  subagentMaxSiblingsPerParent?: number;
+  subagentMaxConcurrentTotal?: number;
+  /**
    * Cold-path compaction trigger. When set, the runtime watches
    * sampling_complete events and publishes `compact_request` once the
    * projection's estimatedTokens crosses the threshold. The trigger is a
@@ -147,6 +156,13 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(opts.subagentTokenBudget !== undefined
       ? { tokenBudget: opts.subagentTokenBudget }
+      : {}),
+    ...(opts.subagentMaxDepth !== undefined ? { maxDepth: opts.subagentMaxDepth } : {}),
+    ...(opts.subagentMaxSiblingsPerParent !== undefined
+      ? { maxSiblingsPerParent: opts.subagentMaxSiblingsPerParent }
+      : {}),
+    ...(opts.subagentMaxConcurrentTotal !== undefined
+      ? { maxConcurrentTotal: opts.subagentMaxConcurrentTotal }
       : {}),
   });
 

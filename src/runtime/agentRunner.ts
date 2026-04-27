@@ -118,6 +118,7 @@ export interface AgentRunnerOptions {
 export interface SpawnRequestInfo {
   parentThreadId: ThreadId;
   parentTurnId: TurnId;
+  childThreadId?: ThreadId;
   task: string;
   role?: string;
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number };
@@ -629,7 +630,12 @@ export class AgentRunner {
     const args = rawArgs as {
       task: string;
       role?: string;
-      budget?: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number };
+      budget?: {
+        maxTurns?: number;
+        maxToolCalls?: number;
+        maxWallMs?: number;
+        maxTokens?: number;
+      };
       inheritTurns?: number;
     };
     const childThreadId = newThreadId();
@@ -646,15 +652,39 @@ export class AgentRunner {
       turnId,
     });
     if (this.opts.onSpawn) {
-      await this.opts.onSpawn({
-        parentThreadId: this.opts.threadId,
-        parentTurnId: turnId,
-        task: args.task,
-        ...(args.role !== undefined ? { role: args.role } : {}),
-        budget: args.budget ?? {},
-        inheritTurns: args.inheritTurns ?? 0,
-        parentTraceparent: childOf(undefined),
-      });
+      try {
+        const spawnedChildThreadId = await this.opts.onSpawn({
+          parentThreadId: this.opts.threadId,
+          parentTurnId: turnId,
+          childThreadId,
+          task: args.task,
+          ...(args.role !== undefined ? { role: args.role } : {}),
+          budget: args.budget ?? {},
+          inheritTurns: args.inheritTurns ?? 0,
+          parentTraceparent: childOf(undefined),
+        });
+        if (spawnedChildThreadId !== childThreadId) {
+          throw new Error(
+            `spawn returned mismatched childThreadId: expected ${childThreadId}, got ${spawnedChildThreadId}`,
+          );
+        }
+      } catch (err) {
+        // Structural-cap rejection from the pool surfaces as a tool
+        // error the LLM can react to (e.g. retry with smaller scope or
+        // back off). Other exceptions also flow here — letting them
+        // crash the tick was historically how this path failed; a
+        // typed tool_result is strictly better signal.
+        const message = err instanceof Error ? err.message : String(err);
+        const reason =
+          err instanceof Error && err.name === 'SpawnRefused'
+            ? (err as { reason?: string }).reason ?? 'spawn_refused'
+            : 'spawn_failed';
+        await this.persistToolResult(toolCallId, {
+          ok: false,
+          error: { kind: reason, message },
+        });
+        return;
+      }
     }
     await this.persistToolResult(toolCallId, {
       ok: true,
