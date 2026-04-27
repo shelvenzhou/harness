@@ -30,6 +30,7 @@ import { MicroCompactor, type MicroCompactorOptions } from '@harness/context/mic
 import type { MemoryStore } from '@harness/memory/types.js';
 
 import { ActiveTurn } from './activeTurn.js';
+import { Scheduler } from './scheduler.js';
 
 /**
  * AgentRunner: drives one thread. Event-driven, not loop-driven.
@@ -142,12 +143,27 @@ export class AgentRunner {
   private microCompactor?: MicroCompactor;
   private tokensThisTurn = 0;
   private tokensThisThread = 0;
+  private readonly scheduler: Scheduler;
+  /**
+   * Pending timer ids on the current turn. Tracked so we can cancel
+   * everything on completeTurn / interrupt without leaving zombie
+   * timers that fire into a dead turn. Cleared at every turn boundary.
+   */
+  private pendingTimerIds = new Set<string>();
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
     if (opts.microCompact !== false) {
       this.microCompactor = new MicroCompactor(opts.microCompact ?? {});
     }
+    // The runner always owns the onFire callback because timer→event
+    // translation is runner state (threadId, store, bus). If the caller
+    // supplied a Scheduler we re-use the timer-handle table but install
+    // our callback on top.
+    // Runner owns its scheduler; timer→event translation is runner state
+    // (threadId, store, bus), so injection from outside would just have
+    // to wrap the runner's callback anyway.
+    this.scheduler = new Scheduler((s) => this.onTimerFired(s));
   }
 
   /** Wire this runner's subscription to its thread. */
@@ -195,8 +211,18 @@ export class AgentRunner {
     // though the right event arrived.
     const at = this.activeTurn;
     if (at && at.state.kind === 'awaiting_event') {
-      if (ev.kind === 'interrupt' || eventMatchesSpec(ev, at.state.spec)) {
+      const woke =
+        ev.kind === 'interrupt' ||
+        eventMatchesSpec(ev, at.state.spec) ||
+        // Permissive fallback: a wait_timeout external_event always wakes
+        // the turn so a bounded wait can never deadlock.
+        (ev.kind === 'external_event' &&
+          (ev.payload as { source?: string }).source === 'wait_timeout');
+      if (woke) {
         at.toRunning();
+        // The wait either matched its target or timed out; either way
+        // the surviving timers for this wait become noise. Cancel them.
+        this.cancelPendingTimers();
       }
     }
 
@@ -205,6 +231,10 @@ export class AgentRunner {
       this.activeTurn.deliver(ev, ev.kind === 'interrupt' ? { interrupt: true } : {});
       if (ev.kind === 'interrupt') {
         this.abortCtl?.abort();
+        // Pending wait timers should not fire after an interrupt: the
+        // turn is on its way out and any timer_fired we'd publish would
+        // be stale. Same as completeTurn but earlier in the lifecycle.
+        this.cancelPendingTimers();
       }
     }
 
@@ -637,12 +667,95 @@ export class AgentRunner {
     // Otherwise the tool_result we publish would itself flow back through
     // onEvent → shouldTriggerTick(tool_result) and re-arm sampling, which
     // would defeat the suspension.
+    const a = (rawArgs ?? {}) as Record<string, unknown>;
     const spec = parseWaitSpec(rawArgs);
     this.activeTurn?.toAwaitingEvent(spec);
+
+    // matcher='timer' must schedule the timer ourselves, otherwise the
+    // turn deadlocks: nothing else publishes timer_fired.
+    let scheduled = false;
+    let scheduledTimeoutId: string | undefined;
+    if (spec.matcher === 'timer') {
+      const delayMs = typeof a.delayMs === 'number' ? a.delayMs : NaN;
+      if (Number.isFinite(delayMs) && delayMs > 0) {
+        this.scheduler.schedule({
+          threadId: this.opts.threadId,
+          timerId: spec.timerId,
+          delayMs,
+          tag: 'wait',
+        });
+        this.pendingTimerIds.add(spec.timerId);
+        scheduled = true;
+      }
+      // If delayMs is missing for a timer wait, we deliberately do not
+      // synthesize one. That's a model error — surface it via the
+      // tool_result so the LLM can re-issue with valid args; the wait
+      // itself stays open and will need an interrupt or a manual
+      // event to resolve.
+    } else {
+      // For non-timer matchers, honour wait.timeoutMs if provided. We
+      // schedule a private timer that, on fire, publishes a synthetic
+      // external_event{source:"wait_timeout"} which the runner's
+      // permissive fallback in eventMatchesSpec wakes on (kind matcher
+      // = 'external_event'). For specific matchers we still wake them
+      // because shouldTriggerTick admits external_event — and once the
+      // tick runs, isReadyToSample sees the awaiting_event clear.
+      const timeoutMs = typeof a.timeoutMs === 'number' ? a.timeoutMs : NaN;
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        const timeoutTimerId = `wait_timeout_${toolCallId}`;
+        this.scheduler.schedule({
+          threadId: this.opts.threadId,
+          timerId: timeoutTimerId,
+          delayMs: timeoutMs,
+          tag: 'wait_timeout',
+        });
+        this.pendingTimerIds.add(timeoutTimerId);
+        scheduledTimeoutId = timeoutTimerId;
+      }
+    }
+
     await this.persistToolResult(toolCallId, {
       ok: true,
-      output: { scheduled: true, matcher: spec.matcher },
+      output: {
+        scheduled: spec.matcher === 'timer' ? scheduled : true,
+        matcher: spec.matcher,
+        ...(spec.matcher === 'timer' && !scheduled
+          ? { error: 'timer wait requires positive delayMs' }
+          : {}),
+        ...(scheduledTimeoutId !== undefined ? { timeoutTimerId: scheduledTimeoutId } : {}),
+      },
     });
+  }
+
+  /**
+   * Scheduler callback. We keep it tight: persist the timer_fired
+   * envelope on this thread and publish; runner's own subscription
+   * picks it up via shouldTriggerTick → eventMatchesSpec wakes any
+   * awaiting_event whose timerId matches. Wait-timeout timers fire as
+   * external_event so the permissive fallback handles them too.
+   */
+  private onTimerFired(s: { threadId: ThreadId; timerId: string; tag?: string }): void {
+    if (!this.pendingTimerIds.delete(s.timerId)) {
+      // Already cancelled or unknown; drop.
+      return;
+    }
+    const isTimeout = s.tag === 'wait_timeout';
+    const ev: HarnessEvent = isTimeout
+      ? ({
+          id: newEventId(),
+          threadId: s.threadId,
+          kind: 'external_event',
+          payload: { source: 'wait_timeout', data: { timerId: s.timerId } },
+          createdAt: new Date().toISOString(),
+        } as HarnessEvent)
+      : ({
+          id: newEventId(),
+          threadId: s.threadId,
+          kind: 'timer_fired',
+          payload: { timerId: s.timerId, ...(s.tag !== undefined ? { tag: s.tag } : {}) },
+          createdAt: new Date().toISOString(),
+        } as HarnessEvent);
+    void this.opts.store.append(ev).then(() => this.opts.bus.publish(ev));
   }
 
   private async handleUsageRequest(toolCallId: ToolCallId): Promise<void> {
@@ -686,11 +799,22 @@ export class AgentRunner {
     summary?: string,
   ): Promise<void> {
     this.activeTurn?.toCompleted(summary);
+    // Cancel any timers scheduled by waits in this turn so they don't
+    // fire into a dead turn (would publish stray timer_fired events
+    // that re-arm a tick with no awaiting_event to wake).
+    this.cancelPendingTimers();
     await this.appendEvent({
       kind: 'turn_complete',
       payload: { status, ...(summary !== undefined ? { summary } : {}) },
       ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
     });
+  }
+
+  private cancelPendingTimers(): void {
+    for (const tid of this.pendingTimerIds) {
+      this.scheduler.cancel(tid);
+    }
+    this.pendingTimerIds.clear();
   }
 
   private async appendEvent(

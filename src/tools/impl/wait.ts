@@ -22,7 +22,19 @@ const WaitArgs = z.object({
   childThreadId: z.string().optional(),
   /** Used when `matcher === 'timer'`. */
   timerId: z.string().optional(),
-  timeoutMs: z.number().optional(),
+  /**
+   * Required when `matcher === 'timer'`: how long to sleep before
+   * `timer_fired` is published. The runner schedules the timer when it
+   * sees this tool_call.
+   */
+  delayMs: z.number().int().positive().optional(),
+  /**
+   * Cap on how long to wait for the matching event. When exceeded the
+   * runner publishes a synthetic `external_event{source:"wait_timeout"}`
+   * that wakes the turn as a permissive fallback. Without this a
+   * malformed wait deadlocks the turn until interrupt.
+   */
+  timeoutMs: z.number().int().positive().optional(),
 });
 
 export const waitTool: Tool<typeof WaitArgs, { scheduled: true }> = {
@@ -31,7 +43,8 @@ export const waitTool: Tool<typeof WaitArgs, { scheduled: true }> = {
   description: [
     'Yield until a matching event arrives. Use `matcher: "user_input"` to explicitly pause for user.',
     'Use `matcher: "subtask_complete"` after spawning a child and wanting its result before continuing.',
-    'Use `matcher: "timer"` for delayed work. Default timeout is provider default — set timeoutMs to override.',
+    'Use `matcher: "timer"` for delayed work — provide `timerId` and `delayMs`.',
+    'Set `timeoutMs` on any matcher to bound the wait (otherwise the wait is open-ended).',
   ].join(' '),
   schema: WaitArgs,
   async execute() {
