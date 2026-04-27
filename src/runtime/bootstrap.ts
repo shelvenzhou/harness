@@ -19,6 +19,10 @@ import {
   CompactionTrigger,
   type CompactionTriggerOptions,
 } from '@harness/context/compactionTrigger.js';
+import {
+  CompactionHandler,
+  type CompactionHandlerOptions,
+} from '@harness/context/compactionHandler.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 
@@ -78,6 +82,16 @@ export interface BootstrapOptions {
    * compactor stack.
    */
   compactionTrigger?: CompactionTriggerOptions;
+  /**
+   * Cold-path compaction handler. Defaults to a `CompactionHandler` with
+   * the `StaticCompactor` strategy whenever `compactionTrigger` is set,
+   * so threshold crossings always have a consumer that emits
+   * `compaction_event` and clears the trigger's cooldown. Pass
+   * explicit options to override the strategy (e.g. inject a
+   * subagent-backed Compactor) or to install a handler without a
+   * trigger.
+   */
+  compactionHandler?: CompactionHandlerOptions;
 }
 
 export interface Runtime {
@@ -93,6 +107,8 @@ export interface Runtime {
   diag?: { stop: () => Promise<void> };
   /** Cold-path compaction trigger (only present if `compactionTrigger` opt was passed). */
   compactionTrigger?: CompactionTrigger;
+  /** Cold-path compaction handler (auto-installed alongside the trigger). */
+  compactionHandler?: CompactionHandler;
 }
 
 export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
@@ -157,6 +173,20 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     compactionTrigger.start(bus, store);
   }
 
+  // Install a cold-path handler whenever a trigger is present (so the
+  // request actually has a consumer) or when the caller explicitly
+  // asks for one. Without this, threshold crossings would publish
+  // compact_request and nobody would pick it up — the cooldown would
+  // fire once and then stay silent forever.
+  let compactionHandler: CompactionHandler | undefined;
+  if (opts.compactionHandler !== undefined || compactionTrigger !== undefined) {
+    compactionHandler = new CompactionHandler({
+      ...(opts.compactionHandler ?? {}),
+      ...(compactionTrigger !== undefined ? { trigger: compactionTrigger } : {}),
+    });
+    compactionHandler.start(bus, store);
+  }
+
   return {
     bus,
     store,
@@ -169,5 +199,6 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     runner,
     ...(diag !== undefined ? { diag } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
+    ...(compactionHandler !== undefined ? { compactionHandler } : {}),
   };
 }

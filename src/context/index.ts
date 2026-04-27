@@ -5,3 +5,4 @@ export * from './compactor.js';
 export * from './microCompactor.js';
 export * from './promptDebug.js';
 export * from './compactionTrigger.js';
+export * from './compactionHandler.js';
