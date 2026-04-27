@@ -28,6 +28,18 @@ export type AppendInput = Omit<HarnessEvent, 'id' | 'createdAt'> & {
   createdAt?: string;
 };
 
+export interface ForkOptions {
+  source: ThreadId;
+  /**
+   * Inclusive boundary: the new thread copies every event up to and
+   * including this event. Omit to copy the entire source thread.
+   */
+  untilEventId?: EventId;
+  newThreadId: ThreadId;
+  /** Optional title for the forked thread. */
+  title?: string;
+}
+
 export interface SessionStore {
   createThread(thread: Omit<Thread, 'createdAt' | 'updatedAt' | 'status'> & {
     status?: Thread['status'];
@@ -46,6 +58,18 @@ export interface SessionStore {
 
   /** For tool_result elision: attach handle metadata to a stored event. */
   attachElision(threadId: ThreadId, eventId: EventId, elided: ElidedMeta): Promise<void>;
+
+  /**
+   * Fork a thread up to (and including) `untilEventId` into a new
+   * thread. Each copied event is reissued with a fresh event id but
+   * keeps its kind, payload, turnId, parentTraceparent, and elided
+   * metadata. The new thread is recorded with `parentThreadId =
+   * source`.
+   *
+   * Used by cold-path compaction (a snapshot for the compactor
+   * subagent to read) and, later, rollback / replay debugging.
+   */
+  fork(opts: ForkOptions): Promise<Thread>;
 
   close(): Promise<void>;
 }
@@ -139,6 +163,42 @@ export class MemorySessionStore implements SessionStore {
     if (idx === undefined) throw new Error(`unknown event ${eventId} in thread ${threadId}`);
     const ev = state.events[idx]!;
     state.events[idx] = { ...ev, elided } as HarnessEvent;
+  }
+
+  async fork(opts: import('./sessionStore.js').ForkOptions): Promise<Thread> {
+    const src = this.expectThread(opts.source);
+    if (this.threads.has(opts.newThreadId)) {
+      throw new Error(`thread ${opts.newThreadId} already exists`);
+    }
+    const sliceEnd = opts.untilEventId
+      ? (() => {
+          const idx = src.byId.get(opts.untilEventId);
+          if (idx === undefined) {
+            throw new Error(`unknown event ${opts.untilEventId} in thread ${opts.source}`);
+          }
+          return idx + 1;
+        })()
+      : src.events.length;
+
+    const child = await this.createThread({
+      id: opts.newThreadId,
+      rootTraceparent: src.thread.rootTraceparent,
+      parentThreadId: src.thread.id,
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+    });
+
+    for (let i = 0; i < sliceEnd; i++) {
+      const ev = src.events[i]!;
+      // Reissue with a fresh event id but preserve the rest of the
+      // envelope so projection / tool pairing stay consistent.
+      const copy: HarnessEvent = {
+        ...ev,
+        id: newEventId(),
+        threadId: opts.newThreadId,
+      } as HarnessEvent;
+      await this.append(copy);
+    }
+    return child;
   }
 
   async close(): Promise<void> {

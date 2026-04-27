@@ -6,7 +6,12 @@ import type { EventId, ThreadId } from '@harness/core/ids.js';
 import type { HarnessEvent, ElidedMeta } from '@harness/core/events.js';
 import type { Thread } from '@harness/core/thread.js';
 
-import { MemorySessionStore, type AppendInput, type SessionStore } from './sessionStore.js';
+import {
+  MemorySessionStore,
+  type AppendInput,
+  type ForkOptions,
+  type SessionStore,
+} from './sessionStore.js';
 
 /**
  * Thin JSONL backend composed on top of MemorySessionStore.
@@ -14,6 +19,16 @@ import { MemorySessionStore, type AppendInput, type SessionStore } from './sessi
  * Layout:
  *   <root>/<threadId>/meta.json          — Thread record (rewritten on update)
  *   <root>/<threadId>/events.jsonl       — append-only event log (one JSON per line)
+ *   <root>/<threadId>/elisions.jsonl     — sidecar patch log (one JSON per line)
+ *
+ * Why a sidecar for elisions: the event log is append-only and we want
+ * to keep it that way (cheap, lock-free, replay-friendly). When tool
+ * results are elided after the fact (handle metadata attached), we
+ * append a `{eventId, elided}` line to elisions.jsonl. Loader replays
+ * events.jsonl first, then walks elisions.jsonl and patches each
+ * matching in-memory event. This keeps the canonical event ordering
+ * identical across restart while still making the elided shape
+ * authoritative on next prompt build.
  *
  * Not a production-grade store. Good enough for local dev, resume, and
  * inspecting a session after the fact. Future: swap for SQLite.
@@ -43,6 +58,7 @@ export class JsonlSessionStore implements SessionStore {
       if (!entry.isDirectory()) continue;
       const metaPath = join(this.root, entry.name, 'meta.json');
       const eventsPath = join(this.root, entry.name, 'events.jsonl');
+      const elisionsPath = join(this.root, entry.name, 'elisions.jsonl');
       if (!existsSync(metaPath)) continue;
       const thread = JSON.parse(await readFile(metaPath, 'utf8')) as Thread;
       await this.mem.createThread({
@@ -64,6 +80,21 @@ export class JsonlSessionStore implements SessionStore {
             id: ev.id,
             createdAt: ev.createdAt,
           } as AppendInput);
+        }
+      }
+      // Apply elision sidecar AFTER the events are loaded so the in-
+      // memory view reflects the post-elision shape on next prompt
+      // build. Bad lines are skipped: the elision is best-effort
+      // metadata, not load-blocking truth.
+      if (existsSync(elisionsPath)) {
+        const lines = (await readFile(elisionsPath, 'utf8')).split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const patch = JSON.parse(line) as { eventId: EventId; elided: ElidedMeta };
+            await this.mem.attachElision(thread.id, patch.eventId, patch.elided);
+          } catch {
+            // ignore: malformed line is non-fatal for replay
+          }
         }
       }
     }
@@ -121,10 +152,30 @@ export class JsonlSessionStore implements SessionStore {
   async attachElision(threadId: ThreadId, eventId: EventId, elided: ElidedMeta): Promise<void> {
     await this.ready;
     await this.mem.attachElision(threadId, eventId, elided);
-    // Elision changes the canonical event payload; we don't rewrite the
-    // JSONL (append-only). The memory view is the truth going forward, and
-    // a load+replay would reapply elision from the tool result payload
-    // itself. For phase 1 this is acceptable.
+    // Persist the elision as a sidecar patch so a load+replay produces
+    // the elided shape on next prompt build. The events.jsonl file
+    // stays append-only; elisions.jsonl is the authoritative patch
+    // log. See the layout note at the top of this file.
+    await appendElision(this.root, threadId, eventId, elided);
+  }
+
+  async fork(opts: ForkOptions): Promise<import('@harness/core/thread.js').Thread> {
+    await this.ready;
+    const thread = await this.mem.fork(opts);
+    // The mem fork already issued createThread + a series of append()
+    // calls on the in-memory backend, but those went through the
+    // sub-store's append, not ours, so nothing was persisted to disk.
+    // Rewrite the on-disk side from the in-memory truth: write meta +
+    // dump every event line we now own.
+    await this.writeMeta(thread);
+    const events = await this.mem.readAll(opts.newThreadId);
+    for (const ev of events) {
+      await appendEvent(this.root, ev);
+      if (ev.elided) {
+        await appendElision(this.root, ev.threadId, ev.id, ev.elided);
+      }
+    }
+    return thread;
   }
 
   async close(): Promise<void> {
@@ -145,4 +196,17 @@ async function appendEvent(root: string, event: HarnessEvent): Promise<void> {
     await mkdir(dirname(path), { recursive: true });
   }
   await appendFile(path, JSON.stringify(event) + '\n', 'utf8');
+}
+
+async function appendElision(
+  root: string,
+  threadId: ThreadId,
+  eventId: EventId,
+  elided: ElidedMeta,
+): Promise<void> {
+  const path = join(root, threadId, 'elisions.jsonl');
+  if (!existsSync(dirname(path))) {
+    await mkdir(dirname(path), { recursive: true });
+  }
+  await appendFile(path, JSON.stringify({ eventId, elided }) + '\n', 'utf8');
 }
