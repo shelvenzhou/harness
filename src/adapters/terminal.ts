@@ -12,10 +12,17 @@ import type { Adapter, AdapterStartOptions } from './adapter.js';
  *
  * - Each line of stdin becomes either a `user_turn_start` (if no turn is
  *   active) or a `user_input` (steer into the active turn).
- * - Subscribes to `reply`, `preamble`, `turn_complete`, and
- *   `compaction_event`; streams them to stdout with minimal formatting.
- * - Ctrl-C soft-interrupts the turn once; the CLI wrapping the adapter
- *   is expected to catch a second one and exit.
+ * - Subscribes to `reply`, `preamble`, `turn_complete`,
+ *   `compaction_event`, and `interrupt`; streams them to stdout with
+ *   minimal formatting. The interrupt subscription matters: the
+ *   runner takes a moment to unwind in-flight sampling after an
+ *   abort, and the user needs visible feedback during that window.
+ * - First Ctrl-C publishes an `interrupt` event (soft cancel of the
+ *   in-flight turn). Second Ctrl-C inside the doubleInterruptMs
+ *   window stops the adapter and resolves a shutdown promise so the
+ *   CLI host can exit cleanly. Lifted out of the CLI shell because
+ *   the previous "expected to be caught externally" contract was
+ *   never wired and double-Ctrl-C just killed the process.
  *
  * Phase 1 ships single-thread binding only.
  */
@@ -24,6 +31,11 @@ export interface TerminalAdapterOptions {
   store: SessionStore;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
+  /**
+   * Window inside which a second Ctrl-C is treated as "exit now"
+   * rather than a redundant interrupt. Default 2000ms.
+   */
+  doubleInterruptMs?: number;
 }
 
 export class TerminalAdapter implements Adapter {
@@ -37,11 +49,29 @@ export class TerminalAdapter implements Adapter {
   private readonly store: SessionStore;
   private readonly input: NodeJS.ReadableStream;
   private readonly output: NodeJS.WritableStream;
+  private readonly doubleInterruptMs: number;
+  private lastSigintAt = 0;
+  private sigintHandler: (() => void) | undefined;
+  private readonly shutdownPromise: Promise<void>;
+  private resolveShutdown!: () => void;
 
   constructor(opts: TerminalAdapterOptions) {
     this.store = opts.store;
     this.input = opts.input ?? process.stdin;
     this.output = opts.output ?? process.stdout;
+    this.doubleInterruptMs = opts.doubleInterruptMs ?? 2_000;
+    this.shutdownPromise = new Promise<void>((resolve) => {
+      this.resolveShutdown = resolve;
+    });
+  }
+
+  /**
+   * Resolves when the adapter has been asked to shut down (e.g. via
+   * double Ctrl-C). The CLI host awaits this before exiting so the
+   * process can drain in-flight work.
+   */
+  whenShutdown(): Promise<void> {
+    return this.shutdownPromise;
   }
 
   async start(opts: AdapterStartOptions): Promise<void> {
@@ -55,7 +85,7 @@ export class TerminalAdapter implements Adapter {
       (ev) => this.onBusEvent(ev),
       {
         threadId: this.threadId,
-        kinds: ['reply', 'preamble', 'turn_complete', 'compaction_event'],
+        kinds: ['reply', 'preamble', 'turn_complete', 'compaction_event', 'interrupt'],
       },
     );
 
@@ -69,12 +99,41 @@ export class TerminalAdapter implements Adapter {
       void this.onLine(line);
     });
 
+    // SIGINT: first hit interrupts the turn, second within the window
+    // shuts the adapter down. Without this the CLI shell killed the
+    // process on the first Ctrl-C and the runtime never saw the
+    // interrupt event, so any pending state (timers, child agents)
+    // was orphaned on exit.
+    this.sigintHandler = () => {
+      void this.onSigint();
+    };
+    process.on('SIGINT', this.sigintHandler);
+
     this.writePrompt();
   }
 
   async stop(): Promise<void> {
     this.subscription?.unsubscribe();
+    if (this.sigintHandler) {
+      process.removeListener('SIGINT', this.sigintHandler);
+      this.sigintHandler = undefined;
+    }
     this.rl?.close();
+    this.resolveShutdown();
+  }
+
+  private async onSigint(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastSigintAt < this.doubleInterruptMs) {
+      this.output.write('\n[exiting]\n');
+      await this.stop();
+      return;
+    }
+    this.lastSigintAt = now;
+    this.output.write('\n[interrupting — press Ctrl-C again to exit]\n');
+    if (this.bus && this.threadId) {
+      await this.publishInterrupt();
+    }
   }
 
   private writePrompt(): void {
@@ -167,6 +226,14 @@ export class TerminalAdapter implements Adapter {
         this.output.write(
           `\x1b[2m[compacted reason=${p.reason} ${p.tokensBefore}→${p.tokensAfter} tok]\x1b[0m\n`,
         );
+        break;
+      }
+      case 'interrupt': {
+        // Visible feedback while the runner unwinds the in-flight
+        // sampling — without this, double-Ctrl-C felt like a freeze.
+        const p = ev.payload as { reason?: string };
+        const reason = p.reason ? ` (${p.reason})` : '';
+        this.output.write(`\x1b[2m[interrupt${reason}]\x1b[0m\n`);
         break;
       }
       default:

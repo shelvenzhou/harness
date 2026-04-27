@@ -151,6 +151,14 @@ export class AgentRunner {
    * timers that fire into a dead turn. Cleared at every turn boundary.
    */
   private pendingTimerIds = new Set<string>();
+  /**
+   * Set when an `interrupt` event lands during the current turn. The
+   * post-sampling classifier reads this so a user-cut-off sampling
+   * resolves as `turn_complete{interrupted}` rather than misreporting
+   * as `errored:model_returned_no_actions` when the abort happened
+   * before any action surfaced. Cleared at the start of each turn.
+   */
+  private turnInterrupted = false;
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
@@ -232,6 +240,7 @@ export class AgentRunner {
       this.activeTurn.deliver(ev, ev.kind === 'interrupt' ? { interrupt: true } : {});
       if (ev.kind === 'interrupt') {
         this.abortCtl?.abort();
+        this.turnInterrupted = true;
         // Pending wait timers should not fire after an interrupt: the
         // turn is on its way out and any timer_fired we'd publish would
         // be stale. Same as completeTurn but earlier in the lifecycle.
@@ -284,6 +293,7 @@ export class AgentRunner {
     this.activeTurn.setPhase('CurrentTurn');
     this.activeTurn.toRunning();
     this.tokensThisTurn = 0;
+    this.turnInterrupted = false;
     void payload; // payload already persisted as the seed event.
     void seedEventId;
     await this.runSamplingStep();
@@ -414,6 +424,16 @@ export class AgentRunner {
 
     if (shouldContinueSampling) {
       this.scheduleTick(synthEvent(this.opts.threadId, 'post_transport_tool'));
+      return;
+    }
+
+    // Interrupt classification must come before the empty-actions and
+    // stop-reason cases below: when the user aborts mid-stream the
+    // provider may yield no actions, which would otherwise be reported
+    // as `errored:model_returned_no_actions` — wrong attribution that
+    // makes user-initiated cancellation look like a model bug.
+    if (this.turnInterrupted) {
+      await this.completeTurn('interrupted', 'user_interrupt');
       return;
     }
 
