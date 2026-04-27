@@ -115,8 +115,12 @@ export class ToolExecutor {
     tool: Tool,
     args: unknown,
   ): { ok: true; args: unknown } | { ok: false; error: string } {
+    const reparsed = maybeRecoverRawJson(args);
+    if (!reparsed.ok) {
+      return { ok: false, error: reparsed.error };
+    }
     try {
-      const parsed = tool.schema.parse(args);
+      const parsed = tool.schema.parse(reparsed.args);
       return { ok: true, args: parsed };
     } catch (err) {
       return {
@@ -124,5 +128,31 @@ export class ToolExecutor {
         error: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+}
+
+function maybeRecoverRawJson(
+  args: unknown,
+): { ok: true; args: unknown } | { ok: false; error: string } {
+  if (
+    !args ||
+    typeof args !== 'object' ||
+    !('_raw' in args) ||
+    typeof (args as { _raw?: unknown })._raw !== 'string'
+  ) {
+    return { ok: true, args };
+  }
+  const raw = (args as { _raw: string })._raw;
+  try {
+    return { ok: true, args: JSON.parse(raw) };
+  } catch (err) {
+    const preview = raw.length > 200 ? raw.slice(0, 200) + '...' : raw;
+    return {
+      ok: false,
+      error:
+        'tool arguments were not valid JSON when received by the runtime; ' +
+        'this usually means the model was cut off mid-tool-call (for example by max_tokens). ' +
+        `raw=${preview} parse_error=${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }

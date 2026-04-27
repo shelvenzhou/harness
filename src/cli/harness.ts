@@ -183,7 +183,7 @@ function printUsage(): void {
       '  OPENAI_API_KEY       required',
       '  OPENAI_MODEL         default gpt-4o-mini',
       '  OPENAI_BASE_URL      override endpoint (OpenAI-compatible)',
-      '  OPENAI_MAX_TOKENS    default 1024',
+      '  OPENAI_MAX_TOKENS    default 32768',
       '  OPENAI_TEMPERATURE   default 0.7',
       '  HARNESS_PROVIDER     default openai',
       '  HARNESS_SYSTEM_PROMPT',

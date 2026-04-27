@@ -54,6 +54,22 @@ describe('ToolExecutor', () => {
     expect(r.error?.kind).toBe('schema');
   });
 
+  it('surfaces truncated tool JSON as a readable schema error', async () => {
+    const reg = new ToolRegistry();
+    reg.register(okTool);
+    const exec = new ToolExecutor(reg);
+    const r = await exec.execute({
+      toolCallId: newToolCallId(),
+      name: 'ok',
+      args: { _raw: '{"name":"alice"' },
+      ctx: ctx(),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error?.kind).toBe('schema');
+    expect(r.error?.message).toContain('tool arguments were not valid JSON');
+    expect(r.error?.message).toContain('cut off mid-tool-call');
+  });
+
   it('executeBatch preserves input order', async () => {
     const reg = new ToolRegistry();
     reg.register(okTool);

@@ -54,6 +54,8 @@ export interface MicroCompactionResult {
   compactedCount: number;
   /** Highest index in the events array that has been compacted through. */
   newCheckpointIndex: number;
+  /** Appended compaction event, if one was emitted this pass. */
+  compactionEvent?: HarnessEvent;
 }
 
 export class MicroCompactor {
@@ -132,6 +134,7 @@ export class MicroCompactor {
     this.checkpointIndex = tailBoundary;
     this.totalAtLastPass = total;
 
+    let compactionEvent: HarnessEvent | undefined;
     if (compacted > 0 && this.opts.emitCompactionEvent) {
       const payload: CompactionEventPayload = {
         reason: 'auto',
@@ -141,14 +144,19 @@ export class MicroCompactor {
         retainedUserTurns: 0,
         ghostSnapshotCount: 0,
       };
-      await store.append({
+      compactionEvent = await store.append({
         threadId,
         kind: 'compaction_event',
         payload,
       });
     }
 
-    return { ran: true, compactedCount: compacted, newCheckpointIndex: tailBoundary };
+    return {
+      ran: true,
+      compactedCount: compacted,
+      newCheckpointIndex: tailBoundary,
+      ...(compactionEvent !== undefined ? { compactionEvent } : {}),
+    };
   }
 
   /** Rewind state for a fresh thread; primarily for tests. */

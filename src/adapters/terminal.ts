@@ -150,6 +150,10 @@ export class TerminalAdapter implements Adapter {
         break;
       }
       case 'turn_complete': {
+        const p = ev.payload as { status: string; summary?: string };
+        if (p.status !== 'completed' && p.summary) {
+          this.output.write(`\x1b[2m[turn ${p.status}: ${p.summary}]\x1b[0m\n`);
+        }
         this.turnActive = false;
         this.writePrompt();
         break;

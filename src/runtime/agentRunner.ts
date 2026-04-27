@@ -1,4 +1,4 @@
-import type { Action } from '@harness/core/actions.js';
+import type { Action, EventSpec } from '@harness/core/actions.js';
 import type {
   HarnessEvent,
   ReplyPayload,
@@ -190,6 +190,16 @@ export class AgentRunner {
       return;
     }
 
+    // Wake from awaiting_event when the spec matches, or unconditionally on
+    // interrupt. Without this, the turn stays stuck after `wait` even
+    // though the right event arrived.
+    const at = this.activeTurn;
+    if (at && at.state.kind === 'awaiting_event') {
+      if (ev.kind === 'interrupt' || eventMatchesSpec(ev, at.state.spec)) {
+        at.toRunning();
+      }
+    }
+
     // Deliver to mailbox so drain picks it up on next tick.
     if (this.activeTurn && !this.activeTurn.isTerminal()) {
       this.activeTurn.deliver(ev, ev.kind === 'interrupt' ? { interrupt: true } : {});
@@ -266,7 +276,14 @@ export class AgentRunner {
     this.samplingIndex += 1;
 
     if (this.microCompactor) {
-      await this.microCompactor.maybeRun(this.opts.threadId, this.opts.store, this.handles);
+      const compacted = await this.microCompactor.maybeRun(
+        this.opts.threadId,
+        this.opts.store,
+        this.handles,
+      );
+      if (compacted.compactionEvent) {
+        this.opts.bus.publish(compacted.compactionEvent);
+      }
     }
 
     const { request, stats } = await this.buildRequestWithStats();
@@ -296,9 +313,13 @@ export class AgentRunner {
 
     const pendingToolCalls: Array<{ toolCallId: ToolCallId; call: Action & { kind: 'tool_call' } }> = [];
 
+    let shouldContinueSampling = false;
+    let suspended = false;
     for (const action of parsed.actions) {
       at.pushActionInFlight(action);
-      await this.dispatchAction(action, pendingToolCalls);
+      const out = await this.dispatchAction(action, pendingToolCalls);
+      shouldContinueSampling = shouldContinueSampling || out.continueSampling;
+      suspended = suspended || out.suspended;
     }
 
     // Accumulate tokens for hard-wall budget enforcement. Counted on the
@@ -353,15 +374,48 @@ export class AgentRunner {
       return;
     }
 
+    if (suspended) {
+      // wait was issued: leave the turn open. An external event
+      // (timer_fired / external_event / subtask_complete) will re-arm
+      // sampling via shouldTriggerTick. Do NOT close the turn here.
+      return;
+    }
+
+    if (shouldContinueSampling) {
+      this.scheduleTick(synthEvent(this.opts.threadId, 'post_transport_tool'));
+      return;
+    }
+
+    if (parsed.actions.length === 0) {
+      const summary =
+        parsed.stopReason === 'tool_use'
+          ? 'model_returned_tool_use_without_tool_calls'
+          : parsed.stopReason === 'max_tokens'
+            ? 'model_response_truncated_before_any_action'
+            : `model_returned_no_actions${parsed.stopReason ? ` stop=${parsed.stopReason}` : ''}`;
+      await this.completeTurn('errored', summary);
+      return;
+    }
+
     const lastReply = [...parsed.actions]
       .reverse()
       .find((a): a is Action & { kind: 'reply' } => a.kind === 'reply');
+    if (parsed.stopReason === 'max_tokens') {
+      await this.completeTurn(
+        'errored',
+        lastReply
+          ? 'model_response_truncated_after_partial_reply'
+          : 'model_response_truncated_before_reply',
+      );
+      return;
+    }
     if (lastReply?.final || parsed.stopReason === 'end_turn') {
       await this.completeTurn('completed', lastReply?.text);
     } else {
-      // Model returned nothing actionable; treat as completed to avoid a
-      // runaway empty loop. Provider-specific handling can improve later.
-      await this.completeTurn('completed');
+      await this.completeTurn(
+        'errored',
+        `model_stopped_without_final_reply${parsed.stopReason ? ` stop=${parsed.stopReason}` : ''}`,
+      );
     }
   }
 
@@ -405,7 +459,7 @@ export class AgentRunner {
   private async dispatchAction(
     action: Action,
     collectToolCalls: Array<{ toolCallId: ToolCallId; call: Action & { kind: 'tool_call' } }>,
-  ): Promise<void> {
+  ): Promise<{ continueSampling: boolean; suspended: boolean }> {
     switch (action.kind) {
       case 'reply':
         await this.appendEvent({
@@ -417,14 +471,14 @@ export class AgentRunner {
           } satisfies ReplyPayload,
           ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
         });
-        break;
+        return { continueSampling: false, suspended: false };
       case 'preamble':
         await this.appendEvent({
           kind: 'preamble',
           payload: { text: action.text },
           ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
         });
-        break;
+        return { continueSampling: false, suspended: false };
       case 'tool_call': {
         const toolCallId = action.toolCallId;
         // The canonical conversation pair for ANY tool — including the
@@ -448,29 +502,32 @@ export class AgentRunner {
         // can't be expressed as ordinary Tool.execute().
         if (action.name === 'spawn') {
           await this.handleSpawnRequest(toolCallId, action.args);
-          break;
+          return { continueSampling: true, suspended: false };
         }
         if (action.name === 'wait') {
           await this.handleWaitRequest(toolCallId, action.args);
-          break;
+          // wait is a hard suspend: the turn stays open until an external
+          // event (timer_fired / external_event / subtask_complete) re-arms
+          // sampling via shouldTriggerTick.
+          return { continueSampling: false, suspended: true };
         }
         if (action.name === 'restore') {
           await this.handleRestoreRequest(toolCallId, action.args);
-          break;
+          return { continueSampling: true, suspended: false };
         }
         if (action.name === 'usage') {
           await this.handleUsageRequest(toolCallId);
-          break;
+          return { continueSampling: true, suspended: false };
         }
         collectToolCalls.push({ toolCallId, call: action });
-        break;
+        return { continueSampling: false, suspended: false };
       }
       case 'spawn':
       case 'wait':
       case 'done':
         // Not produced by the parser today; reserved for providers that
         // emit these actions directly.
-        break;
+        return { continueSampling: false, suspended: false };
     }
   }
 
@@ -576,11 +633,15 @@ export class AgentRunner {
   }
 
   private async handleWaitRequest(toolCallId: ToolCallId, rawArgs: unknown): Promise<void> {
-    // Reflect the wait as a tool_result; the real yield is implicit — the
-    // runner simply won't sample again until a matching event arrives.
+    // Transition into awaiting_event BEFORE persisting the tool_result.
+    // Otherwise the tool_result we publish would itself flow back through
+    // onEvent → shouldTriggerTick(tool_result) and re-arm sampling, which
+    // would defeat the suspension.
+    const spec = parseWaitSpec(rawArgs);
+    this.activeTurn?.toAwaitingEvent(spec);
     await this.persistToolResult(toolCallId, {
       ok: true,
-      output: { scheduled: true, matcher: (rawArgs as { matcher?: string }).matcher ?? 'kind' },
+      output: { scheduled: true, matcher: spec.matcher },
     });
   }
 
@@ -664,8 +725,57 @@ function shouldTriggerTick(ev: HarnessEvent): boolean {
 function isReadyToSample(at: ActiveTurn): boolean {
   const s = at.state;
   if (s.kind === 'awaiting_tool_results') return s.pending.size === 0;
+  if (s.kind === 'awaiting_event') return false;
+  if (s.kind === 'awaiting_subtask') return false;
   if (s.kind === 'completed' || s.kind === 'interrupted' || s.kind === 'errored') return false;
   return true;
+}
+
+function parseWaitSpec(rawArgs: unknown): EventSpec {
+  const a = (rawArgs ?? {}) as Record<string, unknown>;
+  const matcher = typeof a.matcher === 'string' ? a.matcher : 'kind';
+  switch (matcher) {
+    case 'tool_result':
+      if (typeof a.toolCallId === 'string') {
+        return { matcher: 'tool_result', toolCallId: a.toolCallId as ToolCallId };
+      }
+      break;
+    case 'subtask_complete':
+      if (typeof a.childThreadId === 'string') {
+        return { matcher: 'subtask_complete', childThreadId: a.childThreadId as ThreadId };
+      }
+      break;
+    case 'user_input':
+      return { matcher: 'user_input' };
+    case 'timer':
+      if (typeof a.timerId === 'string') {
+        return { matcher: 'timer', timerId: a.timerId };
+      }
+      break;
+    case 'kind':
+      if (typeof a.kind === 'string') {
+        return { matcher: 'kind', kind: a.kind };
+      }
+      break;
+  }
+  // Permissive fallback: any external_event wakes the turn. Without this,
+  // a malformed wait would deadlock the turn until interrupt.
+  return { matcher: 'kind', kind: 'external_event' };
+}
+
+function eventMatchesSpec(ev: HarnessEvent, spec: EventSpec): boolean {
+  switch (spec.matcher) {
+    case 'kind':
+      return ev.kind === spec.kind;
+    case 'tool_result':
+      return ev.kind === 'tool_result' && ev.payload.toolCallId === spec.toolCallId;
+    case 'subtask_complete':
+      return ev.kind === 'subtask_complete' && ev.payload.childThreadId === spec.childThreadId;
+    case 'user_input':
+      return ev.kind === 'user_input' || ev.kind === 'user_turn_start';
+    case 'timer':
+      return ev.kind === 'timer_fired' && ev.payload.timerId === spec.timerId;
+  }
 }
 
 function synthEvent(threadId: ThreadId, reason: string): HarnessEvent {

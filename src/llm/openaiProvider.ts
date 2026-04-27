@@ -57,7 +57,7 @@ export class OpenAIProvider implements LlmProvider {
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     });
     this.model = opts.model ?? DEFAULT_MODEL;
-    this.defaultMaxTokens = opts.defaultMaxTokens ?? 1024;
+    this.defaultMaxTokens = opts.defaultMaxTokens ?? 32768;
     this.defaultTemperature = opts.defaultTemperature ?? 0.7;
   }
 
@@ -207,12 +207,34 @@ function toChatMessages(
   }
   messages.push({ role: 'system', content: systemParts.join('\n') });
 
+  let pendingAssistant:
+    | {
+        textChunks: string[];
+        toolCalls: NonNullable<
+          Extract<ChatCompletionMessageParam, { role: 'assistant' }>['tool_calls']
+        >;
+      }
+    | undefined;
+  const flushAssistant = (): void => {
+    if (!pendingAssistant) return;
+    messages.push({
+      role: 'assistant',
+      ...(pendingAssistant.textChunks.length > 0
+        ? { content: pendingAssistant.textChunks.join('') }
+        : { content: null }),
+      ...(pendingAssistant.toolCalls.length > 0 ? { tool_calls: pendingAssistant.toolCalls } : {}),
+    });
+    pendingAssistant = undefined;
+  };
+
   for (const item of tail) {
     if (item.role === 'user') {
+      flushAssistant();
       messages.push({ role: 'user', content: contentToText(item.content) });
       continue;
     }
     if (item.role === 'tool_result') {
+      flushAssistant();
       for (const c of item.content) {
         if (c.kind === 'tool_result') {
           messages.push({
@@ -251,7 +273,9 @@ function toChatMessages(
       }
       continue;
     }
-    // assistant
+    if (!pendingAssistant) {
+      pendingAssistant = { textChunks: [], toolCalls: [] };
+    }
     const textChunks: string[] = [];
     const toolCalls: NonNullable<
       Extract<ChatCompletionMessageParam, { role: 'assistant' }>['tool_calls']
@@ -279,15 +303,18 @@ function toChatMessages(
           break;
       }
     }
-    messages.push({
-      role: 'assistant',
-      ...(textChunks.length > 0 ? { content: textChunks.join('') } : { content: null }),
-      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-    });
+    pendingAssistant.textChunks.push(...textChunks);
+    pendingAssistant.toolCalls.push(...toolCalls);
   }
+
+  flushAssistant();
 
   return messages;
 }
+
+export const __testOnly = {
+  toChatMessages,
+};
 
 function toChatTools(prefix: StablePrefix): ChatCompletionTool[] {
   return prefix.tools.map((t) => ({

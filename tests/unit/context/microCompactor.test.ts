@@ -69,6 +69,7 @@ describe('MicroCompactor', () => {
 
     expect(r.ran).toBe(true);
     expect(r.compactedCount).toBeGreaterThan(0);
+    expect(r.compactionEvent?.kind).toBe('compaction_event');
 
     const events = await store.readAll(tid);
     // Walk: anything in [0..17) that's a tool_result must be elided.
