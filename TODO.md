@@ -36,43 +36,62 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   sliding-window micro-compaction; runs deterministically before each
   sampling step, elides oversized tool_results in the warm zone via
   attachElision + handle. Restore-recoverable.
-- 🔴 **StaticCompactor** — placeholder semantic compactor. Phase 2:
-  replace with a `spawn({role: 'compactor'})` subagent producing a real
-  `CompactedSummary` for cold-path / threshold-triggered compaction.
-- ⚪ **Compaction triggers (cold path)** — threshold computation exists
-  (`estimateTokens`) but nothing subscribes + triggers `compact_request`.
+- 🔴 **StaticCompactor** — placeholder semantic compactor; the
+  `Compactor` strategy `CompactionHandler` runs by default. Phase 2:
+  replace with a `spawn({role: 'compactor'})` subagent producing a
+  real `CompactedSummary`. The handler interface already accepts an
+  injected Compactor, so the subagent strategy slots in without
+  touching wiring.
+- 🟢 **Compaction trigger + handler (cold path)** —
+  `CompactionTrigger` fires `compact_request` past the threshold (with
+  cooldown). `CompactionHandler` consumes the request, runs the
+  configured `Compactor`, persists a `compaction_event`, and
+  acknowledges the trigger so the cooldown can release. An in-flight
+  guard drops duplicate requests on the same thread. Bootstrap
+  installs the handler automatically alongside the trigger.
 - ⚪ **Cache-edits path** — `cacheEdits` field on SamplingRequest is
   plumbed but no provider consumes it; no logic decides when to use hot
   vs. cold path.
 - ⚪ **GhostSnapshots** — type defined, never produced or consumed.
-- ⚪ **`restore` handle rehydration** — `restore` tool pins the handle,
-  but projection currently always inlines pinned handles without respecting
-  the documented "drop back after next cycle" rule. Needs a TTL.
+- 🟢 **`restore` handle rehydration** — `restore` pins the handle for
+  exactly the next sampling; `clearPins()` runs after each step, so the
+  documented "drop back after next cycle" rule already holds.
 
 ## Runtime
 
-- 🟡 **AgentRunner** — happy path works. Missing:
-  - ⚪ `wait` action proper implementation — currently returns a fake
-    tool_result; never actually blocks the turn on a matching event.
-  - ⚪ interrupt propagation: `abortCtl.abort()` is called but the next
-    sampling request is not cancelled with user-visible feedback yet.
+- 🟡 **AgentRunner** — happy path works. The `wait` transport now
+  suspends the turn into `awaiting_event` and resumes when a matching
+  event arrives (`user_input` / `subtask_complete:<id>` / `tool_result`
+  / `kind` / `timer`). Each runner owns a `Scheduler`; `wait(timer,
+  delayMs)` schedules a real one-shot timer that publishes
+  `timer_fired`, and `wait.timeoutMs` schedules a private fallback
+  timer that emits `external_event{source:"wait_timeout"}` so a
+  bounded wait can never deadlock. Pending timers are cancelled on
+  turn complete / interrupt / wakeup. Interrupt classification routes
+  a user-cut-off sampling to `turn_complete{interrupted}` instead of
+  the historical `errored:model_returned_no_actions`. Missing:
+  - ⚪ provider stream cancellation surfaces back to the user via the
+    `interrupt` event the adapter renders, but no separate
+    "interrupting…" lifecycle event is emitted by the runner — the
+    bus interrupt envelope is the source of truth.
   - ⚪ `rollback` / `fork` event handling — events are filtered out of
     projection but the runner does not respond to them.
 - 🟡 **SubagentPool** — `spawn` creates a child, returns its id, and
   parent receives `subtask_complete` when the child's turn ends.
-  Budgets (`maxTurns`/`maxToolCalls`/`maxWallMs`) enforced as hard caps;
-  parent → descendant interrupt propagation works.
+  Budgets (`maxTurns`/`maxToolCalls`/`maxWallMs`/`maxTokens`) enforced
+  as hard caps; structural caps (`maxDepth`, `maxSiblingsPerParent`,
+  `maxConcurrentTotal`) reject violating spawns at pre-flight via
+  `SpawnRefused`, surfaced to the LLM as `tool_result.ok=false` with
+  the cap name in `error.kind`. Parent → descendant interrupt
+  propagation works.
   Missing:
   - ⚪ `inheritTurns` — currently recorded but never copies parent turns.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
-  - ⚪ `maxTokens` budget dimension — track cumulative
-    `SamplingResult.usage` against a cap; warn at 80%, interrupt at
-    100%. See [01-runtime.md](design-docs/01-runtime.md#subagent-budgets-and-interrupt-propagation).
-  - ⚪ Structural caps (`maxDepth`, `maxSiblingsPerParent`,
-    `maxConcurrentTotal`) — reject `spawn` as tool-call error when
-    exceeded. Anti spawn-bomb. See same section.
-- ⚪ **Scheduler** — class exists, not wired to `wait(timer)` actions;
-  no cron.
+  - ⚪ Soft 80%-warn before the hard cap fires (today the model only
+    learns about the budget when the child gets cut off). See
+    [01-runtime.md](design-docs/01-runtime.md#subagent-budgets-and-interrupt-propagation).
+- 🟢 **Scheduler** — owned per AgentRunner, drives `wait(timer)` and
+  `wait.timeoutMs`. No cron yet (one-shot delays only).
 
 ## Tools
 
@@ -109,23 +128,37 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     cadence, promotes to `verified` or downgrades / deletes.
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
-- 🟡 **`wait`** — schema + tool-call accepted; actual yield semantics
-  missing (see runtime).
+- 🟢 **`wait`** — yield semantics work for `user_input` /
+  `subtask_complete` / `tool_result` / `kind`. `timer` matcher
+  schedules a real one-shot timer when given `delayMs`; `timeoutMs`
+  on any matcher schedules a fallback timer that wakes the wait via
+  `external_event{source:"wait_timeout"}`. Malformed `timer` waits
+  return `tool_result.ok=true` with `scheduled=false` + an error
+  string the model can react to.
 - 🟡 **`spawn`** — composition works, parent sees subtask_complete.
-  Missing: budget enforcement, `inheritTurns`.
+  All four budget dimensions (`maxTurns`/`maxToolCalls`/`maxWallMs`/
+  `maxTokens`) enforced; structural caps reject overage spawns
+  pre-flight. Missing: `inheritTurns` (recorded, never applied).
 
 ## Store
 
-- 🟡 **JsonlSessionStore** — append-only persistence works. Missing:
-  - ⚪ `attachElision` is memory-only; not rewritten into the JSONL.
-  - ⚪ No compaction of the events.jsonl file itself (it grows forever).
-  - ⚪ No `fork()` helper to copy an event log up to a boundary.
+- 🟡 **JsonlSessionStore** — append-only persistence works.
+  `attachElision` now writes to a sidecar `elisions.jsonl` so cold
+  reload reproduces the elided shape. `SessionStore.fork(source,
+  untilEventId, newThreadId)` copies events up to a boundary into a
+  new thread (foundation for cold-path snapshots and future
+  rollback). Missing:
+  - ⚪ Compaction of the events.jsonl file itself (it grows forever).
 - ⚪ **SQLite backend** — designed; not implemented.
 
 ## Adapters
 
-- 🟡 **TerminalAdapter** — single-thread binding only. `/interrupt` is
-  exposed but its UX (double-Ctrl-C → shutdown) is not wired.
+- 🟡 **TerminalAdapter** — single-thread binding only. `/interrupt`
+  works, SIGINT is now wired (1st: publish interrupt; 2nd within
+  `doubleInterruptMs` window: graceful adapter shutdown via
+  `whenShutdown()`), and `interrupt` events are rendered inline so
+  the unwind window has visible feedback. Multi-thread binding is
+  the remaining item.
 - ⚪ **DiscordAdapter / TelegramAdapter / HTTPAdapter**. Interface and
   docs exist; no implementations.
 - ⚪ Multi-adapter bootstrap (one runtime, N adapters).
