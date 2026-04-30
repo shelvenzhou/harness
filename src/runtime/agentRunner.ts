@@ -856,6 +856,22 @@ export class AgentRunner {
       }
     }
 
+    // If the wait is on sessions that are *already* terminal, we'd
+    // deadlock waiting for an event that fired before the wait started.
+    // Drop them from `remaining` and, if the gate is satisfied, wake
+    // the turn immediately by clearing awaiting_event.
+    if (spec.matcher === 'session') {
+      for (const sid of [...spec.remaining]) {
+        const s = this.sessions.get(sid);
+        if (s && s.status !== 'running') spec.remaining.delete(sid);
+      }
+      const gateMet =
+        spec.mode === 'all' ? spec.remaining.size === 0 : spec.remaining.size < spec.sessionIds.length;
+      if (gateMet && this.activeTurn?.state.kind === 'awaiting_event') {
+        this.activeTurn.toRunning();
+      }
+    }
+
     await this.persistToolResult(toolCallId, {
       ok: true,
       output: {
@@ -867,6 +883,18 @@ export class AgentRunner {
         ...(scheduledTimeoutId !== undefined ? { timeoutTimerId: scheduledTimeoutId } : {}),
       },
     });
+
+    // After persistToolResult: if we already cleared awaiting_event
+    // because the sessions were terminal at wait-time, schedule another
+    // sampling so the agent can read the captured outputs via `session`.
+    // (We don't want suspended=true upstream — but the dispatch returned
+    // it already; counter that with an explicit re-arm.)
+    if (
+      spec.matcher === 'session' &&
+      this.activeTurn?.state.kind === 'running'
+    ) {
+      this.scheduleTick(synthEvent(this.opts.threadId, 'session_already_done'));
+    }
   }
 
   /**
@@ -1020,6 +1048,21 @@ function parseWaitSpec(rawArgs: unknown): EventSpec {
         return { matcher: 'timer', timerId: a.timerId };
       }
       break;
+    case 'session': {
+      const ids = Array.isArray(a.sessionIds)
+        ? a.sessionIds.filter((x): x is string => typeof x === 'string')
+        : [];
+      if (ids.length > 0) {
+        const mode = a.mode === 'all' ? 'all' : 'any';
+        return {
+          matcher: 'session',
+          sessionIds: [...ids],
+          mode,
+          remaining: new Set(ids),
+        };
+      }
+      break;
+    }
     case 'kind':
       if (typeof a.kind === 'string') {
         return { matcher: 'kind', kind: a.kind };
@@ -1043,6 +1086,17 @@ function eventMatchesSpec(ev: HarnessEvent, spec: EventSpec): boolean {
       return ev.kind === 'user_input' || ev.kind === 'user_turn_start';
     case 'timer':
       return ev.kind === 'timer_fired' && ev.payload.timerId === spec.timerId;
+    case 'session': {
+      // Stateful: remove the completing session from `remaining` and
+      // wake when the gate is satisfied. The runner mutates the spec
+      // because it lives on ActiveTurn.state — same instance both here
+      // and after wake-up.
+      if (ev.kind !== 'session_complete') return false;
+      if (!spec.remaining.has(ev.payload.sessionId)) return false;
+      spec.remaining.delete(ev.payload.sessionId);
+      if (spec.mode === 'all') return spec.remaining.size === 0;
+      return true;
+    }
   }
 }
 

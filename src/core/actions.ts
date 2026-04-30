@@ -65,4 +65,11 @@ export type EventSpec =
   | { matcher: 'tool_result'; toolCallId: ToolCallId }
   | { matcher: 'subtask_complete'; childThreadId: ThreadId }
   | { matcher: 'user_input' }
-  | { matcher: 'timer'; timerId: string };
+  | { matcher: 'timer'; timerId: string }
+  | {
+      matcher: 'session';
+      sessionIds: string[];
+      mode: 'any' | 'all';
+      /** Sessions still pending (mutated by the runner as session_complete events arrive). */
+      remaining: Set<string>;
+    };

@@ -7,3 +7,4 @@ export { restoreTool } from './restore.js';
 export { waitTool } from './wait.js';
 export { spawnTool } from './spawn.js';
 export { usageTool } from './usage.js';
+export { sessionTool } from './session.js';

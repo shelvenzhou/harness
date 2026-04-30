@@ -47,6 +47,7 @@ interface ShellOutput {
 export const shellTool: Tool<typeof ShellArgs, ShellOutput> = {
   name: 'shell',
   concurrency: 'serial',
+  async: true,
   description: [
     'Run a shell command and return exit code + stdout/stderr. Output is captured with a byte cap;',
     'oversized results are elided and saved to a handle (use `restore` to pull the full log).',

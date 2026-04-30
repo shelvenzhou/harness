@@ -40,6 +40,7 @@ interface FetchOutput {
 export const webFetchTool: Tool<typeof FetchArgs, FetchOutput> = {
   name: 'web_fetch',
   concurrency: 'safe',
+  async: true,
   description: [
     'Fetch a URL (GET or HEAD). Body is captured with a byte cap; oversize bodies are elided',
     'and saved to a handle (use `restore` to pull the full body). Use for known URLs.',

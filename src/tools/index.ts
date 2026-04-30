@@ -8,6 +8,7 @@ import {
   memoryTool,
   readTool,
   restoreTool,
+  sessionTool,
   shellTool,
   spawnTool,
   usageTool,
@@ -32,5 +33,6 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(waitTool);
   registry.register(spawnTool);
   registry.register(usageTool);
+  registry.register(sessionTool);
   return registry;
 }

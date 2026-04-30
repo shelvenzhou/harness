@@ -13,7 +13,7 @@ import type { Tool } from '../tool.js';
  */
 
 const WaitArgs = z.object({
-  matcher: z.enum(['kind', 'tool_result', 'subtask_complete', 'user_input', 'timer']),
+  matcher: z.enum(['kind', 'tool_result', 'subtask_complete', 'user_input', 'timer', 'session']),
   /** Used when `matcher === 'kind'`. */
   kind: z.string().optional(),
   /** Used when `matcher === 'tool_result'`. */
@@ -22,6 +22,15 @@ const WaitArgs = z.object({
   childThreadId: z.string().optional(),
   /** Used when `matcher === 'timer'`. */
   timerId: z.string().optional(),
+  /**
+   * Used when `matcher === 'session'`: ids of long-running tool sessions
+   * to wait on. With `mode: 'any'` (default) the wait wakes on the first
+   * `session_complete` for any of these ids; with `mode: 'all'` it
+   * waits until every id has fired.
+   */
+  sessionIds: z.array(z.string()).optional(),
+  /** Multi-session wait gate. Defaults to `'any'` for `matcher === 'session'`. */
+  mode: z.enum(['any', 'all']).optional(),
   /**
    * Required when `matcher === 'timer'`: how long to sleep before
    * `timer_fired` is published. The runner schedules the timer when it
@@ -44,6 +53,8 @@ export const waitTool: Tool<typeof WaitArgs, { scheduled: true }> = {
     'Yield until a matching event arrives. Use `matcher: "user_input"` to explicitly pause for user.',
     'Use `matcher: "subtask_complete"` after spawning a child and wanting its result before continuing.',
     'Use `matcher: "timer"` for delayed work — provide `timerId` and `delayMs`.',
+    'Use `matcher: "session"` with `sessionIds: [...]` to wait on long-running tools (web_fetch, shell);',
+    'set `mode: "all"` to wait for every session, default `"any"` wakes on the first one.',
     'Set `timeoutMs` on any matcher to bound the wait (otherwise the wait is open-ended).',
   ].join(' '),
   schema: WaitArgs,
