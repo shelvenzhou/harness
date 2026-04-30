@@ -15,6 +15,7 @@ const Budget = z.object({
   maxTurns: z.number().optional(),
   maxToolCalls: z.number().optional(),
   maxWallMs: z.number().optional(),
+  maxTokens: z.number().optional(),
 });
 
 const SpawnArgs = z.object({

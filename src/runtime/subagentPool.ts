@@ -13,7 +13,12 @@ import type {
   SubtaskCompletePayload,
 } from '@harness/core/events.js';
 
-import { AgentRunner, type SpawnRequestInfo, type TokenBudget } from './agentRunner.js';
+import {
+  AgentRunner,
+  type RuntimeBudgetSnapshot,
+  type SpawnRequestInfo,
+  type TokenBudget,
+} from './agentRunner.js';
 
 /**
  * Subagent pool.
@@ -183,7 +188,7 @@ export class SubagentPool {
       payload: { text: req.task },
     });
 
-    const systemPrompt = this.deps.systemPromptFor(req.role);
+    const systemPrompt = withBudgetGuidance(this.deps.systemPromptFor(req.role), req.budget);
     const runner = new AgentRunner({
       threadId: childThreadId,
       bus: this.deps.bus,
@@ -195,6 +200,7 @@ export class SubagentPool {
       ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       ...(this.deps.microCompact !== undefined ? { microCompact: this.deps.microCompact } : {}),
       ...(this.deps.tokenBudget !== undefined ? { tokenBudget: this.deps.tokenBudget } : {}),
+      runtimeBudgetSnapshot: () => this.runtimeBudgetSnapshotFor(childThreadId),
       onSpawn: (inner) => this.spawn(inner),
     });
     runner.start();
@@ -328,13 +334,42 @@ export class SubagentPool {
     void this.deps.store.append(ev).then(() => this.deps.bus.publish(ev));
   }
 
+  private runtimeBudgetSnapshotFor(threadId: ThreadId): RuntimeBudgetSnapshot | undefined {
+    const r = this.children.get(threadId);
+    if (!r) return undefined;
+    const wallMs = Math.max(0, Date.now() - r.startedAt);
+    return {
+      caps: { ...r.budget },
+      used: {
+        turns: r.turnsUsed,
+        toolCalls: r.toolCallsUsed,
+        wallMs,
+        tokens: r.tokensUsed,
+      },
+      remaining: {
+        ...(r.budget.maxTurns !== undefined
+          ? { turns: Math.max(0, r.budget.maxTurns - r.turnsUsed) }
+          : {}),
+        ...(r.budget.maxToolCalls !== undefined
+          ? { toolCalls: Math.max(0, r.budget.maxToolCalls - r.toolCallsUsed) }
+          : {}),
+        ...(r.budget.maxWallMs !== undefined
+          ? { wallMs: Math.max(0, r.budget.maxWallMs - wallMs) }
+          : {}),
+        ...(r.budget.maxTokens !== undefined
+          ? { tokens: Math.max(0, r.budget.maxTokens - r.tokensUsed) }
+          : {}),
+      },
+    };
+  }
+
   private async onTurnComplete(event: HarnessEvent): Promise<void> {
     const record = this.children.get(event.threadId);
     if (!record) return; // not one of our children
     this.children.delete(event.threadId);
     if (record.wallTimer) clearTimeout(record.wallTimer);
 
-    const p = event.payload as { status: string; summary?: string };
+    const p = event.payload as { status: string; summary?: string; reason?: string };
     let status: SubtaskCompletePayload['status'];
     if (record.budgetExceeded) {
       status = 'budget_exceeded';
@@ -346,9 +381,11 @@ export class SubagentPool {
       status = 'interrupted';
     }
 
-    const summary = record.budgetExceeded
-      ? `budget exceeded (${record.exceededReason}); turns=${record.turnsUsed} toolCalls=${record.toolCallsUsed} tokens=${record.tokensUsed}`
-      : p.summary;
+    const summary =
+      p.summary ??
+      (record.budgetExceeded
+        ? `budget exceeded (${record.exceededReason}); turns=${record.turnsUsed} toolCalls=${record.toolCallsUsed} tokens=${record.tokensUsed}`
+        : undefined);
 
     const evOut: HarnessEvent = {
       id: newEventId(),
@@ -359,6 +396,19 @@ export class SubagentPool {
         childThreadId: event.threadId,
         status,
         ...(summary !== undefined ? { summary } : {}),
+        ...(record.budgetExceeded
+          ? {
+              reason: `budget:${record.exceededReason}`,
+              budget: {
+                reason: record.exceededReason!,
+                turnsUsed: record.turnsUsed,
+                toolCallsUsed: record.toolCallsUsed,
+                tokensUsed: record.tokensUsed,
+              },
+            }
+          : p.reason !== undefined
+            ? { reason: p.reason }
+            : {}),
       } satisfies SubtaskCompletePayload,
       createdAt: new Date().toISOString(),
     } as HarnessEvent;
@@ -370,4 +420,32 @@ export class SubagentPool {
   get childCount(): number {
     return this.children.size;
   }
+}
+
+function withBudgetGuidance(systemPrompt: string, budget: ChildBudget): string {
+  if (!hasBudgetCaps(budget)) return systemPrompt;
+  const caps = [
+    budget.maxTurns !== undefined ? `maxTurns=${budget.maxTurns}` : undefined,
+    budget.maxToolCalls !== undefined ? `maxToolCalls=${budget.maxToolCalls}` : undefined,
+    budget.maxWallMs !== undefined ? `maxWallMs=${budget.maxWallMs}` : undefined,
+    budget.maxTokens !== undefined ? `maxTokens=${budget.maxTokens}` : undefined,
+  ].filter((v): v is string => v !== undefined);
+  return [
+    systemPrompt,
+    [
+      '[subagent budget]',
+      `Hard caps: ${caps.join(', ')}.`,
+      'Plan before acting. If the task is larger than the remaining budget, produce the best partial conclusion you can before the cap fires.',
+      'Prefer a concise conclusion over extra exploration when close to budget limits.',
+    ].join('\n'),
+  ].join('\n\n');
+}
+
+function hasBudgetCaps(budget: ChildBudget): boolean {
+  return (
+    budget.maxTurns !== undefined ||
+    budget.maxToolCalls !== undefined ||
+    budget.maxWallMs !== undefined ||
+    budget.maxTokens !== undefined
+  );
 }

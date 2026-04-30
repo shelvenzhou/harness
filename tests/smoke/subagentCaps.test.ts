@@ -18,7 +18,7 @@ import { bootstrap } from '@harness/runtime/bootstrap.js';
  *      LLM gets a tool error and finishes the turn with a reply.
  *   2. child given maxTokens budget that's too small => child runs one
  *      sampling step, accumulates >cap tokens, pool trips the budget,
- *      parent observes subtask_complete{budget_exceeded, summary~maxTokens}.
+ *      parent observes subtask_complete{budget_exceeded, reason=budget:maxTokens}.
  */
 
 class ScriptedProvider implements LlmProvider {
@@ -175,8 +175,15 @@ describe('smoke: subagent structural caps', () => {
     const parentEvents = await runtime.store.readAll(runtime.rootThreadId);
     const subtask = parentEvents.find((e) => e.kind === 'subtask_complete');
     expect(subtask).toBeDefined();
-    const p = subtask!.payload as { status: string; summary?: string };
+    const p = subtask!.payload as {
+      status: string;
+      summary?: string;
+      reason?: string;
+      budget?: { reason: string };
+    };
     expect(p.status).toBe('budget_exceeded');
-    expect(p.summary).toContain('maxTokens');
+    expect(p.summary).toBe('hello');
+    expect(p.reason).toBe('budget:maxTokens');
+    expect(p.budget?.reason).toBe('maxTokens');
   }, 10_000);
 });

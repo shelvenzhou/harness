@@ -50,7 +50,7 @@ describe('runtime: interrupt classifier', () => {
       microCompact: false,
     });
 
-    const turnDone = new Promise<{ status: string; summary?: string }>(
+    const turnDone = new Promise<{ status: string; summary?: string; reason?: string }>(
       (resolve, reject) => {
         const t = setTimeout(() => reject(new Error('timeout')), 3_000);
         const sub = runtime.bus.subscribe(
@@ -61,6 +61,7 @@ describe('runtime: interrupt classifier', () => {
               resolve({
                 status: ev.payload.status,
                 ...(ev.payload.summary !== undefined ? { summary: ev.payload.summary } : {}),
+                ...(ev.payload.reason !== undefined ? { reason: ev.payload.reason } : {}),
               });
             }
           },
@@ -90,6 +91,7 @@ describe('runtime: interrupt classifier', () => {
 
     const result = await turnDone;
     expect(result.status).toBe('interrupted');
-    expect(result.summary).toBe('user_interrupt');
+    expect(result.summary).toBeUndefined();
+    expect(result.reason).toBe('test cancel');
   }, 5_000);
 });

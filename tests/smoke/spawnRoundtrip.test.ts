@@ -98,6 +98,9 @@ describe('smoke: spawn round-trip', () => {
 
     const parentEvents = await runtime.store.readAll(runtime.rootThreadId);
     expect(parentEvents.some((e) => e.kind === 'spawn_request')).toBe(true);
+    const spawnRequest = parentEvents.find((e) => e.kind === 'spawn_request');
+    expect(spawnRequest).toBeDefined();
+    const spawnPayload = spawnRequest!.payload as { childThreadId: string };
     const subtask = parentEvents.find((e) => e.kind === 'subtask_complete');
     expect(subtask).toBeDefined();
     const subPayload = subtask!.payload as {
@@ -105,6 +108,17 @@ describe('smoke: spawn round-trip', () => {
       status: string;
       summary?: string;
     };
+    const spawnToolResult = parentEvents.find(
+      (e) =>
+        e.kind === 'tool_result' &&
+        typeof (e.payload as { output?: { childThreadId?: string } }).output?.childThreadId === 'string',
+    );
+    expect(spawnToolResult).toBeDefined();
+    const spawnToolResultPayload = spawnToolResult!.payload as {
+      output: { childThreadId: string };
+    };
+    expect(spawnPayload.childThreadId).toBe(subPayload.childThreadId);
+    expect(spawnPayload.childThreadId).toBe(spawnToolResultPayload.output.childThreadId);
     expect(subPayload.status).toBe('completed');
     // SubagentPool routes based on the child's turn_complete summary.
     expect(subPayload.summary).toBe('child done');

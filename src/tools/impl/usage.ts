@@ -27,6 +27,26 @@ export interface UsageOutput {
     maxTurnTokens?: number;
     maxThreadTokens?: number;
   };
+  subagentBudget?: {
+    caps: {
+      maxTurns?: number;
+      maxToolCalls?: number;
+      maxWallMs?: number;
+      maxTokens?: number;
+    };
+    used: {
+      turns: number;
+      toolCalls: number;
+      wallMs: number;
+      tokens: number;
+    };
+    remaining: {
+      turns?: number;
+      toolCalls?: number;
+      wallMs?: number;
+      tokens?: number;
+    };
+  };
 }
 
 export const usageTool: Tool<typeof UsageArgs, UsageOutput> = {
@@ -34,6 +54,8 @@ export const usageTool: Tool<typeof UsageArgs, UsageOutput> = {
   concurrency: 'safe',
   description: [
     'Read the runtime\'s accounting: tokens consumed this turn / this thread, sampling steps so far, and any configured token caps.',
+    '',
+    'Inside a spawned child, this also reports the child budget caps and current usage/remaining counts so you can decide whether to wrap up now or keep exploring.',
     '',
     'Pull-only — the runtime never pushes "you have N tokens left" into your prompt; if you want to know, ask. Use it when the task is open-ended and you want to decide whether to keep iterating, summarise now, or hand off via spawn.',
     '',

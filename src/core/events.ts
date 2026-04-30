@@ -128,14 +128,23 @@ export interface SpawnRequestPayload {
   role?: string;
   task: string;
   inheritTurns: number;
-  budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number };
+  budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
 }
 export type SpawnRequestEvent = EventBase<'spawn_request', SpawnRequestPayload>;
+
+export interface SubtaskBudgetPayload {
+  reason: 'maxTurns' | 'maxToolCalls' | 'maxWallMs' | 'maxTokens';
+  turnsUsed: number;
+  toolCallsUsed: number;
+  tokensUsed: number;
+}
 
 export interface SubtaskCompletePayload {
   childThreadId: ThreadId;
   status: 'completed' | 'errored' | 'budget_exceeded' | 'interrupted';
   summary?: string;
+  reason?: string;
+  budget?: SubtaskBudgetPayload;
 }
 export type SubtaskCompleteEvent = EventBase<'subtask_complete', SubtaskCompletePayload>;
 
@@ -172,6 +181,7 @@ export type SessionCompleteEvent = EventBase<'session_complete', SessionComplete
 export interface TurnCompletePayload {
   status: 'completed' | 'interrupted' | 'errored';
   summary?: string;
+  reason?: string;
 }
 export type TurnCompleteEvent = EventBase<'turn_complete', TurnCompletePayload>;
 

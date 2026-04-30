@@ -39,7 +39,7 @@ export interface SpawnAction {
   childThreadId: ThreadId;
   task: string;
   role?: string;
-  budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number };
+  budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
   inheritTurns?: number;
 }
 
