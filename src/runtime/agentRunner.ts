@@ -31,6 +31,7 @@ import type { MemoryStore } from '@harness/memory/types.js';
 
 import { ActiveTurn } from './activeTurn.js';
 import { Scheduler } from './scheduler.js';
+import { SessionRegistry, type Session } from './sessionRegistry.js';
 
 /**
  * AgentRunner: drives one thread. Event-driven, not loop-driven.
@@ -159,6 +160,13 @@ export class AgentRunner {
    * before any action surfaced. Cleared at the start of each turn.
    */
   private turnInterrupted = false;
+  /**
+   * Long-running tool sessions live here. Each async tool dispatch
+   * registers a Session, runs the tool body in the background, and
+   * publishes `session_complete` on terminal state. Per-runner so
+   * subagents have their own session namespace.
+   */
+  private readonly sessions = new SessionRegistry();
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
@@ -352,13 +360,11 @@ export class AgentRunner {
       });
     }
 
-    const pendingToolCalls: Array<{ toolCallId: ToolCallId; call: Action & { kind: 'tool_call' } }> = [];
-
     let shouldContinueSampling = false;
     let suspended = false;
     for (const action of parsed.actions) {
       at.pushActionInFlight(action);
-      const out = await this.dispatchAction(action, pendingToolCalls);
+      const out = await this.dispatchAction(action);
       shouldContinueSampling = shouldContinueSampling || out.continueSampling;
       suspended = suspended || out.suspended;
     }
@@ -385,25 +391,13 @@ export class AgentRunner {
         ...(parsed.ttftMs !== undefined ? { ttftMs: parsed.ttftMs } : {}),
         ...(parsed.stopReason !== undefined ? { stopReason: parsed.stopReason } : {}),
         projection: stats,
-        toolCallCount: pendingToolCalls.length,
+        toolCallCount: parsed.actions.filter((a) => a.kind === 'tool_call').length,
         ...(promptDumpPath !== undefined ? { promptDumpPath } : {}),
       },
       ...(at.turnId !== undefined ? { turnId: at.turnId } : {}),
     });
 
-    if (pendingToolCalls.length > 0) {
-      at.toAwaitingTools(pendingToolCalls.map((p) => p.toolCallId));
-      // Kick off all tool calls concurrently; results arrive as events.
-      // Cap enforcement for the multi-step path is handled by the
-      // checkTokenBudget at the top of the *next* runSamplingStep —
-      // tools dispatched here are allowed to finish first.
-      for (const { toolCallId, call } of pendingToolCalls) {
-        void this.runToolCall(toolCallId, call);
-      }
-      return;
-    }
-
-    // No tool calls emitted. Re-check the cap *now*: if this single
+    // Re-check the cap *now*: if this single
     // sampling overran the budget, there is no "next sampling" to gate
     // — the turn would otherwise close as 'completed' and the wall
     // would silently fail. The pre-sampling check at the top of this
@@ -509,7 +503,6 @@ export class AgentRunner {
 
   private async dispatchAction(
     action: Action,
-    collectToolCalls: Array<{ toolCallId: ToolCallId; call: Action & { kind: 'tool_call' } }>,
   ): Promise<{ continueSampling: boolean; suspended: boolean }> {
     switch (action.kind) {
       case 'reply':
@@ -570,8 +563,18 @@ export class AgentRunner {
           await this.handleUsageRequest(toolCallId);
           return { continueSampling: true, suspended: false };
         }
-        collectToolCalls.push({ toolCallId, call: action });
-        return { continueSampling: false, suspended: false };
+        if (action.name === 'session') {
+          await this.handleSessionRequest(toolCallId, action.args);
+          return { continueSampling: true, suspended: false };
+        }
+        // Ordinary tools: dispatch atomically — execute (or kick off a
+        // session) and persist the paired tool_result *before* returning
+        // control to the sampling loop. This keeps every tool_call ↔
+        // tool_result pair atomic in the persisted history, so a
+        // user_turn_start that arrives between samplings can never
+        // observe an orphaned tool_call.
+        await this.runToolCall(toolCallId, action);
+        return { continueSampling: true, suspended: false };
       }
       case 'spawn':
       case 'wait':
@@ -608,6 +611,23 @@ export class AgentRunner {
       },
     };
 
+    if (tool.async === true) {
+      // Async (session) tool. Persist a tool_result placeholder synchronously
+      // so the tool_call ↔ tool_result invariant always holds in the log,
+      // then run the body in the background and publish session_complete
+      // when it finishes.
+      const session = this.sessions.create({
+        threadId: this.opts.threadId,
+        toolName: call.name,
+      });
+      await this.persistToolResult(toolCallId, {
+        ok: true,
+        output: { sessionId: session.id, status: 'running', toolName: call.name },
+      });
+      void this.executeSession(session, call, ctx);
+      return;
+    }
+
     const result = await this.opts.executor.execute({
       toolCallId,
       name: call.name,
@@ -615,6 +635,84 @@ export class AgentRunner {
       ctx,
     });
     await this.persistToolResult(toolCallId, result, tool);
+  }
+
+  /**
+   * Run an async tool's body off the dispatch path, then publish
+   * session_complete so any `wait({matcher:'session'})` can wake.
+   * Errors from the executor become `ok:false` on the session — they are
+   * not re-thrown (the originating tool_call/tool_result was already
+   * persisted as `running`).
+   */
+  private async executeSession(
+    session: Session,
+    call: Action & { kind: 'tool_call' },
+    ctx: ToolExecutionContext,
+  ): Promise<void> {
+    const result = await this.opts.executor.execute({
+      toolCallId: ctx.toolCallId,
+      name: call.name,
+      args: call.args,
+      ctx,
+    });
+    if (result.ok) {
+      this.sessions.complete(session.id, { ok: true, output: result.output });
+    } else {
+      this.sessions.complete(session.id, {
+        ok: false,
+        error: result.error ?? { kind: 'execute', message: 'tool returned ok:false' },
+      });
+    }
+    const completed = this.sessions.get(session.id);
+    if (!completed) return;
+    await this.appendEvent({
+      kind: 'session_complete',
+      payload: {
+        sessionId: completed.id,
+        toolName: completed.toolName,
+        ok: completed.status === 'done',
+        ...(completed.output !== undefined
+          ? { totalTokens: estimateTokens(completed.output) }
+          : {}),
+        ...(completed.error !== undefined ? { error: completed.error } : {}),
+      },
+    });
+  }
+
+  private async handleSessionRequest(toolCallId: ToolCallId, rawArgs: unknown): Promise<void> {
+    const args = (rawArgs ?? {}) as { sessionId?: string; maxTokens?: number };
+    if (typeof args.sessionId !== 'string') {
+      await this.persistToolResult(toolCallId, {
+        ok: false,
+        error: { kind: 'bad_args', message: 'session.sessionId must be a string' },
+      });
+      return;
+    }
+    const s = this.sessions.get(args.sessionId);
+    if (!s) {
+      await this.persistToolResult(toolCallId, {
+        ok: false,
+        error: { kind: 'unknown_session', message: `no session ${args.sessionId}` },
+      });
+      return;
+    }
+    const maxTokens = typeof args.maxTokens === 'number' && args.maxTokens > 0 ? args.maxTokens : 2048;
+    const rendered = renderSessionOutput(s, maxTokens);
+    await this.persistToolResult(toolCallId, {
+      ok: true,
+      output: {
+        sessionId: s.id,
+        status: s.status,
+        toolName: s.toolName,
+        startedAt: s.startedAt,
+        ...(s.endedAt !== undefined ? { endedAt: s.endedAt } : {}),
+        ...(s.error !== undefined ? { error: s.error } : {}),
+        output: rendered.output,
+        totalTokens: rendered.totalTokens,
+        truncated: rendered.truncated,
+        maxTokens,
+      },
+    });
   }
 
   private async persistToolResult(
@@ -637,12 +735,6 @@ export class AgentRunner {
     });
     if (result.elided) {
       await this.opts.store.attachElision(this.opts.threadId, event.id, result.elided);
-    }
-    if (this.activeTurn) {
-      const allResolved = this.activeTurn.resolveTool(toolCallId);
-      if (allResolved && !this.activeTurn.isTerminal()) {
-        this.scheduleTick(synthEvent(this.opts.threadId, 'internal_resume'));
-      }
     }
   }
 
@@ -886,11 +978,14 @@ function shouldTriggerTick(ev: HarnessEvent): boolean {
     case 'user_input':
     case 'interrupt':
     case 'compact_request':
-    case 'tool_result':
     case 'subtask_complete':
+    case 'session_complete':
     case 'timer_fired':
     case 'external_event':
       return true;
+    // tool_result no longer triggers a tick: dispatch is atomic now,
+    // so the runner is the sole producer of tool_result events for its
+    // thread and self-arms re-sampling explicitly via scheduleTick.
     default:
       return false;
   }
@@ -898,7 +993,6 @@ function shouldTriggerTick(ev: HarnessEvent): boolean {
 
 function isReadyToSample(at: ActiveTurn): boolean {
   const s = at.state;
-  if (s.kind === 'awaiting_tool_results') return s.pending.size === 0;
   if (s.kind === 'awaiting_event') return false;
   if (s.kind === 'awaiting_subtask') return false;
   if (s.kind === 'completed' || s.kind === 'interrupted' || s.kind === 'errored') return false;
@@ -965,6 +1059,39 @@ function synthEvent(threadId: ThreadId, reason: string): HarnessEvent {
 
 function formatPinnedEntry(e: { key?: string; content: string }): string {
   return e.key ? `${e.key}: ${e.content}` : e.content;
+}
+
+/**
+ * Cheap byte-based token estimate. We deliberately do *not* call into the
+ * tokenizer here — the same crude proxy used elsewhere in the projection
+ * stack is fine for telling the agent "you have N tokens worth of output".
+ */
+function estimateTokens(payload: unknown): number {
+  if (payload === undefined || payload === null) return 0;
+  const s = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  return Math.ceil(s.length / 4);
+}
+
+/**
+ * Render the session's captured output for the `session` tool. Truncates
+ * the *string form* to `maxTokens * 4` bytes and reports whether truncation
+ * happened along with the full token estimate, so the agent can decide
+ * whether to widen the window or grep over the captured handle.
+ */
+function renderSessionOutput(
+  s: Session,
+  maxTokens: number,
+): { output: string | undefined; totalTokens: number; truncated: boolean } {
+  if (s.output === undefined) {
+    return { output: undefined, totalTokens: 0, truncated: false };
+  }
+  const full = typeof s.output === 'string' ? s.output : JSON.stringify(s.output);
+  const totalTokens = Math.ceil(full.length / 4);
+  const cap = maxTokens * 4;
+  if (full.length <= cap) {
+    return { output: full, totalTokens, truncated: false };
+  }
+  return { output: full.slice(0, cap), totalTokens, truncated: true };
 }
 
 // re-export for convenience

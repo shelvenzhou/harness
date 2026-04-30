@@ -140,6 +140,7 @@ function projectEvent(
     case 'shutdown':
     case 'timer_fired':
     case 'external_event':
+    case 'session_complete':
     case 'turn_complete':
     case 'sampling_complete':
     case 'compaction_event':

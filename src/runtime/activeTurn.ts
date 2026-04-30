@@ -1,6 +1,6 @@
 import type { Action, EventSpec } from '@harness/core/actions.js';
 import type { HarnessEvent } from '@harness/core/events.js';
-import type { ThreadId, ToolCallId, TurnId } from '@harness/core/ids.js';
+import type { ThreadId, TurnId } from '@harness/core/ids.js';
 
 /**
  * ActiveTurn — explicit state machine for the currently-running turn on a
@@ -15,7 +15,6 @@ import type { ThreadId, ToolCallId, TurnId } from '@harness/core/ids.js';
 export type TurnState =
   | { kind: 'pending' } // created, not yet sampled
   | { kind: 'running'; samplingCount: number }
-  | { kind: 'awaiting_tool_results'; pending: Set<ToolCallId> }
   | { kind: 'awaiting_subtask'; childThreadId: ThreadId }
   | { kind: 'awaiting_event'; spec: EventSpec; timerId?: string }
   | { kind: 'completed'; summary?: string }
@@ -96,16 +95,6 @@ export class ActiveTurn {
   toRunning(): void {
     const prev = this._state.kind === 'running' ? this._state.samplingCount : 0;
     this._state = { kind: 'running', samplingCount: prev + 1 };
-  }
-
-  toAwaitingTools(ids: Iterable<ToolCallId>): void {
-    this._state = { kind: 'awaiting_tool_results', pending: new Set(ids) };
-  }
-
-  resolveTool(toolCallId: ToolCallId): boolean {
-    if (this._state.kind !== 'awaiting_tool_results') return false;
-    this._state.pending.delete(toolCallId);
-    return this._state.pending.size === 0;
   }
 
   toAwaitingSubtask(childThreadId: ThreadId): void {

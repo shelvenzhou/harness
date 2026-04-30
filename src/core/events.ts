@@ -26,6 +26,7 @@ export type EventKind =
   | 'subtask_complete'
   | 'timer_fired'
   | 'external_event'
+  | 'session_complete'
   | 'turn_complete'
   | 'sampling_complete'
   | 'compaction_event'
@@ -150,6 +151,24 @@ export interface ExternalEventPayload {
 }
 export type ExternalEventEvent = EventBase<'external_event', ExternalEventPayload>;
 
+/**
+ * A long-running tool ("session tool") finished. The tool_call/tool_result
+ * pair was already persisted atomically with `{sessionId, status:'running'}`
+ * back when dispatch ran; this event signals the session moved to a
+ * terminal state so the agent can read it via the `session` tool or wake
+ * a `wait({matcher:'session'})`. Sessions live in-memory in the runner's
+ * SessionRegistry — this event is the persisted record.
+ */
+export interface SessionCompletePayload {
+  sessionId: string;
+  toolName: string;
+  ok: boolean;
+  /** Total tokens of the captured output (full, before truncation). */
+  totalTokens?: number;
+  error?: { kind: string; message: string };
+}
+export type SessionCompleteEvent = EventBase<'session_complete', SessionCompletePayload>;
+
 export interface TurnCompletePayload {
   status: 'completed' | 'interrupted' | 'errored';
   summary?: string;
@@ -212,6 +231,7 @@ export type HarnessEvent =
   | SubtaskCompleteEvent
   | TimerFiredEvent
   | ExternalEventEvent
+  | SessionCompleteEvent
   | TurnCompleteEvent
   | SamplingCompleteEvent
   | CompactionEventEvent
@@ -239,6 +259,7 @@ export const DATA_PLANE_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
   'subtask_complete',
   'timer_fired',
   'external_event',
+  'session_complete',
   'turn_complete',
   'sampling_complete',
   'compaction_event',

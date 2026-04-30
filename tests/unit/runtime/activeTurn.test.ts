@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { ActiveTurn } from '@harness/runtime/activeTurn.js';
-import { newEventId, newThreadId, newToolCallId, newTurnId } from '@harness/core/ids.js';
+import { newEventId, newThreadId, newTurnId } from '@harness/core/ids.js';
 import type { HarnessEvent } from '@harness/core/events.js';
 
 function fakeEvent(kind: HarnessEvent['kind'] = 'reply'): HarnessEvent {
@@ -15,17 +15,11 @@ function fakeEvent(kind: HarnessEvent['kind'] = 'reply'): HarnessEvent {
 }
 
 describe('ActiveTurn', () => {
-  it('transitions through running → awaiting tools → completed', () => {
+  it('transitions through running → completed', () => {
     const t = new ActiveTurn(newThreadId(), newTurnId());
     expect(t.state.kind).toBe('pending');
     t.toRunning();
     expect(t.state.kind).toBe('running');
-    const tc1 = newToolCallId();
-    const tc2 = newToolCallId();
-    t.toAwaitingTools([tc1, tc2]);
-    expect(t.state.kind).toBe('awaiting_tool_results');
-    expect(t.resolveTool(tc1)).toBe(false);
-    expect(t.resolveTool(tc2)).toBe(true);
     t.toCompleted('done');
     expect(t.state.kind).toBe('completed');
     expect(t.isTerminal()).toBe(true);

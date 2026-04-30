@@ -56,6 +56,20 @@ export interface Tool<S extends ZodTypeAny = ZodTypeAny, Output = unknown> {
    * 'serial' tools (e.g. shell that mutates cwd) queue per thread.
    */
   readonly concurrency: 'safe' | 'serial';
+  /**
+   * When true, the runner dispatches the tool as a *session*: persists
+   * `tool_call` and a paired `tool_result {sessionId, status:'running'}`
+   * atomically inside dispatch, then runs `execute` in the background.
+   * The agent reads the captured output via the `session` tool once a
+   * `session_complete` event lands (waitable via `wait({matcher:'session'})`).
+   *
+   * Design note: this flag exists to keep the persisted message history
+   * always well-formed. Without atomic pairing, an in-flight async tool
+   * leaves a `tool_call` on disk with no matching `tool_result` — a new
+   * `user_turn_start` arriving in that window forms an OpenAI-illegal
+   * projection ("tool_calls without responses").
+   */
+  readonly async?: boolean;
   execute(args: z.infer<S>, ctx: ToolExecutionContext): Promise<ToolResult<Output>>;
 }
 
