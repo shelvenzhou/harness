@@ -108,4 +108,25 @@ describe('adapter: terminal SIGINT handling', () => {
     // Adapter must still be live; clean up explicitly.
     await adapter.stop();
   });
+
+  it('renders turn_complete reason when summary is absent', async () => {
+    const { adapter, bus, output, threadId } = await makeAdapter(20);
+    await new Promise((r) => setImmediate(r));
+    output.read();
+
+    bus.publish({
+      id: 'evt_turn_complete' as never,
+      threadId,
+      kind: 'turn_complete',
+      createdAt: new Date().toISOString(),
+      payload: {
+        status: 'interrupted',
+        reason: 'test cancel',
+      },
+    } as HarnessEvent);
+    await new Promise((r) => setImmediate(r));
+
+    expect(readOutput(output)).toContain('[turn interrupted: test cancel]');
+    await adapter.stop();
+  });
 });

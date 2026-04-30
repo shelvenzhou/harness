@@ -135,6 +135,7 @@ describe('runtime: atomic session dispatch', () => {
       registry: runtime.registry,
       handles: new HandleRegistry(),
       systemPrompt: 'sys',
+      pinnedMemory: [],
     });
     const toolUseIds = new Set<string>();
     const responseIds = new Set<string>();

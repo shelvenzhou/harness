@@ -106,4 +106,42 @@ describe('buildSamplingRequest', () => {
     expect(texts).not.toContain('a');
     expect(texts).not.toContain('b');
   });
+
+  it('projects subtask_complete reason and budget metadata into the prompt text', async () => {
+    const store = new MemorySessionStore();
+    const tid = newThreadId();
+    await store.createThread({ id: tid, rootTraceparent: newRootTraceparent() });
+    await store.append({
+      threadId: tid,
+      kind: 'subtask_complete',
+      payload: {
+        childThreadId: 'thr_child' as never,
+        status: 'budget_exceeded',
+        summary: 'partial conclusion',
+        reason: 'budget:maxTokens',
+        budget: {
+          reason: 'maxTokens',
+          turnsUsed: 1,
+          toolCallsUsed: 2,
+          tokensUsed: 321,
+        },
+      },
+    });
+
+    const { request } = await buildSamplingRequest({
+      threadId: tid,
+      store,
+      registry: new ToolRegistry(),
+      handles: new HandleRegistry(),
+      systemPrompt: 'sys',
+      pinnedMemory: [],
+    });
+    const text = request.tail[0]?.content[0];
+    expect(text?.kind).toBe('text');
+    expect((text as { text: string }).text).toContain('[subtask thr_child budget_exceeded');
+    expect((text as { text: string }).text).toContain('reason=budget:maxTokens');
+    expect((text as { text: string }).text).toContain('budget=maxTokens');
+    expect((text as { text: string }).text).toContain('tokens=321');
+    expect((text as { text: string }).text).toContain('partial conclusion');
+  });
 });

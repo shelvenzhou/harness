@@ -72,8 +72,16 @@ export class StderrDiagSink implements DiagSink {
       }
       case 'turn_complete': {
         const p = event.payload;
+        const details =
+          p.summary && p.reason
+            ? ` "${p.summary}" reason=${p.reason}`
+            : p.summary
+              ? ` "${p.summary}"`
+              : p.reason
+                ? ` reason=${p.reason}`
+                : '';
         process.stderr.write(
-          `${DIM}[diag] turn_complete ${p.status}${p.summary ? ` "${p.summary}"` : ''}${RESET}\n`,
+          `${DIM}[diag] turn_complete ${p.status}${details}${RESET}\n`,
         );
         break;
       }

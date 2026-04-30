@@ -120,13 +120,24 @@ function projectEvent(
       };
     }
     case 'subtask_complete': {
-      const p = ev.payload as { childThreadId: string; status: string; summary?: string };
+      const p = ev.payload as {
+        childThreadId: string;
+        status: string;
+        summary?: string;
+        reason?: string;
+        budget?: {
+          reason: string;
+          turnsUsed: number;
+          toolCallsUsed: number;
+          tokensUsed: number;
+        };
+      };
       return {
         role: 'user',
         content: [
           {
             kind: 'text',
-            text: `[subtask ${p.childThreadId} ${p.status}] ${p.summary ?? ''}`,
+            text: formatSubtaskCompleteText(p),
           },
         ],
         cacheTag: ev.id,
@@ -197,6 +208,27 @@ function projectToolResult(ev: HarnessEvent, opts: ProjectOneOpts): ProjectedIte
     content: [content],
     cacheTag: ev.id,
   };
+}
+
+function formatSubtaskCompleteText(p: {
+  childThreadId: string;
+  status: string;
+  summary?: string;
+  reason?: string;
+  budget?: { reason: string; turnsUsed: number; toolCallsUsed: number; tokensUsed: number };
+}): string {
+  const head = [`[subtask ${p.childThreadId} ${p.status}`];
+  if (p.reason) head.push(`reason=${p.reason}`);
+  if (p.budget) {
+    head.push(
+      `budget=${p.budget.reason}`,
+      `turns=${p.budget.turnsUsed}`,
+      `toolCalls=${p.budget.toolCallsUsed}`,
+      `tokens=${p.budget.tokensUsed}`,
+    );
+  }
+  const prefix = `${head.join(' ')}]`;
+  return p.summary ? `${prefix} ${p.summary}` : prefix;
 }
 
 function describeElision(kind: string, meta: Record<string, unknown>): string {

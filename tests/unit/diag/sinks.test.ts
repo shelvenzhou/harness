@@ -95,4 +95,29 @@ describe('StderrDiagSink', () => {
     await sink.close();
     expect(true).toBe(true);
   });
+
+  it('prints turn_complete reason when summary is absent', async () => {
+    const sink = new StderrDiagSink({ level: 'summary' });
+    const writes: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      sink.onEvent({
+        id: newEventId(),
+        threadId: newThreadId(),
+        kind: 'turn_complete',
+        createdAt: new Date().toISOString(),
+        payload: {
+          status: 'interrupted',
+          reason: 'budget:maxTokens',
+        },
+      } as HarnessEvent);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    expect(writes.join('')).toContain('turn_complete interrupted reason=budget:maxTokens');
+  });
 });
