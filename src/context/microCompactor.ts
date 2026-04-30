@@ -102,6 +102,8 @@ export class MicroCompactor {
     }
 
     let compacted = 0;
+    const compactedMetaByEventId = new Map<EventId, HarnessEvent['elided']>();
+    const startedAt = Date.now();
     for (let i = this.checkpointIndex; i < tailBoundary; i++) {
       const ev = events[i]!;
       if (ev.kind !== 'tool_result') continue;
@@ -128,6 +130,16 @@ export class MicroCompactor {
           ok: p.ok,
         },
       });
+      compactedMetaByEventId.set(ev.id, {
+        handle,
+        kind: 'micro_compact',
+        meta: {
+          toolName,
+          bytes: json.length,
+          summary,
+          ok: p.ok,
+        },
+      });
       compacted += 1;
     }
 
@@ -138,10 +150,10 @@ export class MicroCompactor {
     if (compacted > 0 && this.opts.emitCompactionEvent) {
       const payload: CompactionEventPayload = {
         reason: 'auto',
-        tokensBefore: 0,
-        tokensAfter: 0,
-        durationMs: 0,
-        retainedUserTurns: 0,
+        tokensBefore: estimateTokens(events),
+        tokensAfter: estimateTokens(events, compactedMetaByEventId),
+        durationMs: Date.now() - startedAt,
+        retainedUserTurns: countUserTurns(events),
         ghostSnapshotCount: 0,
       };
       compactionEvent = await store.append({
@@ -168,6 +180,36 @@ export class MicroCompactor {
   get checkpoint(): number {
     return this.checkpointIndex;
   }
+}
+
+function estimateTokens(
+  events: readonly HarnessEvent[],
+  overrides: ReadonlyMap<EventId, HarnessEvent['elided']> = new Map(),
+): number {
+  let total = 0;
+  for (const event of events) {
+    total += JSON.stringify(renderEventForEstimate(event, overrides.get(event.id))).length;
+  }
+  return Math.ceil(total / 4);
+}
+
+function renderEventForEstimate(event: HarnessEvent, override?: HarnessEvent['elided']): unknown {
+  const elided = override ?? event.elided;
+  if (!elided) return event.payload ?? {};
+  return {
+    elided: {
+      kind: elided.kind,
+      handle: elided.handle,
+      summary:
+        typeof elided.meta.summary === 'string'
+          ? elided.meta.summary
+          : undefined,
+    },
+  };
+}
+
+function countUserTurns(events: readonly HarnessEvent[]): number {
+  return events.filter((event) => event.kind === 'user_turn_start' || event.kind === 'user_input').length;
 }
 
 function buildSummary(toolName: string, p: ToolResultPayload, bytes: number): string {

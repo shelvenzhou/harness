@@ -53,6 +53,7 @@ export interface Compactor {
 export class StaticCompactor implements Compactor {
   async compact(req: CompactionRequest): Promise<CompactionResult> {
     const t0 = Date.now();
+    const tokensBefore = estimateTokens(req.events);
     const userTurns = req.events.filter(
       (e) => e.kind === 'user_turn_start' || e.kind === 'user_input',
     );
@@ -69,23 +70,29 @@ export class StaticCompactor implements Compactor {
       req.events[req.events.length - 1]?.id ??
       ('' as EventId)) as EventId;
 
-    return {
-      summary: {
-        reinject: {
-          systemReinject: '(no extra system reinjection)',
-        },
-        summary:
-          summarised.length === 0
-            ? '(no prior content)'
-            : `(stub summary of ${summarised.length} prior events)`,
-        recentUserTurns: excerpts,
-        ghostSnapshots: [],
-        activeHandles: [],
+    const summary: CompactedSummary = {
+      reinject: {
+        systemReinject: '(no extra system reinjection)',
       },
+      summary:
+        summarised.length === 0
+          ? '(no prior content)'
+          : `(stub summary of ${summarised.length} prior events)`,
+      recentUserTurns: excerpts,
+      ghostSnapshots: [],
+      activeHandles: [],
+    };
+
+    return {
+      summary,
       atEventId,
-      tokensBefore: 0,
-      tokensAfter: 0,
+      tokensBefore,
+      tokensAfter: estimateTokens([summary]),
       durationMs: Date.now() - t0,
     };
   }
+}
+
+function estimateTokens(value: unknown): number {
+  return Math.ceil(JSON.stringify(value).length / 4);
 }

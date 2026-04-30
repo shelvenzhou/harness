@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
 import { newThreadId, type ToolCallId } from '@harness/core/ids.js';
 import { HandleRegistry, MicroCompactor } from '@harness/context/index.js';
+import type { CompactionEventPayload } from '@harness/core/events.js';
 import { MemorySessionStore } from '@harness/store/index.js';
 
 /**
@@ -70,6 +71,11 @@ describe('MicroCompactor', () => {
     expect(r.ran).toBe(true);
     expect(r.compactedCount).toBeGreaterThan(0);
     expect(r.compactionEvent?.kind).toBe('compaction_event');
+    const compactionPayload = r.compactionEvent?.payload as CompactionEventPayload | undefined;
+    expect(compactionPayload?.tokensBefore).toBeGreaterThan(0);
+    expect(compactionPayload?.tokensAfter).toBeGreaterThan(0);
+    expect(compactionPayload?.tokensAfter).toBeLessThan(compactionPayload!.tokensBefore);
+    expect(compactionPayload?.retainedUserTurns).toBe(1);
 
     const events = await store.readAll(tid);
     // Walk: anything in [0..17) that's a tool_result must be elided.

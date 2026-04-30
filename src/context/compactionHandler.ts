@@ -114,7 +114,7 @@ export class CompactionHandler {
         payload: {
           reason: 'auto',
           tokensBefore,
-          tokensAfter: result.tokensAfter || tokensBefore,
+          tokensAfter: result.tokensAfter,
           durationMs: result.durationMs,
           retainedUserTurns: result.summary.recentUserTurns.length,
           ghostSnapshotCount: result.summary.ghostSnapshots.length,
