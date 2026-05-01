@@ -59,11 +59,28 @@ Data-plane (from runner / executor / subagents):
 - `tool_call` — `{toolCallId, name, args}`
 - `tool_result` — `{toolCallId, ok, output, elided?, originalBytes?, bytesSent}`
 - `spawn_request` — agent requested a subagent
-- `subtask_complete` — child thread reached `done`
+- `subtask_complete` — child thread reached `done`. Carries
+  `{childThreadId, status, summary?, reason?, budget?}`. `summary` is
+  the child's own final reply (preserved even when the child was cut
+  off by a budget cap); `reason` records *why* the child terminated
+  (`user_interrupt`, `parent_interrupt`, a `budget_*` cap name, …) and
+  `budget` is a `{reason, turnsUsed, toolCallsUsed, tokensUsed}`
+  snapshot when budget enforcement fired. Projection renders all of
+  these so the parent's next sampling can plan around them.
+- `session_complete` — async tool body finished; carries
+  `{sessionId, toolName, ok, totalTokens?, error?}`. The
+  tool_call / tool_result pair was already persisted atomically at
+  dispatch time.
 - `timer_fired`
 - `external_event` — webhook, file watch, …
-- `turn_complete` — `{status, summary?}`
-- `compaction_event` — `{reason, durationMs, tokensBefore, tokensAfter}`
+- `turn_complete` — `{status, summary?, reason?}`. `reason` exposes
+  the *cause* (`user_interrupt`, `parent_interrupt`, a budget cap
+  name, `model_returned_no_actions`, …) separately from `summary`;
+  the terminal adapter and the diag stderr sink both surface it.
+- `compaction_event` — `{reason, durationMs, tokensBefore,
+  tokensAfter, retainedUserTurns, ghostSnapshotCount}`. Token
+  counts are real estimates (cheap byte-based proxy) — not the
+  zero placeholders an earlier draft emitted.
 - `rollback_marker`
 
 This list is meant to be extended in a principled way: new kinds get their

@@ -37,9 +37,13 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   sampling step, elides oversized tool_results in the warm zone via
   attachElision + handle. Restore-recoverable.
 - 🔴 **StaticCompactor** — placeholder semantic compactor; the
-  `Compactor` strategy `CompactionHandler` runs by default. Phase 2:
-  replace with a `spawn({role: 'compactor'})` subagent producing a
-  real `CompactedSummary`. The handler interface already accepts an
+  `Compactor` strategy `CompactionHandler` runs by default. The
+  emitted `compaction_event` carries real `tokensBefore` /
+  `tokensAfter` / `durationMs` / `retainedUserTurns` (cheap byte-based
+  estimate, lazy: only re-renders the events whose elision metadata
+  changed in the pass). Phase 2: replace with a
+  `spawn({role: 'compactor'})` subagent producing a real
+  `CompactedSummary`. The handler interface already accepts an
   injected Compactor, so the subagent strategy slots in without
   touching wiring.
 - 🟢 **Compaction trigger + handler (cold path)** —
@@ -59,23 +63,36 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 
 ## Runtime
 
-- 🟡 **AgentRunner** — happy path works. The `wait` transport now
+- 🟡 **AgentRunner** — happy path works. Tool dispatch is atomic: the
+  paired `tool_call` + `tool_result` are persisted synchronously even
+  for long-running tools (which return `{sessionId, status:'running'}`
+  immediately and run their bodies off-path; agent reads the captured
+  output via the `session` tool, waits via
+  `wait({matcher:'session', sessionIds, mode:'any'|'all'})`). The old
+  `awaiting_tool_results` ActiveTurn state and the
+  `deferredUserTurnStarts` ad-hoc guard are gone — projection can no
+  longer observe an orphan tool_call. The `wait` transport
   suspends the turn into `awaiting_event` and resumes when a matching
   event arrives (`user_input` / `subtask_complete:<id>` / `tool_result`
-  / `kind` / `timer`). Each runner owns a `Scheduler`; `wait(timer,
-  delayMs)` schedules a real one-shot timer that publishes
+  / `kind` / `timer` / `session`). Each runner owns a `Scheduler`;
+  `wait(timer, delayMs)` schedules a real one-shot timer that publishes
   `timer_fired`, and `wait.timeoutMs` schedules a private fallback
   timer that emits `external_event{source:"wait_timeout"}` so a
   bounded wait can never deadlock. Pending timers are cancelled on
   turn complete / interrupt / wakeup. Interrupt classification routes
-  a user-cut-off sampling to `turn_complete{interrupted}` instead of
-  the historical `errored:model_returned_no_actions`. Missing:
+  a user-cut-off sampling to `turn_complete{interrupted, reason}`
+  carrying the actual cause (`user_interrupt`, `parent_interrupt`,
+  `budget_*`, …) so adapters and diag don't have to guess. Missing:
   - ⚪ provider stream cancellation surfaces back to the user via the
     `interrupt` event the adapter renders, but no separate
     "interrupting…" lifecycle event is emitted by the runner — the
     bus interrupt envelope is the source of truth.
   - ⚪ `rollback` / `fork` event handling — events are filtered out of
     projection but the runner does not respond to them.
+  - ⚪ Mid-turn `user_turn_start` currently *replaces* the active turn
+    (the old turn's wait/sessions are abandoned but its persisted
+    history stays well-formed). FIFO-queue alternative is a possible
+    future option; right now "newest message wins" is the contract.
 - 🟡 **SubagentPool** — `spawn` creates a child, returns its id, and
   parent receives `subtask_complete` when the child's turn ends.
   Budgets (`maxTurns`/`maxToolCalls`/`maxWallMs`/`maxTokens`) enforced
@@ -84,11 +101,21 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   `SpawnRefused`, surfaced to the LLM as `tool_result.ok=false` with
   the cap name in `error.kind`. Parent → descendant interrupt
   propagation works.
+  `subtask_complete` now keeps the *child's* own final reply as
+  `summary` and reports the cap that fired (and turns/toolCalls/
+  tokens used) in a separate `budget` field — the parent no longer
+  loses the child's conclusion when a budget interrupts it. Each
+  child's system prompt gets a budget-summary preface so the model
+  can plan within the caps from sampling 1; `usage` returns a
+  `RuntimeBudgetSnapshot` (caps / used / remaining) so the model can
+  poll its dynamic budget rather than discovering the cap by getting
+  cut off.
   Missing:
   - ⚪ `inheritTurns` — currently recorded but never copies parent turns.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
-  - ⚪ Soft 80%-warn before the hard cap fires (today the model only
-    learns about the budget when the child gets cut off). See
+  - ⚪ Soft 80%-warn event before the hard cap fires (today the model
+    can poll `usage` for live remaining, but no auto-warn lands on the
+    bus). See
     [01-runtime.md](design-docs/01-runtime.md#subagent-budgets-and-interrupt-propagation).
 - 🟢 **Scheduler** — owned per AgentRunner, drives `wait(timer)` and
   `wait.timeoutMs`. No cron yet (one-shot delays only).
@@ -96,13 +123,17 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 ## Tools
 
 - 🟡 **`shell`** — real. `child_process.spawn` with cwd / timeout / byte-cap
-  / signal-group kill / handle elision. Missing: custom env passthrough,
+  / signal-group kill / handle elision. Marked `async: true` — same
+  session pairing as `web_fetch`. Missing: custom env passthrough,
   stream progress events (tools can't emit intermediate events today),
   explicit stdin support.
 - 🟡 **`write`** — overwrite mode real; `mode: 'patch'` returns
   `not_implemented`.
 - 🟡 **`web_fetch`** — real (undici fetch). GET/HEAD, byte cap, timeout,
-  handle elision. Missing: auth headers, POST body, pluggable transport.
+  handle elision. Marked `async: true` — the runner persists the
+  paired tool_result `{sessionId, status:'running'}` at dispatch and
+  runs the fetch off-path. Agent reads via `session(sessionId)`.
+  Missing: auth headers, POST body, pluggable transport.
 - 🔴 **`web_search`** — still a stub; needs a search backend adapter
   (Brave / Google / DDG).
 - 🟢 **`memory`** — refactored onto a `MemoryStore` interface
@@ -129,16 +160,27 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟢 **`wait`** — yield semantics work for `user_input` /
-  `subtask_complete` / `tool_result` / `kind`. `timer` matcher
-  schedules a real one-shot timer when given `delayMs`; `timeoutMs`
-  on any matcher schedules a fallback timer that wakes the wait via
-  `external_event{source:"wait_timeout"}`. Malformed `timer` waits
-  return `tool_result.ok=true` with `scheduled=false` + an error
-  string the model can react to.
+  `subtask_complete` / `tool_result` / `kind` / `session`. `timer`
+  matcher schedules a real one-shot timer when given `delayMs`;
+  `timeoutMs` on any matcher schedules a fallback timer that wakes
+  the wait via `external_event{source:"wait_timeout"}`. Malformed
+  `timer` waits return `tool_result.ok=true` with `scheduled=false` +
+  an error string the model can react to. `session` matcher accepts
+  `sessionIds: string[]` + `mode: 'any' | 'all'`; sessions that are
+  already terminal at wait-time get drained synchronously to avoid
+  deadlocking on a `session_complete` that fired before the wait.
+- 🟢 **`session`** — reads the captured output of an async tool
+  (`web_fetch`, `shell`, …) by `sessionId`. Returns `status` plus
+  the captured `output` truncated to `maxTokens` (default 2048),
+  the full `totalTokens` estimate, and a `truncated` flag so the
+  model knows when it hit the cap. Future args reserved (`range`,
+  `grep`); not yet implemented.
 - 🟡 **`spawn`** — composition works, parent sees subtask_complete.
   All four budget dimensions (`maxTurns`/`maxToolCalls`/`maxWallMs`/
   `maxTokens`) enforced; structural caps reject overage spawns
-  pre-flight. Missing: `inheritTurns` (recorded, never applied).
+  pre-flight. Children get a budget summary in their system prompt
+  and can poll `usage` for live caps/used/remaining. Missing:
+  `inheritTurns` (recorded, never applied).
 
 ## Store
 
@@ -172,8 +214,18 @@ See commit B for what just landed. Still missing:
 - ⚪ Permission-review audit log (needs sandbox work first).
 - ⚪ Cache-hit tracking — requires a provider that exposes cached token
   counts; OpenAI reports `cached_tokens` when long prefixes hit.
-- ⚪ Compaction metrics plumbing: `CompactionEvent` type exists and is
-  accepted by the bus, but StaticCompactor doesn't emit one.
+- 🟢 Compaction metrics — `compaction_event` carries non-placeholder
+  `tokensBefore` / `tokensAfter` / `durationMs` / `retainedUserTurns`
+  (cheap estimator, no full clone). Both MicroCompactor and the
+  cold-path `CompactionHandler` populate the same shape.
+- 🟢 Interrupt cause attribution — `turn_complete{reason}` plus
+  terminal/diag rendering surface the actual cause
+  (`user_interrupt` / `parent_interrupt` / `budget_*` / …) instead
+  of silently writing `user_interrupt` for everything.
+- 🟢 Subtask metadata projection — `subtask_complete` events are
+  rendered into the parent's prompt with status / reason / budget
+  counters / summary, so the parent can plan around how its child
+  terminated.
 
 ## Actor mode (deferred — see [10-actor-mode.md](design-docs/10-actor-mode.md))
 

@@ -54,13 +54,28 @@ CompactionEvent {
   tokensBefore, tokensAfter,
   durationMs,
   retainedUserTurns, ghostSnapshotCount,
-  resultSummaryBytes,
 }
 ```
 
 Visible on the bus and loggable — same treatment as any other Item. UIs can
 render compactions inline with the conversation, which is the Codex app-
 server design.
+
+The token fields are real estimates (cheap byte-based proxy over the
+event log, with this pass's elision overrides folded in) — not the
+zero placeholders an early draft emitted. The estimator does *not*
+deep-clone the events; it only re-renders the entries whose elision
+metadata changed in the current pass, so the cost stays O(events
+touched) rather than O(events on the thread). The `StaticCompactor`
+strategy and the cold-path `CompactionHandler` produce the same
+non-placeholder shape.
+
+`turn_complete` carries an analogous `reason` field separate from
+`summary` — useful for diag because user-initiated cancellations
+(`user_interrupt` / `parent_interrupt`), budget caps, and model
+mistakes (`model_returned_no_actions`) all want different treatment
+in dashboards. The terminal adapter and the stderr diag sink both
+render `summary` and `reason` together when both are present.
 
 ## Permission review log (future hook)
 

@@ -28,7 +28,7 @@ Per event kind, at projection time:
 | `reasoning`   | keep only last 1–2 reasoning blocks verbatim; drop older  |
 | `reply(internal=true)` | keep last one per turn; summarise older          |
 | `preamble`    | keep verbatim; they're tiny and user-visible              |
-| `spawn` / `subtask_complete` | keep handles + summary; elide body         |
+| `spawn` / `subtask_complete` | render `[subtask <id> <status> reason=… budget=… turns=… toolCalls=… tokens=…] <summary>` so the parent's projection sees *both* the child's own conclusion and the termination metadata it needs to plan around |
 | `user_input`  | keep verbatim                                             |
 | `user_turn_start` | keep verbatim                                         |
 
@@ -83,7 +83,13 @@ the full body on demand. The summary line preserves enough invariants
 whether to restore or move on.
 
 **Trigger event.** Each non-empty pass appends a `compaction_event` with
-`reason: 'auto'` so the diag layer surfaces what was compacted.
+`reason: 'auto'` so the diag layer surfaces what was compacted. The
+metric fields are real estimates: `tokensBefore` / `tokensAfter` apply
+a cheap byte-based proxy over the event log (with the warm-zone
+overrides folded in), `durationMs` is wallclock, `retainedUserTurns`
+counts `user_turn_start` + `user_input` events. The estimate is
+intentionally lazy — we don't deep-clone the event log per pass; we
+only re-render the events whose elision metadata changed in this pass.
 
 ### Level 2 — LLM compaction (expensive, threshold-triggered)
 

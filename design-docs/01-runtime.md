@@ -123,6 +123,22 @@ fires) and pending tool calls; the pool then translates the resulting
 `turn_complete{status: 'interrupted'}` into `subtask_complete{status:
 'budget_exceeded'}` for the parent.
 
+`subtask_complete` preserves the *child's* own last reply as `summary`
+even when termination was budget-driven; the cap name and counters
+(`{reason, turnsUsed, toolCallsUsed, tokensUsed}`) ride alongside in a
+separate `budget` field, with a top-level `reason` that mirrors the
+child's `turn_complete.reason` (e.g. `budget_maxTokens`,
+`parent_interrupt`). Earlier the parent only saw a synthetic placeholder
+("budget exceeded"), losing whatever the child had concluded; that
+asymmetry is gone.
+
+**Child-side budget visibility.** The pool injects a budget summary into
+the child's system prompt at spawn time so the child can plan within its
+caps from the first sampling. At runtime, the `usage` tool returns the
+child's `RuntimeBudgetSnapshot` — caps, used, remaining across all four
+dimensions — so the model can poll its dynamic budget rather than
+discovering the cap by getting cut off.
+
 **Parent → child interrupt propagation.** When the parent receives an
 `interrupt`, the pool propagates it to every descendant thread it tracks.
 Without this, killing the parent leaves orphan children burning provider
