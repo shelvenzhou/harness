@@ -18,11 +18,24 @@ const Budget = z.object({
   maxTokens: z.number().optional(),
 });
 
+const ContextRef = z.object({
+  sourceThreadId: z.string(),
+  fromEventId: z.string().optional(),
+  toEventId: z.string().optional(),
+});
+
 const SpawnArgs = z.object({
   task: z.string().describe('Freeform task description. Becomes the child\'s seed user input.'),
   role: z.string().optional().describe('Optional role tag (verifier, researcher, reviewer, …).'),
   budget: Budget.describe('Budget caps. Breach → the child is killed and reports budget_exceeded.'),
-  inheritTurns: z.number().optional().describe('If set, copy the last N turns from the parent into the child context. Default 0.'),
+  contextRefs: z
+    .array(ContextRef)
+    .optional()
+    .describe(
+      'Slices of other threads\' event logs the child should see prepended to its own tail. ' +
+        'COW: source thread keeps appending after the snapshot range. ' +
+        'Use to give a verifier / reviewer subagent the parent\'s recent turns without inheriting the whole prompt.',
+    ),
 });
 
 export const spawnTool: Tool<typeof SpawnArgs, { childThreadId: string }> = {

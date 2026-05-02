@@ -16,7 +16,7 @@ research pipeline) is built by the model composing these primitives plus
 | `write`     | `{path, content, mode: 'overwrite' \| 'patch'}`   | Patch mode accepts unified diff. |
 | `web_fetch` | `{url, maxOutputBytes?}`                          | Fetch only. No crawling. |
 | `web_search`| `{query, topK?}`                                  | Thin wrapper over a configurable search backend. |
-| `spawn`     | `{task, budget, inheritTurns?, role?, policy?}`   | Forks a subagent. **Composition primitive.** |
+| `spawn`     | `{task, budget, contextRefs?, role?, policy?}`    | Forks a subagent. **Composition primitive.** |
 | `memory`    | `{op, key?, value?, query?, pinned?, tags?}`      | KV + ingestion + search; pinned entries auto-injected into the system prompt. See `src/memory/types.ts` for the `MemoryStore` backend interface. |
 | `restore`   | `{handle}`                                        | Rehydrate an elided event. |
 | `wait`      | `{eventSpec, timeoutMs?}`                         | Yield until a matching event arrives. |
@@ -119,9 +119,12 @@ includes:
 Arguments:
 
 - `task` — freeform string; becomes the child's initial user message.
-- `budget` — `{maxTurns, maxToolCalls, maxWallMs}`; child is killed on breach.
-- `inheritTurns` — 0 by default. If > 0, copies the last N turns from the
-  parent's context (the only way contexts ever share).
+- `budget` — `{maxTurns, maxToolCalls, maxWallMs, maxTokens}`; child is killed on breach.
+- `contextRefs` — optional `[{sourceThreadId, fromEventId?, toEventId?}]`.
+  The child's projection prepends the referenced ranges before its own
+  tail, COW-style; active elision handles are copied into the child's
+  registry. Replaces the older `inheritTurns: N` mechanism (never landed
+  in projection). See [04-context.md](04-context.md#cross-thread-context-refs).
 - `role` — optional freeform tag; shows in traces and affects which system
   prompt preset is used.
 - `policy` — `{canSpawn, allowedTools}`; defaults to inherit parent's.

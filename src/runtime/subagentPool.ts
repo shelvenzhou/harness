@@ -200,6 +200,9 @@ export class SubagentPool {
       ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       ...(this.deps.microCompact !== undefined ? { microCompact: this.deps.microCompact } : {}),
       ...(this.deps.tokenBudget !== undefined ? { tokenBudget: this.deps.tokenBudget } : {}),
+      ...(req.contextRefs !== undefined && req.contextRefs.length > 0
+        ? { contextRefs: req.contextRefs }
+        : {}),
       runtimeBudgetSnapshot: () => this.runtimeBudgetSnapshotFor(childThreadId),
       onSpawn: (inner) => this.spawn(inner),
     });

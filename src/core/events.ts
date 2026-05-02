@@ -1,3 +1,4 @@
+import type { ContextRef } from './actions.js';
 import type { EventId, HandleRef, ThreadId, ToolCallId, TurnId } from './ids.js';
 
 /**
@@ -127,7 +128,7 @@ export interface SpawnRequestPayload {
   childThreadId: ThreadId;
   role?: string;
   task: string;
-  inheritTurns: number;
+  contextRefs?: ContextRef[];
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
 }
 export type SpawnRequestEvent = EventBase<'spawn_request', SpawnRequestPayload>;

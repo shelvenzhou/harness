@@ -75,8 +75,10 @@ Key invariants:
   of the next tick.
 - `ActiveTurn` owns the authoritative answer to "is the turn done?" The
   runner's job is to translate LLM actions into state transitions on it.
-- `spawn` does not share context; the child is a new thread unless
-  `inherit_turns=N` is set, in which case the last N turn items are copied.
+- `spawn` does not share context; the child is a new thread. Optional
+  `contextRefs: [{sourceThreadId, fromEventId?, toEventId?}]` give the
+  child a COW slice of another thread's event log for grounding —
+  see [04-context.md](04-context.md#cross-thread-context-refs).
 
 ## Pending input ("steer")
 
@@ -144,9 +146,12 @@ discovering the cap by getting cut off.
 Without this, killing the parent leaves orphan children burning provider
 quota. Propagation walks the `parentThreadId` tree maintained by the pool.
 
-`inheritTurns` (parameter recorded today, not yet enforced): when set,
-the spawn seeds the child thread with the last N turns of the parent log
-copied verbatim. Carries handles forward.
+`contextRefs` (replaces the never-implemented `inheritTurns`): the
+child's projection prepends the referenced ranges before its own tail,
+COW-style. Active elision handles in the referenced range are copied
+into the child's `HandleRegistry` at first sampling so `restore` works
+on source-side elided events. Source threads keep appending after the
+snapshot range without affecting the child.
 
 ### Structural caps (anti spawn-bomb)
 

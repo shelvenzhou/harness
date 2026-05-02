@@ -36,6 +36,29 @@ export class HandleRegistry {
     return handle;
   }
 
+  /**
+   * Register an entry with a caller-supplied handle ref. Used at child
+   * spawn time to copy active handles from a source thread's referenced
+   * range into the child's registry, so `restore(handle)` works on
+   * source-side elided events the child sees through `contextRefs`.
+   */
+  registerWithRef(
+    handle: HandleRef,
+    kind: string,
+    payload: unknown,
+    meta: Record<string, unknown> = {},
+  ): void {
+    if (this.byHandle.has(handle)) return;
+    this.byHandle.set(handle, {
+      handle,
+      kind,
+      payload,
+      meta,
+      pinnedForNextSampling: false,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   get(handle: HandleRef): Entry | undefined {
     return this.byHandle.get(handle);
   }

@@ -91,71 +91,62 @@ counts `user_turn_start` + `user_input` events. The estimate is
 intentionally lazy — we don't deep-clone the event log per pass; we
 only re-render the events whose elision metadata changed in this pass.
 
-### Level 2 — LLM compaction (expensive, threshold-triggered)
+### Level 2 — cold-path compaction (threshold-triggered)
 
-Trigger when:
+`CompactionTrigger` fires `compact_request` past `compactionThreshold`
+(byte estimate × 4/3 safety margin), with a cooldown to prevent
+flapping. `CompactionHandler` consumes the request, runs the
+configured `Compactor`, persists a `compaction_event`, and acknowledges
+the trigger so the cooldown can release. An in-flight guard drops
+duplicate requests on the same thread.
 
-- `estimatedPromptTokens > compactionThreshold` (conservative estimate × 4/3)
-- K consecutive turns produced no new decisions (heuristic)
-- Explicit `compact_request`
-
-The compactor is a subagent: `spawn({role: 'compactor', inheritTurns: all})`.
-It produces a `CompactedSummary`:
-
-```ts
-interface CompactedSummary {
-  reinject: { systemReinject: string; environment?: string };
-  summary: string;                       // Memento
-  recentUserTurns: UserTurnExcerpt[];    // last K verbatim
-  ghostSnapshots: GhostSnapshot[];       // opaque binary / structural state
-  activeHandles: HandleRef[];            // handles still live
-}
-```
-
-A new `Checkpoint` is appended; from that point the stable-prefix
-`compacted_summary` slot is swapped. One cache miss paid; prefix stabilises
-again.
-
-## Cold vs. hot cache paths (microCompact)
-
-Claude Code's trick. We mirror it:
-
-- **Hot cache** (short idle since last call, cache likely warm): do not
-  rewrite message bytes. Use the provider's logical-hide capability
-  (Anthropic `cache_edits: {clear_tool_uses, clear_thinking}` or equivalent).
-  Physically send the full history → 100% prefix cache hit; logically the
-  model sees the pruned view.
-- **Cold cache** (long idle since last call): rewrite the in-memory message
-  content to the elided form. Fewer bytes on the wire. Cache was going to
-  miss anyway.
-
-Choice is per-request. `LlmProvider.sample` exposes a `cacheEditsSupported`
-capability; when absent, only the cold-cache path is used.
+Today's `Compactor` strategy is a deterministic placeholder. A real
+LLM-backed compactor lands later as a `spawn({role: 'compactor'})`
+subagent that produces a structured summary; the handler interface
+already accepts an injected `Compactor`, so the subagent strategy slots
+in without touching wiring.
 
 ## Handles and `restore`
 
 Every elided event carries `elided = {handle, kind, meta}`. The handle is
 the event id in the SessionStore. `restore(handle)` is a tool that, when
-called, re-emits the full payload as a new event visible to the model on its
-next sampling. The rehydrated event itself is subject to pruning rules so a
-reckless agent can't pin a huge blob indefinitely — after its next tool_call
-cycle it goes back to elided form unless pinned (`memory.set`).
+called, re-emits the full payload as a new event visible to the model on
+the next sampling. `restore` pins the handle for exactly the next
+sampling; `clearPins()` runs after each step.
+
+## Cross-thread context refs
+
+Spawn argument `contextRefs: [{ threadId, fromEventId?, toEventId? }]`
+lets a child thread see a slice of the parent's (or any source thread's)
+event log without copying it physically. This replaces the older
+`inheritTurns` parameter (which never landed in projection).
+
+How it works:
+
+- The child's projection layer prepends the referenced ranges to its own
+  tail, in order. Source events keep their original timestamps and ids
+  but render as the child's history.
+- COW: the source thread keeps appending after the snapshot range; the
+  child only sees `fromEventId .. toEventId`. No physical copy in
+  `events.jsonl`.
+- Active handles in the source range are copied into the child's
+  `HandleRegistry` at spawn time. After that, the child's `restore`
+  works the same as for its own elided events. (Cascading lookup into
+  a parent registry was rejected: simpler to copy at spawn, the child
+  keeps the snapshot world it was forked into.)
+- Compaction interaction: source-side compaction does not invalidate
+  the child's view — the child holds copies of the relevant handles
+  and refers by event id, which is stable.
+
+Use case: verifier / reviewer subagents that need the parent's recent
+turns for grounding without inheriting the parent's whole prompt
+budget. The parent picks the slice; nothing is implicit.
 
 ## Conservative token estimation
 
 Approximate tokens from bytes (`bytes / 3`) and multiply by 4/3 safety
-margin. The goal is to trigger compaction **before** the next request would
-overflow, since we can't query the provider for an exact count.
-
-## Ghost snapshots
-
-Some items don't round-trip through text cleanly: a PTY session id, an
-opened MCP resource handle, a file-tree diff scoped to a subagent. These
-are `GhostSnapshot`s: opaque tokens the compactor must preserve verbatim
-across boundaries so the model (or the tool layer) can still reference them.
-
-Ghost snapshots are stored alongside the checkpoint; they are not text
-tokens in the prompt.
+margin. The goal is to trigger compaction **before** the next request
+would overflow, since we can't query the provider for an exact count.
 
 ## Rollback + compaction interaction
 

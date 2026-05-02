@@ -32,31 +32,28 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     dropped reasoning.
   - ⚪ inline-vs-elide decision respects `inlineToolResultLimit` but does
     not consider the *next* sampling's estimated token budget.
+- 🟢 **Cross-thread context refs (COW)** —
+  `spawn(contextRefs: [{sourceThreadId, fromEventId?, toEventId?}])`
+  prepends a slice of another thread's event log into the child's
+  projection without physically copying. Active elision handles in the
+  range are copied into the child's `HandleRegistry` on first sampling
+  so `restore` works on source-side elided events. Replaces the older
+  `inheritTurns: N` mechanism (never landed in projection).
 - 🟢 **MicroCompactor** (`src/context/microCompactor.ts`) — hot-path
   sliding-window micro-compaction; runs deterministically before each
   sampling step, elides oversized tool_results in the warm zone via
   attachElision + handle. Restore-recoverable.
-- 🔴 **StaticCompactor** — placeholder semantic compactor; the
-  `Compactor` strategy `CompactionHandler` runs by default. The
-  emitted `compaction_event` carries real `tokensBefore` /
-  `tokensAfter` / `durationMs` / `retainedUserTurns` (cheap byte-based
-  estimate, lazy: only re-renders the events whose elision metadata
-  changed in the pass). Phase 2: replace with a
-  `spawn({role: 'compactor'})` subagent producing a real
-  `CompactedSummary`. The handler interface already accepts an
-  injected Compactor, so the subagent strategy slots in without
-  touching wiring.
 - 🟢 **Compaction trigger + handler (cold path)** —
   `CompactionTrigger` fires `compact_request` past the threshold (with
   cooldown). `CompactionHandler` consumes the request, runs the
-  configured `Compactor`, persists a `compaction_event`, and
-  acknowledges the trigger so the cooldown can release. An in-flight
-  guard drops duplicate requests on the same thread. Bootstrap
-  installs the handler automatically alongside the trigger.
-- ⚪ **Cache-edits path** — `cacheEdits` field on SamplingRequest is
-  plumbed but no provider consumes it; no logic decides when to use hot
-  vs. cold path.
-- ⚪ **GhostSnapshots** — type defined, never produced or consumed.
+  configured `Compactor` (placeholder strategy today), persists a
+  `compaction_event`, and acknowledges the trigger so the cooldown can
+  release. An in-flight guard drops duplicate requests on the same
+  thread. Phase 2: replace the placeholder with a
+  `spawn({role: 'compactor'})` subagent producing a real
+  `CompactedSummary` — the handler interface already accepts an
+  injected `Compactor`, so the subagent strategy slots in without
+  touching wiring.
 - 🟢 **`restore` handle rehydration** — `restore` pins the handle for
   exactly the next sampling; `clearPins()` runs after each step, so the
   documented "drop back after next cycle" rule already holds.
@@ -111,7 +108,6 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   poll its dynamic budget rather than discovering the cap by getting
   cut off.
   Missing:
-  - ⚪ `inheritTurns` — currently recorded but never copies parent turns.
   - ⚪ Role-aware system prompts — stub concatenates `[role: foo]`.
   - ⚪ Soft 80%-warn event before the hard cap fires (today the model
     can poll `usage` for live remaining, but no auto-warn lands on the
@@ -150,13 +146,9 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   Missing:
   - ⚪ Auto-`ingest` of recent turns into memory at turn boundaries.
   - ⚪ Pagination over mem0 `getAll` (currently first page only).
-  - ⚪ `confidence` + `provenance` metadata on entries; runtime-assigned
-    (LLM `memory.set` → `speculative`, trusted-adapter ingest →
-    `user_asserted`, verifier subagent → `verified`). Projection layer
-    must render `<memory confidence="…">` framing. See
-    [09-memory.md](design-docs/09-memory.md#confidence-and-provenance).
-  - ⚪ Async verifier subagent — sweeps speculative entries on a
-    cadence, promotes to `verified` or downgrades / deletes.
+  - ⚪ Confidence + provenance metadata + async verifier subagent —
+    deferred until a poisoning incident motivates it. See
+    [09-memory.md](design-docs/09-memory.md#future-confidence-and-provenance).
 - 🟡 **`restore`** — pins a handle but projection's rehydration rules
   are incomplete (see context).
 - 🟢 **`wait`** — yield semantics work for `user_input` /
@@ -175,12 +167,13 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   the full `totalTokens` estimate, and a `truncated` flag so the
   model knows when it hit the cap. Future args reserved (`range`,
   `grep`); not yet implemented.
-- 🟡 **`spawn`** — composition works, parent sees subtask_complete.
+- 🟢 **`spawn`** — composition works, parent sees subtask_complete.
   All four budget dimensions (`maxTurns`/`maxToolCalls`/`maxWallMs`/
   `maxTokens`) enforced; structural caps reject overage spawns
   pre-flight. Children get a budget summary in their system prompt
-  and can poll `usage` for live caps/used/remaining. Missing:
-  `inheritTurns` (recorded, never applied).
+  and can poll `usage` for live caps/used/remaining. `contextRefs`
+  give the child a COW slice of another thread's event log when set
+  (replaces the never-implemented `inheritTurns`).
 
 ## Store
 
@@ -229,19 +222,11 @@ See commit B for what just landed. Still missing:
 
 ## Actor mode (deferred — see [10-actor-mode.md](design-docs/10-actor-mode.md))
 
-Whole document is deferred until a trigger condition lands; gaps
-listed here so the TODO is the single source of truth.
+Whole document is deferred until a trigger condition lands.
 
-- ⚪ `ActorPool` (sibling of SubagentPool) with per-turn budget,
-  hibernation idle policy, explicit stop.
-- ⚪ Actor registry + `send(actorRef, msg)` primitive.
-- ⚪ Lifetime circuit breakers on `ActorBudget`:
-  `maxLifetimeTokens` / `maxLifetimeUsd` / `ttlMs` / `idleTtlMs`.
-- ⚪ `senderState` on `SendOpts` — correlation id + goal snapshot
-  restorable via `restore(handle)`. Fixes "B replied but A forgot why".
-- ⚪ Optional state machine layer over `AgentRunner`.
-- ⚪ `external_event` framing in projection (untrusted-input boundary).
-- ⚪ `forkTree` / `rewindTree` with effect-classified tool tags.
+- ⚪ `ActorPool` (sibling of SubagentPool), actor registry,
+  `send(actorRef, msg)` primitive, optional state-machine layer,
+  `external_event` framing in projection.
 
 ## Sandbox / permissions
 

@@ -1,3 +1,4 @@
+import type { ContextRef } from '@harness/core/actions.js';
 import type { HarnessEvent } from '@harness/core/events.js';
 import type { EventId, ThreadId } from '@harness/core/ids.js';
 import type {
@@ -38,6 +39,12 @@ export interface ProjectionInputs {
   compactedSummary?: string;
   /** Events with eventId ≤ this are replaced by the summary. */
   compactionCheckpointEventId?: EventId;
+  /**
+   * COW slices of other threads' event logs to prepend before this
+   * thread's tail. Source events render verbatim (preserving their
+   * original cacheTag / id). See `core/actions.ts:ContextRef`.
+   */
+  contextRefs?: ContextRef[];
   pruning?: PruningOptions;
 }
 
@@ -59,7 +66,15 @@ export async function buildSamplingRequest(
   const tail = sliceAfterCheckpoint(all, input.compactionCheckpointEventId);
   const visible = filterRolledBack(tail);
 
-  const projected = projectEvents(visible, {
+  const refEvents: HarnessEvent[] = [];
+  if (input.contextRefs && input.contextRefs.length > 0) {
+    for (const ref of input.contextRefs) {
+      const slice = await readRefSlice(input.store, ref);
+      refEvents.push(...filterRolledBack(slice));
+    }
+  }
+
+  const projected = projectEvents([...refEvents, ...visible], {
     ...(input.pruning ?? {}),
     handles: input.handles,
   });
@@ -92,6 +107,45 @@ export async function buildSamplingRequest(
       pinnedHandles: input.handles.pinnedHandles.length,
     },
   };
+}
+
+async function readRefSlice(
+  store: SessionStore,
+  ref: ContextRef,
+): Promise<HarnessEvent[]> {
+  const all = await store.readAll(ref.sourceThreadId);
+  let from = 0;
+  if (ref.fromEventId) {
+    const idx = all.findIndex((e) => e.id === ref.fromEventId);
+    from = idx < 0 ? 0 : idx;
+  }
+  let to = all.length;
+  if (ref.toEventId) {
+    const idx = all.findIndex((e) => e.id === ref.toEventId);
+    if (idx >= 0) to = idx + 1;
+  }
+  return all.slice(from, to);
+}
+
+/**
+ * Walks `contextRefs` and copies every active elision handle into the
+ * child's HandleRegistry, so `restore(handle)` works on source-side
+ * elided events the child sees through projection. The original
+ * payload still lives in the source event itself; the registry entry
+ * is just the in-memory mirror.
+ */
+export async function copyHandlesForRefs(
+  store: SessionStore,
+  refs: readonly ContextRef[],
+  handles: HandleRegistry,
+): Promise<void> {
+  for (const ref of refs) {
+    const slice = await readRefSlice(store, ref);
+    for (const ev of slice) {
+      if (!ev.elided) continue;
+      handles.registerWithRef(ev.elided.handle, ev.elided.kind, ev.payload, ev.elided.meta);
+    }
+  }
 }
 
 function sliceAfterCheckpoint(

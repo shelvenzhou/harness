@@ -1,4 +1,22 @@
-import type { ThreadId, ToolCallId } from './ids.js';
+import type { EventId, ThreadId, ToolCallId } from './ids.js';
+
+/**
+ * Cross-thread context reference. Lets a spawned child see a slice of
+ * another thread's event log without copying it physically. The child's
+ * projection prepends the referenced ranges to its own tail; source
+ * threads keep appending after the snapshot range without affecting
+ * the child.
+ *
+ * Both bounds optional: omit `fromEventId` to start from the source's
+ * first event, omit `toEventId` to include everything up to spawn time.
+ * Replaces the older `inheritTurns: N` mechanism (never landed in
+ * projection). See design-docs/04-context.md.
+ */
+export interface ContextRef {
+  sourceThreadId: ThreadId;
+  fromEventId?: EventId;
+  toEventId?: EventId;
+}
 
 /**
  * Action envelope — what AgentRunner translates LLM sampling output into.
@@ -40,7 +58,11 @@ export interface SpawnAction {
   task: string;
   role?: string;
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
-  inheritTurns?: number;
+  /**
+   * Optional COW slices of other threads' event logs the child should
+   * see prepended to its own tail. See `ContextRef`.
+   */
+  contextRefs?: ContextRef[];
 }
 
 /**

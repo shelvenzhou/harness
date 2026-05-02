@@ -1,4 +1,4 @@
-import type { Action, EventSpec } from '@harness/core/actions.js';
+import type { Action, ContextRef } from '@harness/core/actions.js';
 import type {
   HarnessEvent,
   ReplyPayload,
@@ -25,13 +25,25 @@ import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { Tool, ToolExecutionContext } from '@harness/tools/tool.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { HandleRegistry } from '@harness/context/handleRegistry.js';
-import { buildSamplingRequest } from '@harness/context/projection.js';
+import { buildSamplingRequest, copyHandlesForRefs } from '@harness/context/projection.js';
 import { MicroCompactor, type MicroCompactorOptions } from '@harness/context/microCompactor.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 
 import { ActiveTurn } from './activeTurn.js';
+import {
+  estimateTokens,
+  eventMatchesSpec,
+  formatPinnedEntry,
+  isReadyToSample,
+  parseWaitSpec,
+  renderSessionOutput,
+  shouldTriggerTick,
+  synthEvent,
+} from './runnerHelpers.js';
 import { Scheduler } from './scheduler.js';
 import { SessionRegistry, type Session } from './sessionRegistry.js';
+import type { TokenBudget } from './turnBudget.js';
+import { TurnBudgetTracker } from './turnBudget.js';
 
 /**
  * AgentRunner: drives one thread. Event-driven, not loop-driven.
@@ -46,35 +58,7 @@ import { SessionRegistry, type Session } from './sessionRegistry.js';
  * See design-docs/01-runtime.md.
  */
 
-/**
- * Hard-wall token budget. The runtime enforces this as a *cap*, not as
- * advice injected into the prompt — design principle: runtime mechanism,
- * LLM policy. When tripped, the turn terminates with status='errored'
- * and a summary indicating which cap fired.
- *
- * Enforcement points:
- *   1. *Before* each sampling step — protects accumulated state from
- *      prior steps / prior turns (for thread-cap).
- *   2. *After* each sampling step that does NOT emit tool calls —
- *      catches the case where a single oversized response would
- *      otherwise close the turn as 'completed' before the wall could
- *      gate a "next" sampling. Without this the wall silently fails on
- *      one-shot responses.
- *   3. The multi-step (tool-using) path relies on (1): tools dispatched
- *      from a step are allowed to finish; the next sampling boundary
- *      then trips the cap.
- *
- * Tokens counted are `promptTokens + completionTokens` from each
- * `sampling_complete`. `cachedPromptTokens` is included in `promptTokens`
- * by convention, so it counts toward the prompt total too (cost-control
- * framing); use compaction for context-window framing.
- */
-export interface TokenBudget {
-  /** Hard cap on cumulative tokens for the current user turn. */
-  maxTurnTokens?: number;
-  /** Hard cap on cumulative tokens over the lifetime of this thread. */
-  maxThreadTokens?: number;
-}
+export type { TokenBudget } from './turnBudget.js';
 
 export interface RuntimeBudgetSnapshot {
   caps: {
@@ -137,6 +121,14 @@ export interface AgentRunnerOptions {
    * decided externally.
    */
   onSpawn?: (req: SpawnRequestInfo) => Promise<ThreadId>;
+  /**
+   * COW slices of other threads' event logs to prepend before this
+   * runner's tail at every projection. Set by `SubagentPool.spawn` when
+   * the parent's `spawn` action carries `contextRefs`. Active elision
+   * handles in the referenced ranges are copied into this runner's
+   * HandleRegistry on first sampling so `restore` works on them.
+   */
+  contextRefs?: ContextRef[];
 }
 
 export interface SpawnRequestInfo {
@@ -146,7 +138,7 @@ export interface SpawnRequestInfo {
   task: string;
   role?: string;
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
-  inheritTurns: number;
+  contextRefs?: ContextRef[];
   parentTraceparent?: string;
 }
 
@@ -166,8 +158,7 @@ export class AgentRunner {
   private abortCtl: AbortController | undefined;
   private samplingIndex = 0;
   private microCompactor?: MicroCompactor;
-  private tokensThisTurn = 0;
-  private tokensThisThread = 0;
+  private readonly tokenBudget: TurnBudgetTracker;
   private readonly scheduler: Scheduler;
   /**
    * Pending timer ids on the current turn. Tracked so we can cancel
@@ -191,9 +182,17 @@ export class AgentRunner {
    * subagents have their own session namespace.
    */
   private readonly sessions = new SessionRegistry();
+  /**
+   * Becomes true after `copyHandlesForRefs` runs once. We materialise
+   * the source-side handles lazily on the first sampling rather than
+   * in the constructor, so the source slice is read after spawn time
+   * (caller's last `attachElision` may not have flushed yet).
+   */
+  private contextRefHandlesCopied = false;
 
   constructor(opts: AgentRunnerOptions) {
     this.opts = opts;
+    this.tokenBudget = new TurnBudgetTracker(opts.tokenBudget);
     if (opts.microCompact !== false) {
       this.microCompactor = new MicroCompactor(opts.microCompact ?? {});
     }
@@ -234,7 +233,7 @@ export class AgentRunner {
         lastSamplingIndex = ev.payload.samplingIndex;
       }
     }
-    this.tokensThisThread = total;
+    this.tokenBudget.hydrateThread(total);
     this.samplingIndex = lastSamplingIndex;
   }
 
@@ -328,7 +327,7 @@ export class AgentRunner {
     this.activeTurn = new ActiveTurn(this.opts.threadId, turnId);
     this.activeTurn.setPhase('CurrentTurn');
     this.activeTurn.toRunning();
-    this.tokensThisTurn = 0;
+    this.tokenBudget.resetTurn();
     this.turnInterrupted = false;
     this.interruptReason = undefined;
     void payload; // payload already persisted as the seed event.
@@ -343,7 +342,7 @@ export class AgentRunner {
     // Hard-wall token budget check, evaluated at the sampling boundary.
     // Caps are checked *before* committing to another provider call; tools
     // already in flight from the previous step run to completion.
-    const tripped = this.checkTokenBudget();
+    const tripped = this.tokenBudget.check();
     if (tripped) {
       await this.completeTurn('errored', tripped);
       return;
@@ -401,10 +400,7 @@ export class AgentRunner {
     // Accumulate tokens for hard-wall budget enforcement. Counted on the
     // sum of prompt + completion (cost-control framing). Cached prompt
     // tokens are already part of promptTokens by convention.
-    const stepTokens =
-      (parsed.usage?.promptTokens ?? 0) + (parsed.usage?.completionTokens ?? 0);
-    this.tokensThisTurn += stepTokens;
-    this.tokensThisThread += stepTokens;
+    this.tokenBudget.add(parsed.usage?.promptTokens ?? 0, parsed.usage?.completionTokens ?? 0);
 
     // Emit sampling_complete with usage + projection stats so the diag
     // layer (and anyone else subscribed) can build a full trace.
@@ -432,7 +428,7 @@ export class AgentRunner {
     // would silently fail. The pre-sampling check at the top of this
     // method only catches accumulated state from prior steps; this
     // post-sampling check catches a single oversized response.
-    const trippedAfter = this.checkTokenBudget();
+    const trippedAfter = this.tokenBudget.check();
     if (trippedAfter) {
       await this.completeTurn('errored', trippedAfter);
       return;
@@ -496,24 +492,6 @@ export class AgentRunner {
     }
   }
 
-  /**
-   * Returns a non-empty summary string when the token budget would be
-   * exceeded by the next sampling, otherwise undefined. The caller uses
-   * the string as the turn_complete summary so the cap reason is visible
-   * in the trace.
-   */
-  private checkTokenBudget(): string | undefined {
-    const b = this.opts.tokenBudget;
-    if (!b) return undefined;
-    if (b.maxTurnTokens !== undefined && this.tokensThisTurn >= b.maxTurnTokens) {
-      return `tokens_exceeded:turn used=${this.tokensThisTurn} cap=${b.maxTurnTokens}`;
-    }
-    if (b.maxThreadTokens !== undefined && this.tokensThisThread >= b.maxThreadTokens) {
-      return `tokens_exceeded:thread used=${this.tokensThisThread} cap=${b.maxThreadTokens}`;
-    }
-    return undefined;
-  }
-
   private async buildRequestWithStats(): Promise<{
     request: SamplingRequest;
     stats: { projectedItems: number; elidedCount: number; estimatedTokens: number; pinnedHandles: number };
@@ -522,6 +500,14 @@ export class AgentRunner {
     const memoryPinned = this.opts.memory
       ? (await this.opts.memory.pinned()).map(formatPinnedEntry)
       : [];
+    if (
+      !this.contextRefHandlesCopied &&
+      this.opts.contextRefs &&
+      this.opts.contextRefs.length > 0
+    ) {
+      await copyHandlesForRefs(this.opts.store, this.opts.contextRefs, this.handles);
+      this.contextRefHandlesCopied = true;
+    }
     const built = await buildSamplingRequest({
       threadId: this.opts.threadId,
       store: this.opts.store,
@@ -529,6 +515,7 @@ export class AgentRunner {
       handles: this.handles,
       systemPrompt: this.opts.systemPrompt,
       pinnedMemory: [...staticPinned, ...memoryPinned],
+      ...(this.opts.contextRefs !== undefined ? { contextRefs: this.opts.contextRefs } : {}),
     });
     return { request: built.request, stats: built.stats };
   }
@@ -771,16 +758,16 @@ export class AgentRunner {
   }
 
   private async handleSpawnRequest(toolCallId: ToolCallId, rawArgs: unknown): Promise<void> {
-      const args = rawArgs as {
-        task: string;
-        role?: string;
-        budget?: {
-          maxTurns?: number;
-          maxToolCalls?: number;
-          maxWallMs?: number;
-          maxTokens?: number;
+    const args = rawArgs as {
+      task: string;
+      role?: string;
+      budget?: {
+        maxTurns?: number;
+        maxToolCalls?: number;
+        maxWallMs?: number;
+        maxTokens?: number;
       };
-      inheritTurns?: number;
+      contextRefs?: ContextRef[];
     };
     const childThreadId = newThreadId();
     const turnId = this.activeTurn?.turnId ?? newTurnId();
@@ -790,7 +777,7 @@ export class AgentRunner {
         childThreadId,
         ...(args.role !== undefined ? { role: args.role } : {}),
         task: args.task,
-        inheritTurns: args.inheritTurns ?? 0,
+        ...(args.contextRefs !== undefined ? { contextRefs: args.contextRefs } : {}),
         budget: args.budget ?? {},
       },
       turnId,
@@ -804,7 +791,7 @@ export class AgentRunner {
           task: args.task,
           ...(args.role !== undefined ? { role: args.role } : {}),
           budget: args.budget ?? {},
-          inheritTurns: args.inheritTurns ?? 0,
+          ...(args.contextRefs !== undefined ? { contextRefs: args.contextRefs } : {}),
           parentTraceparent: childOf(undefined),
         });
         if (spawnedChildThreadId !== childThreadId) {
@@ -970,8 +957,8 @@ export class AgentRunner {
     await this.persistToolResult(toolCallId, {
       ok: true,
       output: {
-        tokensThisTurn: this.tokensThisTurn,
-        tokensThisThread: this.tokensThisThread,
+        tokensThisTurn: this.tokenBudget.turnTokens,
+        tokensThisThread: this.tokenBudget.threadTokens,
         samplingCount: this.samplingIndex,
         caps: {
           ...(caps.maxTurnTokens !== undefined ? { maxTurnTokens: caps.maxTurnTokens } : {}),
@@ -1037,154 +1024,6 @@ export class AgentRunner {
     this.opts.bus.publish(event);
     return event;
   }
-}
-
-function shouldTriggerTick(ev: HarnessEvent): boolean {
-  switch (ev.kind) {
-    case 'user_turn_start':
-    case 'user_input':
-    case 'interrupt':
-    case 'compact_request':
-    case 'subtask_complete':
-    case 'session_complete':
-    case 'timer_fired':
-    case 'external_event':
-      return true;
-    // tool_result no longer triggers a tick: dispatch is atomic now,
-    // so the runner is the sole producer of tool_result events for its
-    // thread and self-arms re-sampling explicitly via scheduleTick.
-    default:
-      return false;
-  }
-}
-
-function isReadyToSample(at: ActiveTurn): boolean {
-  const s = at.state;
-  if (s.kind === 'awaiting_event') return false;
-  if (s.kind === 'awaiting_subtask') return false;
-  if (s.kind === 'completed' || s.kind === 'interrupted' || s.kind === 'errored') return false;
-  return true;
-}
-
-function parseWaitSpec(rawArgs: unknown): EventSpec {
-  const a = (rawArgs ?? {}) as Record<string, unknown>;
-  const matcher = typeof a.matcher === 'string' ? a.matcher : 'kind';
-  switch (matcher) {
-    case 'tool_result':
-      if (typeof a.toolCallId === 'string') {
-        return { matcher: 'tool_result', toolCallId: a.toolCallId as ToolCallId };
-      }
-      break;
-    case 'subtask_complete':
-      if (typeof a.childThreadId === 'string') {
-        return { matcher: 'subtask_complete', childThreadId: a.childThreadId as ThreadId };
-      }
-      break;
-    case 'user_input':
-      return { matcher: 'user_input' };
-    case 'timer':
-      if (typeof a.timerId === 'string') {
-        return { matcher: 'timer', timerId: a.timerId };
-      }
-      break;
-    case 'session': {
-      const ids = Array.isArray(a.sessionIds)
-        ? a.sessionIds.filter((x): x is string => typeof x === 'string')
-        : [];
-      if (ids.length > 0) {
-        const mode = a.mode === 'all' ? 'all' : 'any';
-        return {
-          matcher: 'session',
-          sessionIds: [...ids],
-          mode,
-          remaining: new Set(ids),
-        };
-      }
-      break;
-    }
-    case 'kind':
-      if (typeof a.kind === 'string') {
-        return { matcher: 'kind', kind: a.kind };
-      }
-      break;
-  }
-  // Permissive fallback: any external_event wakes the turn. Without this,
-  // a malformed wait would deadlock the turn until interrupt.
-  return { matcher: 'kind', kind: 'external_event' };
-}
-
-function eventMatchesSpec(ev: HarnessEvent, spec: EventSpec): boolean {
-  switch (spec.matcher) {
-    case 'kind':
-      return ev.kind === spec.kind;
-    case 'tool_result':
-      return ev.kind === 'tool_result' && ev.payload.toolCallId === spec.toolCallId;
-    case 'subtask_complete':
-      return ev.kind === 'subtask_complete' && ev.payload.childThreadId === spec.childThreadId;
-    case 'user_input':
-      return ev.kind === 'user_input' || ev.kind === 'user_turn_start';
-    case 'timer':
-      return ev.kind === 'timer_fired' && ev.payload.timerId === spec.timerId;
-    case 'session': {
-      // Stateful: remove the completing session from `remaining` and
-      // wake when the gate is satisfied. The runner mutates the spec
-      // because it lives on ActiveTurn.state — same instance both here
-      // and after wake-up.
-      if (ev.kind !== 'session_complete') return false;
-      if (!spec.remaining.has(ev.payload.sessionId)) return false;
-      spec.remaining.delete(ev.payload.sessionId);
-      if (spec.mode === 'all') return spec.remaining.size === 0;
-      return true;
-    }
-  }
-}
-
-function synthEvent(threadId: ThreadId, reason: string): HarnessEvent {
-  // Private sentinel; never published. Used to re-arm tick from this module.
-  return {
-    id: ('evt_synth_' + reason) as EventId,
-    threadId,
-    kind: 'external_event',
-    payload: { source: 'runner', data: { reason } },
-    createdAt: new Date().toISOString(),
-  } as HarnessEvent;
-}
-
-function formatPinnedEntry(e: { key?: string; content: string }): string {
-  return e.key ? `${e.key}: ${e.content}` : e.content;
-}
-
-/**
- * Cheap byte-based token estimate. We deliberately do *not* call into the
- * tokenizer here — the same crude proxy used elsewhere in the projection
- * stack is fine for telling the agent "you have N tokens worth of output".
- */
-function estimateTokens(payload: unknown): number {
-  if (payload === undefined || payload === null) return 0;
-  const s = typeof payload === 'string' ? payload : JSON.stringify(payload);
-  return Math.ceil(s.length / 4);
-}
-
-/**
- * Render the session's captured output for the `session` tool. Truncates
- * the *string form* to `maxTokens * 4` bytes and reports whether truncation
- * happened along with the full token estimate, so the agent can decide
- * whether to widen the window or grep over the captured handle.
- */
-function renderSessionOutput(
-  s: Session,
-  maxTokens: number,
-): { output: string | undefined; totalTokens: number; truncated: boolean } {
-  if (s.output === undefined) {
-    return { output: undefined, totalTokens: 0, truncated: false };
-  }
-  const full = typeof s.output === 'string' ? s.output : JSON.stringify(s.output);
-  const totalTokens = Math.ceil(full.length / 4);
-  const cap = maxTokens * 4;
-  if (full.length <= cap) {
-    return { output: full, totalTokens, truncated: false };
-  }
-  return { output: full.slice(0, cap), totalTokens, truncated: true };
 }
 
 // re-export for convenience
