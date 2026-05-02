@@ -18,9 +18,6 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
     short-leading-chunk pattern and emit `channel: "preamble"`.
   - ⚪ retry-on-transport-error budget.
   - ⚪ structured output (response_format) passthrough.
-- ⚪ **AnthropicProvider** — deleted in the OpenAI switch; add back with
-  `cache_control` markers + `cache_edits` suppression (hot-path context
-  pruning).
 - ⚪ **GeminiProvider / Bedrock / local**. OpenAI-compatible endpoints
   already work via `OPENAI_BASE_URL`; native adapters come later.
 
@@ -130,8 +127,15 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   paired tool_result `{sessionId, status:'running'}` at dispatch and
   runs the fetch off-path. Agent reads via `session(sessionId)`.
   Missing: auth headers, POST body, pluggable transport.
-- 🔴 **`web_search`** — still a stub; needs a search backend adapter
-  (Brave / Google / DDG).
+- 🟢 **`web_search`** — `SearchBackend` interface + two backends:
+  - `GoogleSearchBackend` (Programmable Search JSON API; `GOOGLE_SEARCH_API_KEY`
+    + `GOOGLE_SEARCH_CX`; paginates up to 30 results).
+  - `TavilySearchBackend` (`TAVILY_API_KEY`; basic/advanced depth; optional
+    synthesized one-line `answer`).
+  Tool is `async: true` (same session pairing as `web_fetch`); selection via
+  `HARNESS_SEARCH_PROVIDER` (else first key wins, Tavily preferred).
+  Returns `unsupported` when no backend is configured. Missing:
+  - ⚪ Brave / DDG backends (interface is stable; drop-in additions).
 - 🟢 **`memory`** — refactored onto a `MemoryStore` interface
   (`src/memory/types.ts`). Three backends ship:
   - `InMemoryStore` — KV + pinning + keyword search; process-scoped.

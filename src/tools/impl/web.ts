@@ -169,35 +169,112 @@ export const webFetchTool: Tool<typeof FetchArgs, FetchOutput> = {
   },
 };
 
-// ─── web_search stays a stub in phase 2 — needs a search backend. ───
+// ─── web_search ──────────────────────────────────────────────────────────
+
+import { SearchError, type SearchResponse } from '@harness/search/types.js';
+
+const SEARCH_INLINE_BYTES = 4096;
+const DEFAULT_TOP_K = 8;
+const MAX_TOP_K = 20;
 
 const SearchArgs = z.object({
-  query: z.string(),
-  topK: z.number().optional(),
+  query: z.string().describe('Free-text query.'),
+  topK: z.number().optional().describe('Max results (default 8, hard cap 20).'),
+  safe: z.enum(['off', 'moderate', 'strict']).optional().describe('Safe-search level.'),
 });
 
-export const webSearchTool: Tool<typeof SearchArgs, {
+interface WebSearchOutput {
   query: string;
+  provider: string;
   results: Array<{ title: string; url: string; snippet: string }>;
-  handle?: string;
-}> = {
+  answer?: string;
+  truncated?: boolean;
+}
+
+export const webSearchTool: Tool<typeof SearchArgs, WebSearchOutput> = {
   name: 'web_search',
   concurrency: 'safe',
+  async: true,
   description: [
-    'Search the web. STUB — returns empty results until a search backend (Brave/Google/DDG) is wired.',
-    'Use for open-ended lookup; use web_fetch when you already know the URL.',
+    "Search the web. Returns title/url/snippet triples from the configured backend (Google, Tavily, ...).",
+    "Use for open-ended lookup when you don't yet have a URL; use web_fetch when you do.",
   ].join(' '),
   schema: SearchArgs,
   async execute(args, ctx) {
-    const handle = ctx.registerHandle('web_search_results', { query: args.query, results: [] });
-    return {
-      ok: true,
-      output: { query: args.query, results: [], handle },
-      elided: {
-        handle,
-        kind: 'web_search_results',
-        meta: { query: args.query, topK: args.topK ?? 10 },
-      },
+    const backend = ctx.services.searchBackend;
+    if (!backend) {
+      return {
+        ok: false as const,
+        error: { kind: 'unsupported', message: 'web_search backend not configured' },
+      };
+    }
+    const topK = Math.max(1, Math.min(args.topK ?? DEFAULT_TOP_K, MAX_TOP_K));
+
+    let resp: SearchResponse;
+    try {
+      resp = await backend.search(args.query, {
+        topK,
+        ...(args.safe !== undefined ? { safe: args.safe } : {}),
+        signal: ctx.signal,
+      });
+    } catch (err) {
+      if (err instanceof SearchError) {
+        return {
+          ok: false as const,
+          error: {
+            kind: err.kind,
+            message: err.message,
+            retryable: err.kind === 'rate_limit' || err.kind === 'transport',
+          },
+        };
+      }
+      return {
+        ok: false as const,
+        error: { kind: 'search', message: err instanceof Error ? err.message : String(err) },
+      };
+    }
+
+    const trimmed = resp.results.map((r) => ({
+      title: r.title,
+      url: r.url,
+      snippet: r.snippet,
+    }));
+    const output: WebSearchOutput = {
+      query: resp.query,
+      provider: resp.provider,
+      results: trimmed,
+      ...(resp.answer ? { answer: resp.answer } : {}),
     };
+
+    const inlineBytes = approxJsonBytes(output);
+    if (inlineBytes > SEARCH_INLINE_BYTES) {
+      const handle = ctx.registerHandle(
+        'web_search_results',
+        { query: resp.query, provider: resp.provider, results: resp.results, answer: resp.answer },
+        { query: resp.query, provider: resp.provider, count: resp.results.length },
+      );
+      return {
+        ok: true,
+        output: { ...output, truncated: true },
+        elided: {
+          handle,
+          kind: 'web_search_results',
+          meta: {
+            query: resp.query,
+            provider: resp.provider,
+            count: resp.results.length,
+          },
+        },
+      };
+    }
+    return { ok: true, output };
   },
 };
+
+function approxJsonBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  } catch {
+    return 0;
+  }
+}

@@ -28,6 +28,7 @@ import { HandleRegistry } from '@harness/context/handleRegistry.js';
 import { buildSamplingRequest, copyHandlesForRefs } from '@harness/context/projection.js';
 import { MicroCompactor, type MicroCompactorOptions } from '@harness/context/microCompactor.js';
 import type { MemoryStore } from '@harness/memory/types.js';
+import type { SearchBackend } from '@harness/search/types.js';
 
 import { ActiveTurn } from './activeTurn.js';
 import {
@@ -92,6 +93,8 @@ export interface AgentRunnerOptions {
   pinnedMemory?: string[];
   /** Persistent memory backend; injected into every tool ctx.services. */
   memory?: MemoryStore;
+  /** Web search backend; injected into every tool ctx.services. */
+  searchBackend?: SearchBackend;
   /**
    * Hot-path micro-compaction. Disabled when undefined.
    * When set, runs deterministically before each sampling step.
@@ -627,6 +630,9 @@ export class AgentRunner {
       registerHandle: (kind, payload, meta) => this.handles.register(kind, payload, meta ?? {}),
       services: {
         ...(this.opts.memory !== undefined ? { memory: this.opts.memory } : {}),
+        ...(this.opts.searchBackend !== undefined
+          ? { searchBackend: this.opts.searchBackend }
+          : {}),
       },
     };
 

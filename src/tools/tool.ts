@@ -3,6 +3,7 @@ import type { ZodTypeAny, z } from 'zod';
 import type { ElidedMeta } from '@harness/core/events.js';
 import type { EventId, HandleRef, ThreadId, ToolCallId, TurnId } from '@harness/core/ids.js';
 import type { MemoryStore } from '@harness/memory/types.js';
+import type { SearchBackend } from '@harness/search/types.js';
 
 /**
  * Tool interface. See design-docs/03-tools.md.
@@ -31,6 +32,8 @@ export interface ToolServices {
   toolCallEventId?: EventId;
   /** Persistent memory store (KV + ingestion + search). */
   memory?: MemoryStore;
+  /** Web search backend (Google, Tavily, …). Powers the `web_search` tool. */
+  searchBackend?: SearchBackend;
 }
 
 export interface ToolResult<Output = unknown> {

@@ -25,6 +25,7 @@ import {
 } from '@harness/context/compactionHandler.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
+import type { SearchBackend } from '@harness/search/types.js';
 
 import { AgentRunner, type TokenBudget } from './agentRunner.js';
 import { SubagentPool } from './subagentPool.js';
@@ -54,6 +55,11 @@ export interface BootstrapOptions {
    * cross-session memory.
    */
   memory?: MemoryStore;
+  /**
+   * Web search backend. Off when undefined; the `web_search` tool
+   * returns `unsupported` so the model knows search is disabled.
+   */
+  searchBackend?: SearchBackend;
   /**
    * Hot-path micro-compaction options. Pass `false` to disable.
    * When omitted, defaults are used (keepRecent=20, triggerEvery=10).
@@ -113,6 +119,7 @@ export interface Runtime {
   subagents: SubagentPool;
   rootThreadId: ThreadId;
   runner: AgentRunner;
+  searchBackend?: SearchBackend;
   diag?: { stop: () => Promise<void> };
   /** Cold-path compaction trigger (only present if `compactionTrigger` opt was passed). */
   compactionTrigger?: CompactionTrigger;
@@ -153,6 +160,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     systemPromptFor: (role) =>
       role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
     memory,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(opts.subagentTokenBudget !== undefined
       ? { tokenBudget: opts.subagentTokenBudget }
@@ -175,6 +183,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPrompt: opts.systemPrompt,
     memory,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
@@ -213,6 +222,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     subagents,
     rootThreadId,
     runner,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(diag !== undefined ? { diag } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
     ...(compactionHandler !== undefined ? { compactionHandler } : {}),

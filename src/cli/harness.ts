@@ -9,6 +9,9 @@ import { JsonlMemoryStore } from '@harness/memory/jsonlMemoryStore.js';
 import { Mem0Store } from '@harness/memory/mem0Store.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
+import { GoogleSearchBackend } from '@harness/search/googleSearch.js';
+import { TavilySearchBackend } from '@harness/search/tavilySearch.js';
+import type { SearchBackend } from '@harness/search/types.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
 import {
   JsonlDiagSink,
@@ -58,6 +61,7 @@ async function main(): Promise<void> {
   const diagSinks = buildDiagSinks();
   const microCompact = buildMicroCompactOptions();
   const memory = buildMemoryStore();
+  const searchBackend = buildSearchBackend();
 
   const runtime = await bootstrap({
     provider,
@@ -66,6 +70,7 @@ async function main(): Promise<void> {
     ...(diagSinks.length > 0 ? { diagSinks } : {}),
     ...(microCompact !== undefined ? { microCompact } : {}),
     ...(memory !== undefined ? { memory } : {}),
+    ...(searchBackend !== undefined ? { searchBackend } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -142,6 +147,37 @@ function envNumber(key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function buildSearchBackend(): SearchBackend | undefined {
+  const explicit = process.env['HARNESS_SEARCH_PROVIDER']?.toLowerCase();
+  const tavilyKey = process.env['TAVILY_API_KEY'];
+  const googleKey = process.env['GOOGLE_SEARCH_API_KEY'];
+  const googleCx = process.env['GOOGLE_SEARCH_CX'];
+
+  const tryTavily = (): SearchBackend | undefined => {
+    if (!tavilyKey) return undefined;
+    return new TavilySearchBackend({
+      apiKey: tavilyKey,
+      ...(process.env['TAVILY_BASE_URL'] ? { baseURL: process.env['TAVILY_BASE_URL'] } : {}),
+      ...(process.env['TAVILY_SEARCH_DEPTH'] === 'advanced' ? { searchDepth: 'advanced' } : {}),
+      ...(process.env['TAVILY_INCLUDE_ANSWER'] === '1' ? { includeAnswer: true } : {}),
+    });
+  };
+  const tryGoogle = (): SearchBackend | undefined => {
+    if (!googleKey || !googleCx) return undefined;
+    return new GoogleSearchBackend({
+      apiKey: googleKey,
+      cx: googleCx,
+      ...(process.env['GOOGLE_SEARCH_BASE_URL']
+        ? { baseURL: process.env['GOOGLE_SEARCH_BASE_URL'] }
+        : {}),
+    });
+  };
+
+  if (explicit === 'tavily') return tryTavily();
+  if (explicit === 'google') return tryGoogle();
+  return tryTavily() ?? tryGoogle();
+}
+
 function buildMemoryStore(): MemoryStore | undefined {
   const apiKey = process.env['MEM0_API_KEY'];
   if (apiKey) {
@@ -199,6 +235,12 @@ function printUsage(): void {
       '  MEM0_API_KEY         enable mem0 backend (overrides HARNESS_MEMORY_FILE if both set)',
       '  MEM0_BASE_URL        self-hosted mem0 server (omit for cloud)',
       '  MEM0_USER_ID         fallback userId for mem0 (default \'harness\')',
+      '  HARNESS_SEARCH_PROVIDER   force web_search backend (google | tavily)',
+      '  GOOGLE_SEARCH_API_KEY     enable Google Programmable Search (with GOOGLE_SEARCH_CX)',
+      '  GOOGLE_SEARCH_CX          Google CSE id',
+      '  TAVILY_API_KEY            enable Tavily search backend',
+      '  TAVILY_SEARCH_DEPTH       basic | advanced (default basic)',
+      '  TAVILY_INCLUDE_ANSWER     1 to request a synthesized one-line answer',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

@@ -12,6 +12,7 @@ import type { ThreadId } from '@harness/core/ids.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
+import type { SearchBackend } from '@harness/search/types.js';
 import { EventBus } from '@harness/bus/eventBus.js';
 import { JsonlSessionStore } from '@harness/store/index.js';
 import { createDefaultRegistry } from '@harness/tools/index.js';
@@ -48,6 +49,7 @@ export interface ResumeOptions {
   registry?: ToolRegistry;
   pinnedMemory?: string[];
   memory?: MemoryStore;
+  searchBackend?: SearchBackend;
   microCompact?: MicroCompactorOptions | false;
   diagSinks?: DiagSink[];
   tokenBudget?: TokenBudget;
@@ -87,6 +89,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     systemPromptFor: (role) =>
       role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
     memory,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(opts.subagentTokenBudget !== undefined
       ? { tokenBudget: opts.subagentTokenBudget }
@@ -102,6 +105,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     provider: opts.provider,
     systemPrompt: opts.systemPrompt,
     memory,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
     ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
@@ -127,6 +131,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     subagents,
     rootThreadId: opts.threadId,
     runner,
+    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(diag !== undefined ? { diag } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
   };
