@@ -43,14 +43,24 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 - 🟢 **Compaction trigger + handler (cold path)** —
   `CompactionTrigger` fires `compact_request` past the threshold (with
   cooldown). `CompactionHandler` consumes the request, runs the
-  configured `Compactor` (placeholder strategy today), persists a
-  `compaction_event`, and acknowledges the trigger so the cooldown can
-  release. An in-flight guard drops duplicate requests on the same
-  thread. Phase 2: replace the placeholder with a
-  `spawn({role: 'compactor'})` subagent producing a real
-  `CompactedSummary` — the handler interface already accepts an
-  injected `Compactor`, so the subagent strategy slots in without
-  touching wiring.
+  configured `Compactor`, persists a `compaction_event`, and
+  acknowledges the trigger so the cooldown can release. An in-flight
+  guard drops duplicate requests on the same thread.
+- 🟢 **Subagent-backed compactor** (`SubagentCompactor`) — runs the
+  configured `LlmProvider` against a fresh, isolated thread (parented
+  to the source thread for traceability, empty tool registry so it can
+  only reply with prose). Bypasses `SubagentPool` so a compaction
+  running on an idle thread doesn't have to synthesize a parent turn
+  or pollute that thread with a `subtask_complete` event. Wall timeout
+  (default 60s) + injectable fallback (defaults to `StaticCompactor`)
+  keep the cold path best-effort: a flaky provider can't deadlock
+  compaction. Opt in via `bootstrap({ useSubagentCompactor: true })`
+  or `HARNESS_COMPACTOR=subagent` (alongside
+  `HARNESS_COMPACTION_THRESHOLD_TOKENS`). Missing:
+  - ⚪ Honour the `CompactedSummary` in projection so the resulting
+    summary actually replaces the elided turns in the next prompt
+    (today the event lands but projection's prompt-shape transform is
+    still a separate change).
 - 🟢 **`restore` handle rehydration** — `restore` pins the handle for
   exactly the next sampling; `clearPins()` runs after each step, so the
   documented "drop back after next cycle" rule already holds.

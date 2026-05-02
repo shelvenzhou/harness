@@ -23,6 +23,8 @@ import {
   CompactionHandler,
   type CompactionHandlerOptions,
 } from '@harness/context/compactionHandler.js';
+import type { Compactor } from '@harness/context/compactor.js';
+import { SubagentCompactor } from '@harness/context/subagentCompactor.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import type { SearchBackend } from '@harness/search/types.js';
@@ -107,6 +109,17 @@ export interface BootstrapOptions {
    * trigger.
    */
   compactionHandler?: CompactionHandlerOptions;
+  /**
+   * If set, the bootstrap installs a `SubagentCompactor` (provider-backed,
+   * isolated thread, falls back to `StaticCompactor` on failure) as the
+   * cold-path strategy. `true` keeps the defaults; an object overrides
+   * `systemPrompt` / `timeoutMs` / `fallback`. Ignored when
+   * `compactionHandler.compactor` is already supplied — explicit caller
+   * choice wins.
+   */
+  useSubagentCompactor?:
+    | boolean
+    | { systemPrompt?: string; timeoutMs?: number; fallback?: Compactor };
 }
 
 export interface Runtime {
@@ -205,10 +218,21 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   // fire once and then stay silent forever.
   let compactionHandler: CompactionHandler | undefined;
   if (opts.compactionHandler !== undefined || compactionTrigger !== undefined) {
-    compactionHandler = new CompactionHandler({
-      ...(opts.compactionHandler ?? {}),
-      ...(compactionTrigger !== undefined ? { trigger: compactionTrigger } : {}),
-    });
+    const handlerOpts: CompactionHandlerOptions = { ...(opts.compactionHandler ?? {}) };
+    if (handlerOpts.compactor === undefined && opts.useSubagentCompactor) {
+      const overrides =
+        typeof opts.useSubagentCompactor === 'object' ? opts.useSubagentCompactor : {};
+      handlerOpts.compactor = new SubagentCompactor({
+        bus,
+        store,
+        provider: opts.provider,
+        ...(overrides.systemPrompt !== undefined ? { systemPrompt: overrides.systemPrompt } : {}),
+        ...(overrides.timeoutMs !== undefined ? { timeoutMs: overrides.timeoutMs } : {}),
+        ...(overrides.fallback !== undefined ? { fallback: overrides.fallback } : {}),
+      });
+    }
+    if (compactionTrigger !== undefined) handlerOpts.trigger = compactionTrigger;
+    compactionHandler = new CompactionHandler(handlerOpts);
     compactionHandler.start(bus, store);
   }
 

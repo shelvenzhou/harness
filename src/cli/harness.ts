@@ -62,6 +62,8 @@ async function main(): Promise<void> {
   const microCompact = buildMicroCompactOptions();
   const memory = buildMemoryStore();
   const searchBackend = buildSearchBackend();
+  const compactionTrigger = buildCompactionTrigger();
+  const useSubagentCompactor = process.env['HARNESS_COMPACTOR'] === 'subagent';
 
   const runtime = await bootstrap({
     provider,
@@ -71,6 +73,8 @@ async function main(): Promise<void> {
     ...(microCompact !== undefined ? { microCompact } : {}),
     ...(memory !== undefined ? { memory } : {}),
     ...(searchBackend !== undefined ? { searchBackend } : {}),
+    ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
+    ...(useSubagentCompactor ? { useSubagentCompactor: true } : {}),
   });
 
   const adapter = new TerminalAdapter({ store: runtime.store });
@@ -145,6 +149,16 @@ function envNumber(key: string): number | undefined {
   if (raw === undefined || raw === '') return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function buildCompactionTrigger(): { thresholdTokens: number; cooldownSamples?: number } | undefined {
+  const threshold = envNumber('HARNESS_COMPACTION_THRESHOLD_TOKENS');
+  if (threshold === undefined) return undefined;
+  const cooldown = envNumber('HARNESS_COMPACTION_COOLDOWN_SAMPLES');
+  return {
+    thresholdTokens: threshold,
+    ...(cooldown !== undefined ? { cooldownSamples: cooldown } : {}),
+  };
 }
 
 function buildSearchBackend(): SearchBackend | undefined {
@@ -235,6 +249,9 @@ function printUsage(): void {
       '  MEM0_API_KEY         enable mem0 backend (overrides HARNESS_MEMORY_FILE if both set)',
       '  MEM0_BASE_URL        self-hosted mem0 server (omit for cloud)',
       '  MEM0_USER_ID         fallback userId for mem0 (default \'harness\')',
+      '  HARNESS_COMPACTION_THRESHOLD_TOKENS  enable cold-path compaction at this token mark',
+      '  HARNESS_COMPACTION_COOLDOWN_SAMPLES  samplings to skip after firing (default 5)',
+      '  HARNESS_COMPACTOR=subagent           use provider-backed compactor (else StaticCompactor)',
       '  HARNESS_SEARCH_PROVIDER   force web_search backend (google | tavily)',
       '  GOOGLE_SEARCH_API_KEY     enable Google Programmable Search (with GOOGLE_SEARCH_CX)',
       '  GOOGLE_SEARCH_CX          Google CSE id',
