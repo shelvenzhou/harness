@@ -10,14 +10,27 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 
 ## LLM providers
 
-- 🟡 **OpenAIProvider** — real streaming + tool calls + usage reporting
-  (prompt/completion/cached tokens) working. Missing:
-  - ⚪ `reasoning_delta` emission (newer reasoning models have a
-    `reasoning` field; currently dropped).
-  - ⚪ preamble heuristic: channel is always `reply`; detect the
-    short-leading-chunk pattern and emit `channel: "preamble"`.
-  - ⚪ retry-on-transport-error budget.
-  - ⚪ structured output (response_format) passthrough.
+- 🟢 **OpenAIProvider** — streaming + tool calls + usage reporting
+  (prompt / completion / cached tokens), plus:
+  - `reasoning_delta` emission — probes both `reasoning_content`
+    (o1/o3 + Responses API passthrough) and `reasoning` (alternate
+    spelling on some compatible endpoints) on the streaming delta.
+    Surfaced as a separate `SamplingDelta` so `actionParser`
+    accumulates it into `reasoningText` without polluting the reply.
+  - preamble heuristic — implemented in `actionParser` (one source of
+    truth for every provider): a text buffer flushed *because of* a
+    following tool_call defaults to `preamble`, otherwise `reply`. A
+    provider that explicitly tags a delta with `channel: 'reply'`
+    overrides the default. Provider therefore emits text untagged.
+  - retry-on-transport-error budget — `OpenAIProviderOptions.maxRetries`
+    forwards to the SDK constructor (default 2 = 3 total attempts).
+    Mid-stream errors are NOT retried (would double-emit content);
+    initial connect / 5xx / 429 / 408 / network use the SDK's built-in
+    exponential backoff.
+  - structured output passthrough — `SamplingRequest.responseFormat`
+    accepts `{ type: 'json_object' }` or `{ type: 'json_schema',
+    name, schema, strict?, description? }`; provider translates to
+    OpenAI's `response_format` shape (json_schema strict-by-default).
 - ⚪ **GeminiProvider / Bedrock / local**. OpenAI-compatible endpoints
   already work via `OPENAI_BASE_URL`; native adapters come later.
 

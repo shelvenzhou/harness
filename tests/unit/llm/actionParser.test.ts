@@ -33,6 +33,72 @@ describe('parseSampling', () => {
     expect(kinds).toEqual(['preamble', 'reply']);
   });
 
+  it('classifies untagged text before a tool_call as preamble (heuristic)', async () => {
+    const tc = newToolCallId();
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'text_delta', text: "I'll look that up" },
+        { kind: 'tool_call_begin', toolCallId: tc, name: 'shell' },
+        { kind: 'tool_call_end', toolCallId: tc, args: { cmd: 'ls' } },
+        { kind: 'end', stopReason: 'tool_use' },
+      ]),
+    );
+    expect(parsed.actions.map((a) => a.kind)).toEqual(['preamble', 'tool_call']);
+    expect(parsed.actions[0]).toMatchObject({ kind: 'preamble', text: "I'll look that up" });
+  });
+
+  it('classifies untagged text without a following tool_call as reply', async () => {
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'text_delta', text: 'just chatting' },
+        { kind: 'end', stopReason: 'end_turn' },
+      ]),
+    );
+    expect(parsed.actions).toHaveLength(1);
+    expect(parsed.actions[0]).toMatchObject({ kind: 'reply', text: 'just chatting', final: true });
+  });
+
+  it('handles text → tool_call → text: leading is preamble, trailing is reply', async () => {
+    const tc = newToolCallId();
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'text_delta', text: 'planning…' },
+        { kind: 'tool_call_begin', toolCallId: tc, name: 'shell' },
+        { kind: 'tool_call_end', toolCallId: tc, args: {} },
+        { kind: 'text_delta', text: 'all done' },
+        { kind: 'end', stopReason: 'end_turn' },
+      ]),
+    );
+    expect(parsed.actions.map((a) => a.kind)).toEqual(['preamble', 'tool_call', 'reply']);
+  });
+
+  it('explicit channel="reply" overrides the preamble heuristic', async () => {
+    const tc = newToolCallId();
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'text_delta', text: 'an answer', channel: 'reply' },
+        { kind: 'tool_call_begin', toolCallId: tc, name: 'shell' },
+        { kind: 'tool_call_end', toolCallId: tc, args: {} },
+        { kind: 'end', stopReason: 'tool_use' },
+      ]),
+    );
+    expect(parsed.actions.map((a) => a.kind)).toEqual(['reply', 'tool_call']);
+  });
+
+  it('collects reasoning_delta into reasoningText (separate from reply)', async () => {
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'reasoning_delta', text: 'think 1' },
+        { kind: 'reasoning_delta', text: ' think 2' },
+        { kind: 'text_delta', text: 'answer' },
+        { kind: 'end', stopReason: 'end_turn' },
+      ]),
+    );
+    expect(parsed.reasoningText).toBe('think 1 think 2');
+    expect(parsed.actions).toHaveLength(1);
+    expect(parsed.actions[0]).toMatchObject({ kind: 'reply', text: 'answer' });
+  });
+
   it('emits tool_call action with merged args', async () => {
     const tc = newToolCallId();
     const parsed = await parseSampling(

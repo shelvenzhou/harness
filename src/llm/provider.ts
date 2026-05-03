@@ -84,7 +84,24 @@ export interface SamplingRequest {
   traceparent?: string;
   /** Provider-specific model id; interpreted by each provider. */
   model?: string;
+  /**
+   * Structured-output spec passed through to the provider. Providers
+   * that don't support structured output ignore the field; providers
+   * that do (e.g. OpenAI's `response_format`) translate it into the
+   * native shape.
+   */
+  responseFormat?: ResponseFormatSpec;
 }
+
+export type ResponseFormatSpec =
+  | { type: 'json_object' }
+  | {
+      type: 'json_schema';
+      name: string;
+      schema: unknown;
+      strict?: boolean;
+      description?: string;
+    };
 
 export interface TokenUsage {
   promptTokens: number;

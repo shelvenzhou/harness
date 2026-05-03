@@ -1,6 +1,11 @@
 import OpenAI from 'openai';
 import type { Stream } from 'openai/core/streaming.js';
-import type { ChatCompletionChunk, ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions.js';
+import type {
+  ChatCompletionChunk,
+  ChatCompletionCreateParamsStreaming,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from 'openai/resources/chat/completions.js';
 
 import type { ToolCallId } from '@harness/core/ids.js';
 
@@ -9,6 +14,7 @@ import type {
   LlmProvider,
   ProjectedContent,
   ProjectedItem,
+  ResponseFormatSpec,
   SamplingDelta,
   SamplingRequest,
   StablePrefix,
@@ -31,9 +37,19 @@ export interface OpenAIProviderOptions {
   baseURL?: string;
   defaultMaxTokens?: number;
   defaultTemperature?: number;
+  /**
+   * Per-request retry budget for transport-level failures (network
+   * errors, 5xx, 408, 429). Mid-stream errors are NOT retried — only
+   * the initial connect/handshake. Default 2 (3 total attempts).
+   * The OpenAI SDK exposes the same knob; we forward via the
+   * client constructor so the same budget applies to non-streaming
+   * paths if any are added later.
+   */
+  maxRetries?: number;
 }
 
 const DEFAULT_MODEL = 'gpt-4o-mini';
+const DEFAULT_MAX_RETRIES = 2;
 
 export class OpenAIProvider implements LlmProvider {
   readonly id = 'openai';
@@ -54,6 +70,7 @@ export class OpenAIProvider implements LlmProvider {
     if (!opts.apiKey) throw new Error('OpenAIProvider requires an apiKey');
     this.client = new OpenAI({
       apiKey: opts.apiKey,
+      maxRetries: opts.maxRetries ?? DEFAULT_MAX_RETRIES,
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     });
     this.model = opts.model ?? DEFAULT_MODEL;
@@ -81,6 +98,9 @@ export class OpenAIProvider implements LlmProvider {
         stream_options: { include_usage: true },
         max_completion_tokens: request.maxTokens ?? this.defaultMaxTokens,
         temperature: request.temperature ?? this.defaultTemperature,
+        ...(request.responseFormat
+          ? { response_format: toResponseFormat(request.responseFormat) }
+          : {}),
       },
       { signal },
     )) as unknown as Stream<ChatCompletionChunk>;
@@ -129,7 +149,18 @@ export class OpenAIProvider implements LlmProvider {
         if (!choice) continue;
         const delta = choice.delta;
         if (delta?.content) {
-          yield { kind: 'text_delta', text: delta.content, channel: 'reply' };
+          // Don't tag with channel here. Let actionParser apply the
+          // preamble heuristic: text flushed because of a following
+          // tool_call gets `preamble`; trailing text gets `reply`.
+          yield { kind: 'text_delta', text: delta.content };
+        }
+        // Reasoning content is non-standard on the Chat Completions API
+        // surface — newer reasoning models (o1/o3 family + the OpenAI
+        // Responses API shim) attach a `reasoning_content` field on the
+        // delta; some compatible endpoints use `reasoning`. Probe both.
+        const reasoningText = readReasoningField(delta);
+        if (reasoningText) {
+          yield { kind: 'reasoning_delta', text: reasoningText };
         }
         if (delta?.tool_calls) {
           for (const tc of delta.tool_calls) {
@@ -310,6 +341,8 @@ function toChatMessages(
 
 export const __testOnly = {
   toChatMessages,
+  toResponseFormat,
+  readReasoningField,
 };
 
 function toChatTools(prefix: StablePrefix): ChatCompletionTool[] {
@@ -356,4 +389,44 @@ function mapStopReason(
     default:
       return 'error';
   }
+}
+
+/**
+ * Translate the harness's `ResponseFormatSpec` into the OpenAI Chat
+ * Completions `response_format` shape. JSON-schema mode picks up
+ * `strict: true` by default so the API enforces shape; callers can
+ * opt out by setting `strict: false`.
+ */
+function toResponseFormat(
+  spec: ResponseFormatSpec,
+): NonNullable<ChatCompletionCreateParamsStreaming['response_format']> {
+  if (spec.type === 'json_object') {
+    return { type: 'json_object' };
+  }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: spec.name,
+      schema: spec.schema as Record<string, unknown>,
+      strict: spec.strict ?? true,
+      ...(spec.description !== undefined ? { description: spec.description } : {}),
+    },
+  };
+}
+
+/**
+ * Pull the model's reasoning text out of a streaming delta. The
+ * official ChatCompletionChunk type doesn't declare these fields, so we
+ * widen and probe both `reasoning_content` (o1/o3 + Responses API
+ * passthrough) and `reasoning` (alternate spelling on some compatible
+ * endpoints). Returns the empty string when neither field is set.
+ */
+function readReasoningField(delta: unknown): string {
+  if (!delta || typeof delta !== 'object') return '';
+  const obj = delta as Record<string, unknown>;
+  const a = obj['reasoning_content'];
+  if (typeof a === 'string') return a;
+  const b = obj['reasoning'];
+  if (typeof b === 'string') return b;
+  return '';
 }

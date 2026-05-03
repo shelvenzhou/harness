@@ -75,3 +75,61 @@ describe('OpenAIProvider message translation', () => {
     expect(messages[4]).toMatchObject({ role: 'tool', tool_call_id: 'call_bbb' });
   });
 });
+
+describe('OpenAIProvider response_format', () => {
+  it('passes json_object straight through', () => {
+    const out = __testOnly.toResponseFormat({ type: 'json_object' });
+    expect(out).toEqual({ type: 'json_object' });
+  });
+
+  it('wraps json_schema spec with strict=true by default', () => {
+    const out = __testOnly.toResponseFormat({
+      type: 'json_schema',
+      name: 'Result',
+      schema: { type: 'object', properties: { x: { type: 'number' } } },
+    });
+    expect(out).toMatchObject({
+      type: 'json_schema',
+      json_schema: {
+        name: 'Result',
+        strict: true,
+        schema: { type: 'object', properties: { x: { type: 'number' } } },
+      },
+    });
+  });
+
+  it('honours explicit strict=false and description', () => {
+    const out = __testOnly.toResponseFormat({
+      type: 'json_schema',
+      name: 'R',
+      schema: { type: 'object' },
+      strict: false,
+      description: 'shape doc',
+    });
+    expect(out).toMatchObject({
+      type: 'json_schema',
+      json_schema: { name: 'R', strict: false, description: 'shape doc' },
+    });
+  });
+});
+
+describe('OpenAIProvider reasoning field probing', () => {
+  it('reads reasoning_content', () => {
+    expect(__testOnly.readReasoningField({ reasoning_content: 'thinking…' })).toBe('thinking…');
+  });
+
+  it('falls back to reasoning when reasoning_content is absent', () => {
+    expect(__testOnly.readReasoningField({ reasoning: 'alt' })).toBe('alt');
+  });
+
+  it('returns empty string when neither field is set', () => {
+    expect(__testOnly.readReasoningField({ content: 'hi' })).toBe('');
+    expect(__testOnly.readReasoningField(null)).toBe('');
+    expect(__testOnly.readReasoningField(undefined)).toBe('');
+  });
+
+  it('ignores non-string values', () => {
+    expect(__testOnly.readReasoningField({ reasoning_content: 42 })).toBe('');
+    expect(__testOnly.readReasoningField({ reasoning: { nested: 'x' } })).toBe('');
+  });
+});

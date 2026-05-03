@@ -34,9 +34,23 @@ export async function parseSampling(
   const startedAt = Date.now();
   let firstByteAt: number | undefined;
 
-  const flushReply = (): void => {
+  /**
+   * Flush the text buffer.
+   *
+   * `defaultChannel` is the heuristic applied when the provider didn't
+   * explicitly set `channel` on its text deltas:
+   *   - 'preamble' — caller is about to push a tool_call action; the
+   *     text we just buffered is the model's preflight commentary, not
+   *     its final reply.
+   *   - 'reply' — caller is closing the stream with no further tool
+   *     calls; the buffer is the assistant's reply.
+   * If the provider explicitly sets `channel` on a text delta, that
+   * overrides the default (`replyChannel` wins).
+   */
+  const flushReply = (defaultChannel: 'reply' | 'preamble' = 'reply'): void => {
     if (!replyBuf) return;
-    if (replyChannel === 'preamble') {
+    const channel = replyChannel ?? defaultChannel;
+    if (channel === 'preamble') {
       actions.push({ kind: 'preamble', text: replyBuf });
     } else {
       actions.push({ kind: 'reply', text: replyBuf });
@@ -51,10 +65,14 @@ export async function parseSampling(
     }
     switch (delta.kind) {
       case 'text_delta': {
-        // Channel change forces a flush so the two chunks don't merge.
-        const ch = delta.channel ?? 'reply';
-        if (replyChannel && replyChannel !== ch) flushReply();
-        replyChannel = ch;
+        // Only an *explicit* channel sets `replyChannel`. Untagged
+        // deltas leave the channel unset so the heuristic in
+        // `flushReply` (preamble before a tool call, reply otherwise)
+        // can choose. A change between two explicit channels still
+        // forces a flush so the chunks don't merge.
+        const ch = delta.channel;
+        if (ch && replyChannel && replyChannel !== ch) flushReply();
+        if (ch) replyChannel = ch;
         replyBuf += delta.text;
         break;
       }
@@ -74,7 +92,11 @@ export async function parseSampling(
         if (!entry) break;
         entry.args = delta.args;
         toolCallsInFlight.delete(delta.toolCallId);
-        flushReply(); // any text before a tool call becomes its own reply
+        // Preamble heuristic: text buffered up to here is preflight
+        // commentary before a tool call, not the final reply. The
+        // provider can override by explicitly tagging deltas with
+        // channel: 'reply'.
+        flushReply('preamble');
         actions.push({
           kind: 'tool_call',
           toolCallId: delta.toolCallId,
