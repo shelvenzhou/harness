@@ -26,7 +26,7 @@ describe('JsonlDiagSink', () => {
     const turnId = newTurnId();
 
     const request: SamplingRequest = {
-      prefix: { systemPrompt: 'sys', pinnedMemory: [], tools: [] },
+      prefix: { systemPrompt: 'sys', tools: [] },
       tail: [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }],
     };
     const path = await sink.onPrompt(
@@ -67,7 +67,7 @@ describe('StderrDiagSink', () => {
   it('prints a concise summary line per sampling_complete without throwing', async () => {
     const sink = new StderrDiagSink({ level: 'summary' });
     const request: SamplingRequest = {
-      prefix: { systemPrompt: 'sys', pinnedMemory: [], tools: [] },
+      prefix: { systemPrompt: 'sys', tools: [] },
       tail: [],
     };
     // onPrompt + onEvent — should not throw in any branch.

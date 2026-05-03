@@ -196,16 +196,12 @@ function toChatMessages(
   tail: ProjectedItem[],
 ): ChatCompletionMessageParam[] {
   const messages: ChatCompletionMessageParam[] = [];
-  const systemParts = [prefix.systemPrompt];
-  if (prefix.pinnedMemory.length > 0) {
-    systemParts.push('\n[pinned memory]');
-    for (const m of prefix.pinnedMemory) systemParts.push(`- ${m}`);
-  }
-  if (prefix.compactedSummary) {
-    systemParts.push('\n[compacted summary]');
-    systemParts.push(prefix.compactedSummary);
-  }
-  messages.push({ role: 'system', content: systemParts.join('\n') });
+  // Pinned memory + compacted summary now arrive as synthetic head-of-tail
+  // items (with cacheTags PINNED_MEMORY_CACHE_TAG / COMPACTED_SUMMARY_CACHE_TAG)
+  // so the system message stays byte-stable across pin/unpin and compaction
+  // events. The provider's automatic prompt-prefix cache hits as long as
+  // system + tools don't mutate.
+  messages.push({ role: 'system', content: prefix.systemPrompt });
 
   let pendingAssistant:
     | {

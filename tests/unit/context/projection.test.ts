@@ -201,14 +201,78 @@ describe('buildSamplingRequest', () => {
       compactedSummary: 'CONDENSED',
       compactionCheckpointEventId: old2.id,
     });
-    expect(request.prefix.compactedSummary).toBe('CONDENSED');
+    // Summary lives as a cache-tagged synthetic head-of-tail item so
+    // the prefix stays byte-stable across compactions.
+    expect(request.prefix).not.toHaveProperty('compactedSummary');
+    const summaryItem = request.tail.find((i) => i.cacheTag === 'compacted-summary');
+    expect(summaryItem).toBeDefined();
+    const summaryText = summaryItem?.content
+      .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
+      .map((c) => c.text)
+      .join('\n');
+    expect(summaryText).toContain('CONDENSED');
+    expect(summaryText).toContain('[prior conversation summary]');
     const texts = request.tail
       .flatMap((i) => i.content)
       .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
       .map((c) => c.text);
-    expect(texts).toContain('recent turn');
-    expect(texts).not.toContain('old turn 1');
-    expect(texts).not.toContain('old reply 1');
+    expect(texts.some((t) => t.includes('recent turn'))).toBe(true);
+    expect(texts.some((t) => t.includes('old turn 1'))).toBe(false);
+    expect(texts.some((t) => t.includes('old reply 1'))).toBe(false);
+  });
+
+  it('renders pinnedMemory as a cache-tagged head-of-tail item, not in the prefix', async () => {
+    const store = new MemorySessionStore();
+    const tid = newThreadId();
+    await store.createThread({ id: tid, rootTraceparent: newRootTraceparent() });
+    await store.append({ threadId: tid, kind: 'user_turn_start', payload: { text: 'go' } });
+
+    const { request } = await buildSamplingRequest({
+      threadId: tid,
+      store,
+      registry: new ToolRegistry(),
+      handles: new HandleRegistry(),
+      systemPrompt: 'sys',
+      pinnedMemory: ['prefer-concise', 'tz=UTC+8'],
+    });
+    expect(request.prefix).not.toHaveProperty('pinnedMemory');
+    const pinnedItem = request.tail.find((i) => i.cacheTag === 'pinned-memory');
+    expect(pinnedItem).toBeDefined();
+    const text = pinnedItem?.content
+      .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
+      .map((c) => c.text)
+      .join('\n');
+    expect(text).toContain('[pinned memory]');
+    expect(text).toContain('- prefer-concise');
+    expect(text).toContain('- tz=UTC+8');
+    // Pinned item must be ordered before the live conversation tail.
+    const pinnedIdx = request.tail.findIndex((i) => i.cacheTag === 'pinned-memory');
+    const userIdx = request.tail.findIndex((i) =>
+      i.content.some((c) => c.kind === 'text' && /^go$/.test(c.text)),
+    );
+    expect(pinnedIdx).toBeLessThan(userIdx);
+  });
+
+  it('orders pinnedMemory before compactedSummary at the head of the tail', async () => {
+    const store = new MemorySessionStore();
+    const tid = newThreadId();
+    await store.createThread({ id: tid, rootTraceparent: newRootTraceparent() });
+    await store.append({ threadId: tid, kind: 'user_turn_start', payload: { text: 'live' } });
+
+    const { request } = await buildSamplingRequest({
+      threadId: tid,
+      store,
+      registry: new ToolRegistry(),
+      handles: new HandleRegistry(),
+      systemPrompt: 'sys',
+      pinnedMemory: ['x'],
+      compactedSummary: 's',
+    });
+    const tags = request.tail.map((i) => i.cacheTag);
+    const pinnedIdx = tags.indexOf('pinned-memory');
+    const summaryIdx = tags.indexOf('compacted-summary');
+    expect(pinnedIdx).toBeGreaterThanOrEqual(0);
+    expect(summaryIdx).toBeGreaterThan(pinnedIdx);
   });
 
   it('projects subtask_complete reason and budget metadata into the prompt text', async () => {

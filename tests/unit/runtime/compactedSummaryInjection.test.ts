@@ -14,7 +14,8 @@ import { bootstrap } from '@harness/runtime/bootstrap.js';
  * Regression / integration: once a `compaction_event` carrying a summary
  * + atEventId lands on a thread, every subsequent sampling on that
  * thread must:
- *   1. inject `summary` into prefix.compactedSummary
+ *   1. expose `summary` as a cache-tagged synthetic head-of-tail item
+ *      (not on the prefix — keeps the prefix byte-stable across compactions)
  *   2. drop tail events with id ≤ atEventId
  *
  * Verifies the AgentRunner's `latestCompaction()` helper plus the
@@ -108,17 +109,25 @@ describe('runtime: compaction summary injection', () => {
     await runOneTurn(runtime.bus, runtime.store, runtime.rootThreadId, 'turn 3');
     const last = provider.requests.at(-1);
     expect(provider.requests.length).toBeGreaterThan(before);
-    expect(last?.prefix.compactedSummary).toBe('CONDENSED-PRIOR');
+    expect(last?.prefix).not.toHaveProperty('compactedSummary');
+
+    const summaryItem = last?.tail.find((i) => i.cacheTag === 'compacted-summary');
+    expect(summaryItem).toBeDefined();
+    const summaryText = summaryItem?.content
+      .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
+      .map((c) => c.text)
+      .join('\n');
+    expect(summaryText).toContain('CONDENSED-PRIOR');
 
     const tailTexts = (last?.tail ?? [])
       .flatMap((i) => i.content)
       .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
       .map((c) => c.text);
-    expect(tailTexts).toContain('turn 3');
+    expect(tailTexts.some((t) => t.includes('turn 3'))).toBe(true);
     // turn 1 + the first 'ok' reply should be elided (≤ checkpoint).
-    expect(tailTexts).not.toContain('turn 1');
+    expect(tailTexts.some((t) => t === 'turn 1')).toBe(false);
     // turn 2 lives after the checkpoint and stays.
-    expect(tailTexts).toContain('turn 2');
+    expect(tailTexts.some((t) => t === 'turn 2')).toBe(true);
   });
 
   it('a metrics-only compaction_event (no summary/atEventId) is ignored', async () => {
@@ -146,12 +155,12 @@ describe('runtime: compaction summary injection', () => {
 
     await runOneTurn(runtime.bus, runtime.store, runtime.rootThreadId, 'turn B');
     const last = provider.requests.at(-1);
-    expect(last?.prefix.compactedSummary).toBeUndefined();
+    expect(last?.tail.some((i) => i.cacheTag === 'compacted-summary')).toBe(false);
     const texts = (last?.tail ?? [])
       .flatMap((i) => i.content)
       .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
       .map((c) => c.text);
-    expect(texts).toContain('turn A');
-    expect(texts).toContain('turn B');
+    expect(texts.some((t) => t.includes('turn A'))).toBe(true);
+    expect(texts.some((t) => t.includes('turn B'))).toBe(true);
   });
 });

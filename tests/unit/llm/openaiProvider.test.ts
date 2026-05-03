@@ -8,7 +8,6 @@ describe('OpenAIProvider message translation', () => {
   it('merges adjacent assistant tool_use items into one assistant tool_calls message', () => {
     const prefix: StablePrefix = {
       systemPrompt: 'sys',
-      pinnedMemory: [],
       tools: [],
     };
     const tail: ProjectedItem[] = [

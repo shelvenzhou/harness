@@ -26,11 +26,23 @@ export interface ToolSpec {
  */
 export interface StablePrefix {
   systemPrompt: string;
-  pinnedMemory: string[];
-  compactedSummary?: string;
   /** Tool specs belong to the prefix because they change rarely. */
   tools: ToolSpec[];
 }
+
+/**
+ * cacheTags the projection stamps on synthetic tail items. Pinned
+ * memory and compacted-summary content live at the head of the tail
+ * (not in the prefix) so the prefix stays byte-stable across
+ * compactions and pin/unpin events — provider prompt caches survive.
+ * Providers with explicit cache markers (Anthropic `cache_control`)
+ * can target these tags to seal each segment as its own cache
+ * breakpoint. Order in the tail head: pinned memory first (changes on
+ * manual pin/unpin), then compacted summary (changes on each
+ * compaction), then live conversation tail.
+ */
+export const PINNED_MEMORY_CACHE_TAG = 'pinned-memory';
+export const COMPACTED_SUMMARY_CACHE_TAG = 'compacted-summary';
 
 export interface ProjectedItem {
   /** Role from the model's POV; 'user' also carries tool_result turns. */

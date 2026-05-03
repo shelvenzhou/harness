@@ -215,10 +215,11 @@ export interface CompactionEventPayload {
   retainedUserTurns: number;
   ghostSnapshotCount: number;
   /**
-   * Prose summary the Compactor produced. Projection injects this into
-   * `prefix.compactedSummary` for every subsequent sampling. Optional
-   * for compatibility with handlers that haven't been updated to write
-   * it; absent → projection treats this as a metrics-only event.
+   * Prose summary the Compactor produced. Projection prepends this as
+   * a cache-tagged synthetic tail item (`COMPACTED_SUMMARY_CACHE_TAG`)
+   * for every subsequent sampling. Optional for compatibility with
+   * handlers that haven't been updated to write it; absent →
+   * projection treats this as a metrics-only event.
    */
   summary?: string;
   /**

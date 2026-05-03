@@ -19,16 +19,9 @@ export function renderPromptText(request: SamplingRequest): string {
   const lines: string[] = [];
   lines.push('# system');
   lines.push(request.prefix.systemPrompt);
-  if (request.prefix.pinnedMemory.length) {
-    lines.push('');
-    lines.push('# pinned memory');
-    for (const m of request.prefix.pinnedMemory) lines.push(`- ${m}`);
-  }
-  if (request.prefix.compactedSummary) {
-    lines.push('');
-    lines.push('# compacted summary');
-    lines.push(request.prefix.compactedSummary);
-  }
+  // Pinned memory + compacted summary now appear as cache-tagged tail
+  // items and get rendered in the # tail section below — keeping them
+  // out of the prefix preserves the provider's prompt-prefix cache.
   lines.push('');
   lines.push(`# tools (${request.prefix.tools.length})`);
   for (const t of request.prefix.tools) lines.push(`- ${t.name}: ${t.description.split('\n')[0]}`);

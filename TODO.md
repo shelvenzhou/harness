@@ -57,14 +57,21 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   compaction. Opt in via `bootstrap({ useSubagentCompactor: true })`
   or `HARNESS_COMPACTOR=subagent` (alongside
   `HARNESS_COMPACTION_THRESHOLD_TOKENS`).
-- 🟢 **Compaction summary injection** — `compaction_event.payload`
-  now carries `summary` + `atEventId`. Before each sampling,
-  `AgentRunner` reads the most recent compaction_event with a usable
-  summary and passes both fields into `buildSamplingRequest`, which
-  already honoured `compactedSummary` (→ `prefix.compactedSummary`)
-  and `compactionCheckpointEventId` (→ tail truncation). Metrics-only
-  events (older or pre-handler) are skipped so they don't override a
-  real compaction.
+- 🟢 **Compaction summary + pinned memory injection** —
+  `compaction_event.payload` now carries `summary` + `atEventId`.
+  Before each sampling, `AgentRunner` reads the most recent
+  compaction_event with a usable summary and passes both fields
+  (plus the merged pinned-memory list) into `buildSamplingRequest`.
+  Projection emits *synthetic head-of-tail items* with cacheTags
+  `pinned-memory` and `compacted-summary` (in that order, each as a
+  `role: 'user'` block) instead of folding them into the system
+  message — so `StablePrefix` (system + tools) stays byte-identical
+  across pin/unpin and compaction events and the provider's
+  prompt-cache prefix survives. Metrics-only `compaction_event`s
+  (older or pre-handler) are skipped so they don't override a real
+  compaction. Future: providers with explicit cache markers
+  (Anthropic `cache_control`) can use these tags to seal each
+  segment as its own cache breakpoint.
 - 🟢 **`restore` handle rehydration** — `restore` pins the handle for
   exactly the next sampling; `clearPins()` runs after each step, so the
   documented "drop back after next cycle" rule already holds.

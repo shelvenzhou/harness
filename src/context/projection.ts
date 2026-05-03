@@ -1,11 +1,13 @@
 import type { ContextRef } from '@harness/core/actions.js';
 import type { HarnessEvent } from '@harness/core/events.js';
 import type { EventId, ThreadId } from '@harness/core/ids.js';
-import type {
-  ProjectedItem,
-  SamplingRequest,
-  StablePrefix,
-  ToolSpec,
+import {
+  COMPACTED_SUMMARY_CACHE_TAG,
+  PINNED_MEMORY_CACHE_TAG,
+  type ProjectedItem,
+  type SamplingRequest,
+  type StablePrefix,
+  type ToolSpec,
 } from '@harness/llm/provider.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
@@ -63,8 +65,8 @@ export async function buildSamplingRequest(
   input: ProjectionInputs,
 ): Promise<ProjectionOutput> {
   const all = await input.store.readAll(input.threadId);
-  const tail = sliceAfterCheckpoint(all, input.compactionCheckpointEventId);
-  const visible = filterRolledBack(tail);
+  const sliced = sliceAfterCheckpoint(all, input.compactionCheckpointEventId);
+  const visible = filterRolledBack(sliced);
 
   const refEvents: HarnessEvent[] = [];
   if (input.contextRefs && input.contextRefs.length > 0) {
@@ -83,26 +85,55 @@ export async function buildSamplingRequest(
 
   const prefix: StablePrefix = {
     systemPrompt: input.systemPrompt,
-    pinnedMemory: input.pinnedMemory,
-    ...(input.compactedSummary !== undefined ? { compactedSummary: input.compactedSummary } : {}),
     tools: toolSpecs,
   };
 
-  const elidedCount = projected.filter((p) =>
-    p.content.some((c) => c.kind === 'elided'),
-  ).length;
+  // Synthetic head-of-tail items: pinned memory + compacted summary.
+  // Living in the tail (rather than folded into the system message)
+  // keeps `prefix` byte-stable across pin/unpin and compaction events,
+  // so the provider's prompt-cache prefix stays valid. Each carries a
+  // dedicated cacheTag so explicit-marker providers can seal them as
+  // their own cache breakpoints.
+  const head: ProjectedItem[] = [];
+  if (input.pinnedMemory.length > 0) {
+    head.push({
+      role: 'user',
+      cacheTag: PINNED_MEMORY_CACHE_TAG,
+      content: [
+        {
+          kind: 'text',
+          text: ['[pinned memory]', ...input.pinnedMemory.map((m) => `- ${m}`)].join('\n'),
+        },
+      ],
+    });
+  }
+  if (input.compactedSummary !== undefined) {
+    head.push({
+      role: 'user',
+      cacheTag: COMPACTED_SUMMARY_CACHE_TAG,
+      content: [
+        {
+          kind: 'text',
+          text: ['[prior conversation summary]', input.compactedSummary].join('\n'),
+        },
+      ],
+    });
+  }
+  const tail = head.length > 0 ? [...head, ...projected] : projected;
+
+  const elidedCount = tail.filter((p) => p.content.some((c) => c.kind === 'elided')).length;
 
   const request: SamplingRequest = {
     prefix,
-    tail: projected,
+    tail,
   };
 
   return {
     request,
     stats: {
       eventCount: visible.length,
-      projectedItems: projected.length,
-      estimatedTokens: estimateTokens(projected),
+      projectedItems: tail.length,
+      estimatedTokens: estimateTokens(tail),
       elidedCount,
       pinnedHandles: input.handles.pinnedHandles.length,
     },
