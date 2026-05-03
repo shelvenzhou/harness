@@ -56,11 +56,15 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   keep the cold path best-effort: a flaky provider can't deadlock
   compaction. Opt in via `bootstrap({ useSubagentCompactor: true })`
   or `HARNESS_COMPACTOR=subagent` (alongside
-  `HARNESS_COMPACTION_THRESHOLD_TOKENS`). Missing:
-  - ⚪ Honour the `CompactedSummary` in projection so the resulting
-    summary actually replaces the elided turns in the next prompt
-    (today the event lands but projection's prompt-shape transform is
-    still a separate change).
+  `HARNESS_COMPACTION_THRESHOLD_TOKENS`).
+- 🟢 **Compaction summary injection** — `compaction_event.payload`
+  now carries `summary` + `atEventId`. Before each sampling,
+  `AgentRunner` reads the most recent compaction_event with a usable
+  summary and passes both fields into `buildSamplingRequest`, which
+  already honoured `compactedSummary` (→ `prefix.compactedSummary`)
+  and `compactionCheckpointEventId` (→ tail truncation). Metrics-only
+  events (older or pre-handler) are skipped so they don't override a
+  real compaction.
 - 🟢 **`restore` handle rehydration** — `restore` pins the handle for
   exactly the next sampling; `clearPins()` runs after each step, so the
   documented "drop back after next cycle" rule already holds.

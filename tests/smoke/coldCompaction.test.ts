@@ -52,7 +52,12 @@ describe('smoke: cold-path compaction with SubagentCompactor', () => {
     handler.start(bus, store);
 
     const observed: HarnessEvent[] = [];
-    bus.subscribe((ev) => observed.push(ev), { kinds: ['compaction_event'] });
+    bus.subscribe(
+      (ev) => {
+        observed.push(ev);
+      },
+      { kinds: ['compaction_event'] },
+    );
 
     bus.publish({
       id: newEventId(),
@@ -76,7 +81,11 @@ describe('smoke: cold-path compaction with SubagentCompactor', () => {
     for (let i = 0; i < 5 && observed.length === 0; i++) await flush(8);
 
     expect(observed.length).toBe(1);
-    expect((observed[0]!.payload as { tokensBefore: number }).tokensBefore).toBeGreaterThan(0);
-    expect((observed[0]!.payload as { retainedUserTurns: number }).retainedUserTurns).toBe(2);
+    const payload = observed[0]?.payload as
+      | { tokensBefore?: number; retainedUserTurns?: number; summary?: string }
+      | undefined;
+    expect(payload?.tokensBefore ?? 0).toBeGreaterThan(0);
+    expect(payload?.retainedUserTurns).toBe(2);
+    expect(payload?.summary).toBe('compaction summary 42');
   });
 });

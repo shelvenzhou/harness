@@ -73,15 +73,17 @@ class HangProvider implements LlmProvider {
 
 async function buildRequest(
   store: MemorySessionStore,
-  events: ReadonlyArray<{ kind: HarnessEvent['kind']; payload: HarnessEvent['payload'] }>,
+  events: ReadonlyArray<{ kind: HarnessEvent['kind']; payload: unknown }>,
 ): Promise<CompactionRequest> {
   const tid = newThreadId();
   await store.createThread({ id: tid, rootTraceparent: '00-aaaa-bbbb-00' });
   const persisted: HarnessEvent[] = [];
   for (const e of events) {
-    const ev = await store.append({ threadId: tid, kind: e.kind, payload: e.payload } as Parameters<
-      MemorySessionStore['append']
-    >[0]);
+    const ev = await store.append({
+      threadId: tid,
+      kind: e.kind,
+      payload: e.payload,
+    } as Parameters<MemorySessionStore['append']>[0]);
     persisted.push(ev);
   }
   return { threadId: tid, events: persisted, keepLastUserTurns: 1 };

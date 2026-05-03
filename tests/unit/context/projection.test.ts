@@ -174,6 +174,43 @@ describe('buildSamplingRequest', () => {
     expect(stats.elidedCount).toBe(1);
   });
 
+  it('honours compactionCheckpointEventId + compactedSummary', async () => {
+    const store = new MemorySessionStore();
+    const tid = newThreadId();
+    await store.createThread({ id: tid, rootTraceparent: newRootTraceparent() });
+    const old1 = await store.append({
+      threadId: tid,
+      kind: 'user_turn_start',
+      payload: { text: 'old turn 1' },
+    });
+    const old2 = await store.append({ threadId: tid, kind: 'reply', payload: { text: 'old reply 1' } });
+    void old1;
+    await store.append({
+      threadId: tid,
+      kind: 'user_turn_start',
+      payload: { text: 'recent turn' },
+    });
+
+    const { request } = await buildSamplingRequest({
+      threadId: tid,
+      store,
+      registry: new ToolRegistry(),
+      handles: new HandleRegistry(),
+      systemPrompt: 'sys',
+      pinnedMemory: [],
+      compactedSummary: 'CONDENSED',
+      compactionCheckpointEventId: old2.id,
+    });
+    expect(request.prefix.compactedSummary).toBe('CONDENSED');
+    const texts = request.tail
+      .flatMap((i) => i.content)
+      .filter((c): c is { kind: 'text'; text: string } => c.kind === 'text')
+      .map((c) => c.text);
+    expect(texts).toContain('recent turn');
+    expect(texts).not.toContain('old turn 1');
+    expect(texts).not.toContain('old reply 1');
+  });
+
   it('projects subtask_complete reason and budget metadata into the prompt text', async () => {
     const store = new MemorySessionStore();
     const tid = newThreadId();

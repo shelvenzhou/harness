@@ -118,6 +118,8 @@ export class CompactionHandler {
           durationMs: result.durationMs,
           retainedUserTurns: result.summary.recentUserTurns.length,
           ghostSnapshotCount: result.summary.ghostSnapshots.length,
+          ...(result.summary.summary ? { summary: result.summary.summary } : {}),
+          ...(result.atEventId ? { atEventId: result.atEventId } : {}),
         },
         createdAt: new Date().toISOString(),
       } as CompactionEventEvent;

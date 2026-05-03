@@ -511,6 +511,7 @@ export class AgentRunner {
       await copyHandlesForRefs(this.opts.store, this.opts.contextRefs, this.handles);
       this.contextRefHandlesCopied = true;
     }
+    const compaction = await this.latestCompaction();
     const built = await buildSamplingRequest({
       threadId: this.opts.threadId,
       store: this.opts.store,
@@ -518,9 +519,33 @@ export class AgentRunner {
       handles: this.handles,
       systemPrompt: this.opts.systemPrompt,
       pinnedMemory: [...staticPinned, ...memoryPinned],
+      ...(compaction?.summary !== undefined ? { compactedSummary: compaction.summary } : {}),
+      ...(compaction?.atEventId !== undefined
+        ? { compactionCheckpointEventId: compaction.atEventId }
+        : {}),
       ...(this.opts.contextRefs !== undefined ? { contextRefs: this.opts.contextRefs } : {}),
     });
     return { request: built.request, stats: built.stats };
+  }
+
+  /**
+   * Find the most recent `compaction_event` on this thread that carries
+   * a usable summary + checkpoint. Older metrics-only events (no
+   * summary) are skipped so they don't override a real compaction.
+   */
+  private async latestCompaction(): Promise<{ summary?: string; atEventId?: EventId } | undefined> {
+    const events = await this.opts.store.readAll(this.opts.threadId);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev?.kind !== 'compaction_event') continue;
+      const p = ev.payload as { summary?: string; atEventId?: EventId };
+      if (p.summary === undefined && p.atEventId === undefined) continue;
+      return {
+        ...(p.summary !== undefined ? { summary: p.summary } : {}),
+        ...(p.atEventId !== undefined ? { atEventId: p.atEventId } : {}),
+      };
+    }
+    return undefined;
   }
 
   private async dispatchAction(

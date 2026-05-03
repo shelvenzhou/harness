@@ -214,6 +214,18 @@ export interface CompactionEventPayload {
   durationMs: number;
   retainedUserTurns: number;
   ghostSnapshotCount: number;
+  /**
+   * Prose summary the Compactor produced. Projection injects this into
+   * `prefix.compactedSummary` for every subsequent sampling. Optional
+   * for compatibility with handlers that haven't been updated to write
+   * it; absent → projection treats this as a metrics-only event.
+   */
+  summary?: string;
+  /**
+   * Event id the summary stands in for: every event with id ≤ this is
+   * elided from the next prompt's tail. Pairs with `summary`.
+   */
+  atEventId?: EventId;
 }
 export type CompactionEventEvent = EventBase<'compaction_event', CompactionEventPayload>;
 
