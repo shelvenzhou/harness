@@ -89,11 +89,18 @@ export class TerminalAdapter implements Adapter {
       },
     );
 
+    // terminal: true so readline does the line editing itself, using
+    // getStringWidth/eastAsianWidth to track cursor columns. With
+    // terminal:false the kernel's TTY driver echoed input in canonical
+    // mode, which removes one UTF-8 char from the buffer on Backspace
+    // but only erases one display column — so CJK input drifted out of
+    // sync with what was on screen.
     this.rl = createInterface({
       input: this.input,
       output: this.output,
-      terminal: false,
+      terminal: true,
     });
+    this.rl.setPrompt('» ');
 
     this.rl.on('line', (line) => {
       void this.onLine(line);
@@ -104,10 +111,17 @@ export class TerminalAdapter implements Adapter {
     // process on the first Ctrl-C and the runtime never saw the
     // interrupt event, so any pending state (timers, child agents)
     // was orphaned on exit.
+    //
+    // In terminal:true mode on a real TTY, readline puts stdin into
+    // raw mode and surfaces Ctrl-C as a 'SIGINT' event on the rl
+    // interface — process-level SIGINT does not fire. So bind both:
+    // rl for real-terminal Ctrl-C, process for kill -INT and for the
+    // synthesized SIGINTs the unit tests dispatch via process.emit.
     this.sigintHandler = () => {
       void this.onSigint();
     };
     process.on('SIGINT', this.sigintHandler);
+    this.rl.on('SIGINT', this.sigintHandler);
 
     this.writePrompt();
   }
@@ -137,7 +151,11 @@ export class TerminalAdapter implements Adapter {
   }
 
   private writePrompt(): void {
-    this.output.write('» ');
+    if (this.rl) {
+      this.rl.prompt();
+    } else {
+      this.output.write('» ');
+    }
   }
 
   private async onLine(line: string): Promise<void> {
