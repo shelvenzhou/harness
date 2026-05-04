@@ -21,8 +21,20 @@ export interface ParsedSampling {
   ttftMs?: number;
 }
 
+/**
+ * Streaming hooks invoked while the provider's deltas arrive. The
+ * channel hint is passed through unchanged: providers that don't tag
+ * channel leave it undefined (UI surfaces should default to 'reply').
+ * Hooks must not throw — they fire on the hot path.
+ */
+export interface ParseSamplingHooks {
+  onText?(text: string, channel?: 'reply' | 'preamble'): void;
+  onReasoning?(text: string): void;
+}
+
 export async function parseSampling(
   stream: AsyncIterable<SamplingDelta>,
+  hooks?: ParseSamplingHooks,
 ): Promise<ParsedSampling> {
   let replyBuf = '';
   let replyChannel: 'reply' | 'preamble' | undefined;
@@ -74,10 +86,12 @@ export async function parseSampling(
         if (ch && replyChannel && replyChannel !== ch) flushReply();
         if (ch) replyChannel = ch;
         replyBuf += delta.text;
+        hooks?.onText?.(delta.text, ch);
         break;
       }
       case 'reasoning_delta':
         reasoningBuf += delta.text;
+        hooks?.onReasoning?.(delta.text);
         break;
       case 'tool_call_begin':
         toolCallsInFlight.set(delta.toolCallId, { name: delta.name });

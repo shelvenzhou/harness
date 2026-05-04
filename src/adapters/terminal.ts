@@ -2,6 +2,7 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 
 import { newEventId } from '@harness/core/ids.js';
 import type { EventBus } from '@harness/bus/eventBus.js';
+import type { StreamBus, StreamSubscription } from '@harness/bus/streamBus.js';
 import type { ThreadId } from '@harness/core/ids.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
@@ -47,7 +48,31 @@ export class TerminalAdapter implements Adapter {
   private bus?: EventBus;
   private threadId?: ThreadId;
   private subscription?: { unsubscribe(): void };
+  private streamSubscription?: StreamSubscription;
   private turnActive = false;
+  /**
+   * Per-channel streaming state. We track the text already streamed
+   * inline so the persisted reply/preamble events can be deduped (we
+   * already showed it). Re-keyed on every sampling_flush.
+   */
+  private streamed: { reply: string; preamble: string; reasoning: string } = {
+    reply: '',
+    preamble: '',
+    reasoning: '',
+  };
+  /**
+   * Which channel currently owns the open stdout line — needed to
+   * decide whether the next delta of a *different* channel should
+   * print on a new line. 'none' means no streamed line is open.
+   */
+  private openChannel: 'reply' | 'preamble' | 'reasoning' | 'none' = 'none';
+  /**
+   * Set by sampling_flush: the next delta starts a fresh sampling and
+   * the streamed buffers (still kept around for dedupe against the
+   * persisted events from the previous sampling) need to be reset
+   * before we append more.
+   */
+  private flushed = false;
   private readonly store: SessionStore;
   private readonly input: NodeJS.ReadableStream;
   private readonly output: NodeJS.WritableStream;
@@ -87,9 +112,16 @@ export class TerminalAdapter implements Adapter {
       (ev) => this.onBusEvent(ev),
       {
         threadId: this.threadId,
-        kinds: ['reply', 'preamble', 'turn_complete', 'compaction_event', 'interrupt'],
+        kinds: ['reply', 'preamble', 'reasoning', 'turn_complete', 'compaction_event', 'interrupt'],
       },
     );
+
+    if (opts.streamBus) {
+      this.streamSubscription = opts.streamBus.subscribe(
+        (ev) => this.onStreamEvent(ev),
+        { threadId: this.threadId },
+      );
+    }
 
     // SIGINT: first hit interrupts the turn, second within the window
     // shuts the adapter down. Without this the CLI shell killed the
@@ -139,6 +171,7 @@ export class TerminalAdapter implements Adapter {
 
   async stop(): Promise<void> {
     this.subscription?.unsubscribe();
+    this.streamSubscription?.unsubscribe();
     if (this.sigintHandler) {
       process.removeListener('SIGINT', this.sigintHandler);
       this.sigintHandler = undefined;
@@ -244,13 +277,41 @@ export class TerminalAdapter implements Adapter {
     switch (ev.kind) {
       case 'preamble': {
         const p = ev.payload as { text: string };
-        this.output.write(`\x1b[2m› ${p.text}\x1b[0m\n`);
+        // sampling_flush already closed the open line — if the
+        // persisted text matches what we streamed, suppress the
+        // re-print entirely. Otherwise fall back to a fresh dimmed
+        // block.
+        if (this.streamed.preamble === p.text && p.text.length > 0) {
+          this.streamed.preamble = '';
+        } else {
+          this.closeOpenChannel();
+          this.output.write(`\x1b[2m› ${p.text}\x1b[0m\n`);
+        }
         break;
       }
       case 'reply': {
         const p = ev.payload as { text: string; internal?: boolean };
         if (p.internal) break;
-        this.output.write(`▸ ${p.text}\n`);
+        if (this.streamed.reply === p.text && p.text.length > 0) {
+          this.streamed.reply = '';
+        } else {
+          this.closeOpenChannel();
+          this.output.write(`▸ ${p.text}\n`);
+        }
+        break;
+      }
+      case 'reasoning': {
+        // Reasoning is normally streamed live via `reasoning_delta`.
+        // The persisted reasoning event still arrives — suppress if
+        // we already showed it; otherwise emit a dimmed block so
+        // users on non-streaming providers see it.
+        const p = ev.payload as { text: string };
+        if (this.streamed.reasoning === p.text && p.text.length > 0) {
+          this.streamed.reasoning = '';
+        } else {
+          this.closeOpenChannel();
+          this.output.write(`\x1b[2m✻ ${p.text}\x1b[0m\n`);
+        }
         break;
       }
       case 'turn_complete': {
@@ -292,5 +353,61 @@ export class TerminalAdapter implements Adapter {
       default:
         break;
     }
+  }
+
+  private onStreamEvent(ev: import('@harness/bus/streamBus.js').StreamEvent): void {
+    if (ev.kind === 'sampling_flush') {
+      // Don't clear streamed buffers here — the persisted reply /
+      // preamble / reasoning events for *this* sampling haven't fired
+      // yet, and they need streamed.X to be intact for dedupe. We
+      // just close the open visual line so further prints don't merge
+      // into it, and arm a reset for the next sampling's first delta.
+      this.closeOpenChannel();
+      this.flushed = true;
+      return;
+    }
+    // First delta after a flush starts a new sampling — reset what
+    // any leftover dedupe never matched against.
+    if (this.flushed) {
+      this.streamed.reply = '';
+      this.streamed.preamble = '';
+      this.streamed.reasoning = '';
+      this.flushed = false;
+    }
+    if (ev.kind === 'reasoning_delta') {
+      this.openChannelIfNeeded('reasoning');
+      this.streamed.reasoning += ev.text;
+      this.output.write(ev.text);
+      return;
+    }
+    // text_delta — channel is best-effort. Untagged deltas land in
+    // 'reply' so the user sees them immediately; if the parser later
+    // reclassifies as preamble, the persisted preamble event won't
+    // match `streamed.reply` and we fall back to a fresh dimmed
+    // print. Cosmetic glitch, no correctness impact.
+    const channel: 'reply' | 'preamble' = ev.channel ?? 'reply';
+    this.openChannelIfNeeded(channel);
+    this.streamed[channel] += ev.text;
+    this.output.write(ev.text);
+  }
+
+  private openChannelIfNeeded(channel: 'reply' | 'preamble' | 'reasoning'): void {
+    if (this.openChannel === channel) return;
+    this.closeOpenChannel();
+    if (channel === 'reply') {
+      this.output.write('▸ ');
+    } else if (channel === 'preamble') {
+      this.output.write('\x1b[2m› ');
+    } else {
+      this.output.write('\x1b[2m✻ ');
+    }
+    this.openChannel = channel;
+  }
+
+  private closeOpenChannel(): void {
+    if (this.openChannel === 'none') return;
+    if (this.openChannel === 'reply') this.output.write('\n');
+    else this.output.write('\x1b[0m\n');
+    this.openChannel = 'none';
   }
 }

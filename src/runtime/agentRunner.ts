@@ -18,6 +18,7 @@ import {
 } from '@harness/core/ids.js';
 import { childOf } from '@harness/core/traceparent.js';
 import type { EventBus } from '@harness/bus/eventBus.js';
+import type { StreamBus } from '@harness/bus/streamBus.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { LlmProvider, SamplingRequest } from '@harness/llm/provider.js';
 import { parseSampling } from '@harness/llm/actionParser.js';
@@ -85,6 +86,13 @@ export interface RuntimeBudgetSnapshot {
 export interface AgentRunnerOptions {
   threadId: ThreadId;
   bus: EventBus;
+  /**
+   * Optional transient pub/sub for token-level streaming (text deltas
+   * + reasoning deltas). Adapters render these inline; nothing is
+   * persisted. Omitted on subagents — only the user-facing root
+   * runtime needs streaming.
+   */
+  streamBus?: StreamBus;
   store: SessionStore;
   registry: ToolRegistry;
   executor: ToolExecutor;
@@ -376,9 +384,40 @@ export class AgentRunner {
       : undefined;
 
     const startedAt = Date.now();
+    const streamBus = this.opts.streamBus;
+    const streamTurnId = at.turnId;
+    const streamThreadId = this.opts.threadId;
     const parsed = await parseSampling(
       this.opts.provider.sample(request, this.abortCtl.signal),
+      streamBus && streamTurnId !== undefined
+        ? {
+            onText: (text, channel) => {
+              streamBus.publish({
+                kind: 'text_delta',
+                threadId: streamThreadId,
+                turnId: streamTurnId,
+                text,
+                ...(channel !== undefined ? { channel } : {}),
+              });
+            },
+            onReasoning: (text) => {
+              streamBus.publish({
+                kind: 'reasoning_delta',
+                threadId: streamThreadId,
+                turnId: streamTurnId,
+                text,
+              });
+            },
+          }
+        : undefined,
     );
+    if (streamBus && streamTurnId !== undefined) {
+      streamBus.publish({
+        kind: 'sampling_flush',
+        threadId: streamThreadId,
+        turnId: streamTurnId,
+      });
+    }
     const wallMs = Date.now() - startedAt;
     this.handles.clearPins();
 

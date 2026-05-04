@@ -14,6 +14,7 @@ import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import type { SearchBackend } from '@harness/search/types.js';
 import { EventBus } from '@harness/bus/eventBus.js';
+import { StreamBus } from '@harness/bus/streamBus.js';
 import { JsonlSessionStore } from '@harness/store/index.js';
 import { createDefaultRegistry } from '@harness/tools/index.js';
 import { ToolExecutor } from '@harness/tools/executor.js';
@@ -59,6 +60,7 @@ export interface ResumeOptions {
 
 export async function resume(opts: ResumeOptions): Promise<Runtime> {
   const bus = new EventBus();
+  const streamBus = new StreamBus();
   const store = new JsonlSessionStore({ root: opts.storeRoot });
   const thread = await store.getThread(opts.threadId);
   if (!thread) {
@@ -99,6 +101,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
   const runner = new AgentRunner({
     threadId: opts.threadId,
     bus,
+    streamBus,
     store,
     registry,
     executor,
@@ -123,6 +126,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
 
   return {
     bus,
+    streamBus,
     store,
     memory,
     registry,

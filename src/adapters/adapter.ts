@@ -1,4 +1,5 @@
 import type { EventBus } from '@harness/bus/eventBus.js';
+import type { StreamBus } from '@harness/bus/streamBus.js';
 import type { ThreadId } from '@harness/core/ids.js';
 
 /**
@@ -18,6 +19,13 @@ export type ThreadBinding =
 
 export interface AdapterStartOptions {
   bus: EventBus;
+  /**
+   * Transient streaming bus. When supplied, the adapter can render
+   * token-level deltas (text, reasoning) live instead of waiting for
+   * the persisted `reply` event at sampling end. Optional — adapters
+   * MUST still handle the persisted-event-only case.
+   */
+  streamBus?: StreamBus;
   threadBinding: ThreadBinding;
 }
 

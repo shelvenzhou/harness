@@ -2,6 +2,7 @@ import { newRootTraceparent } from '@harness/core/traceparent.js';
 import { newThreadId } from '@harness/core/ids.js';
 import type { ThreadId } from '@harness/core/ids.js';
 import { EventBus } from '@harness/bus/eventBus.js';
+import { StreamBus } from '@harness/bus/streamBus.js';
 import { MemorySessionStore, JsonlSessionStore } from '@harness/store/index.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import { createDefaultRegistry } from '@harness/tools/index.js';
@@ -124,6 +125,7 @@ export interface BootstrapOptions {
 
 export interface Runtime {
   bus: EventBus;
+  streamBus: StreamBus;
   store: SessionStore;
   memory: MemoryStore;
   registry: ToolRegistry;
@@ -142,6 +144,7 @@ export interface Runtime {
 
 export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   const bus = new EventBus();
+  const streamBus = new StreamBus();
   const store: SessionStore = opts.storeRoot
     ? new JsonlSessionStore({ root: opts.storeRoot })
     : new MemorySessionStore();
@@ -190,6 +193,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   const runner = new AgentRunner({
     threadId: rootThreadId,
     bus,
+    streamBus,
     store,
     registry,
     executor,
@@ -238,6 +242,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
 
   return {
     bus,
+    streamBus,
     store,
     memory,
     registry,

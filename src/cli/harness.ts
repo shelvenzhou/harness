@@ -80,6 +80,7 @@ async function main(): Promise<void> {
   const adapter = new TerminalAdapter({ store: runtime.store });
   await adapter.start({
     bus: runtime.bus,
+    streamBus: runtime.streamBus,
     threadBinding: { kind: 'single', threadId: runtime.rootThreadId },
   });
 
