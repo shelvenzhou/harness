@@ -6,6 +6,7 @@ import type { ThreadId } from '@harness/core/ids.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
 import type { Adapter, AdapterStartOptions } from './adapter.js';
+import { RawLineReader } from './rawLineReader.js';
 
 /**
  * Terminal adapter — stdin/stdout REPL.
@@ -41,7 +42,8 @@ export interface TerminalAdapterOptions {
 export class TerminalAdapter implements Adapter {
   readonly id = 'terminal';
 
-  private rl?: ReadlineInterface;
+  private rl: ReadlineInterface | undefined;
+  private rawReader: RawLineReader | undefined;
   private bus?: EventBus;
   private threadId?: ThreadId;
   private subscription?: { unsubscribe(): void };
@@ -89,41 +91,50 @@ export class TerminalAdapter implements Adapter {
       },
     );
 
-    // terminal: true so readline does the line editing itself, using
-    // getStringWidth/eastAsianWidth to track cursor columns. With
-    // terminal:false the kernel's TTY driver echoed input in canonical
-    // mode, which removes one UTF-8 char from the buffer on Backspace
-    // but only erases one display column — so CJK input drifted out of
-    // sync with what was on screen.
-    this.rl = createInterface({
-      input: this.input,
-      output: this.output,
-      terminal: true,
-    });
-    this.rl.setPrompt('» ');
-
-    this.rl.on('line', (line) => {
-      void this.onLine(line);
-    });
-
     // SIGINT: first hit interrupts the turn, second within the window
     // shuts the adapter down. Without this the CLI shell killed the
     // process on the first Ctrl-C and the runtime never saw the
     // interrupt event, so any pending state (timers, child agents)
     // was orphaned on exit.
-    //
-    // In terminal:true mode on a real TTY, readline puts stdin into
-    // raw mode and surfaces Ctrl-C as a 'SIGINT' event on the rl
-    // interface — process-level SIGINT does not fire. So bind both:
-    // rl for real-terminal Ctrl-C, process for kill -INT and for the
-    // synthesized SIGINTs the unit tests dispatch via process.emit.
     this.sigintHandler = () => {
       void this.onSigint();
     };
     process.on('SIGINT', this.sigintHandler);
-    this.rl.on('SIGINT', this.sigintHandler);
 
-    this.writePrompt();
+    if (this.isTty(this.input)) {
+      // Real TTY → raw-mode editor with bracketed-paste + heredoc
+      // multi-line. Tests use PassThrough streams (not a TTY) and fall
+      // through to the readline path below.
+      this.rawReader = new RawLineReader({
+        input: this.input as NodeJS.ReadStream,
+        output: this.output,
+      });
+      this.rawReader.on((ev) => {
+        if (ev.kind === 'line') void this.onLine(ev.text);
+        else if (ev.kind === 'sigint') void this.onSigint();
+        else if (ev.kind === 'eof') void this.shutdownAndExit();
+      });
+      this.rawReader.start();
+    } else {
+      // Non-TTY (piped input, tests): readline gives us line-based
+      // input. terminal:true keeps CJK backspace consistent with the
+      // displayed columns — see commit fa42452.
+      this.rl = createInterface({
+        input: this.input,
+        output: this.output,
+        terminal: true,
+      });
+      this.rl.setPrompt('» ');
+      this.rl.on('line', (line) => {
+        void this.onLine(line);
+      });
+      // In terminal:true mode on a real TTY, readline puts stdin into
+      // raw mode and surfaces Ctrl-C as a 'SIGINT' event on the rl
+      // interface — but on PassThrough inputs (tests) it doesn't, so
+      // we still need this binding for synthesized process.emit calls.
+      this.rl.on('SIGINT', this.sigintHandler);
+      this.writePrompt();
+    }
   }
 
   async stop(): Promise<void> {
@@ -132,8 +143,22 @@ export class TerminalAdapter implements Adapter {
       process.removeListener('SIGINT', this.sigintHandler);
       this.sigintHandler = undefined;
     }
+    if (this.rawReader) {
+      this.rawReader.stop();
+      this.rawReader = undefined;
+    }
     this.rl?.close();
     this.resolveShutdown();
+  }
+
+  private async shutdownAndExit(): Promise<void> {
+    this.output.write('\n[exiting]\n');
+    await this.stop();
+    process.exit(0);
+  }
+
+  private isTty(stream: NodeJS.ReadableStream): stream is NodeJS.ReadStream {
+    return Boolean((stream as { isTTY?: boolean }).isTTY);
   }
 
   private async onSigint(): Promise<void> {
@@ -151,7 +176,9 @@ export class TerminalAdapter implements Adapter {
   }
 
   private writePrompt(): void {
-    if (this.rl) {
+    if (this.rawReader) {
+      this.rawReader.refresh();
+    } else if (this.rl) {
       this.rl.prompt();
     } else {
       this.output.write('» ');
