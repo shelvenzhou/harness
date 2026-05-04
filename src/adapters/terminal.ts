@@ -285,7 +285,7 @@ export class TerminalAdapter implements Adapter {
           this.streamed.preamble = '';
         } else {
           this.closeOpenChannel();
-          this.output.write(`\x1b[2m› ${p.text}\x1b[0m\n`);
+          this.writeBlock('› ', p.text, { dim: true });
         }
         break;
       }
@@ -296,7 +296,7 @@ export class TerminalAdapter implements Adapter {
           this.streamed.reply = '';
         } else {
           this.closeOpenChannel();
-          this.output.write(`▸ ${p.text}\n`);
+          this.writeBlock('▸ ', p.text, { dim: false });
         }
         break;
       }
@@ -310,7 +310,7 @@ export class TerminalAdapter implements Adapter {
           this.streamed.reasoning = '';
         } else {
           this.closeOpenChannel();
-          this.output.write(`\x1b[2m✻ ${p.text}\x1b[0m\n`);
+          this.writeBlock('✻ ', p.text, { dim: true });
         }
         break;
       }
@@ -327,6 +327,7 @@ export class TerminalAdapter implements Adapter {
             this.output.write(`\x1b[2m[turn ${p.status}]\x1b[0m\n`);
           }
         }
+        this.writeTurnSeparator();
         this.turnActive = false;
         this.writePrompt();
         break;
@@ -410,4 +411,85 @@ export class TerminalAdapter implements Adapter {
     else this.output.write('\x1b[0m\n');
     this.openChannel = 'none';
   }
+
+  /**
+   * Render a multi-paragraph block with a leading prefix on the first
+   * line and a hanging indent on subsequent visual lines, soft-wrapped
+   * to the terminal's column width. Used for the persisted
+   * reply / preamble / reasoning fallbacks (when nothing was streamed
+   * inline). We don't apply this to the streaming path: deltas arrive
+   * unaligned with word boundaries, and re-flowing them mid-stream
+   * would require column tracking we don't have.
+   */
+  private writeBlock(prefix: string, text: string, opts: { dim: boolean }): void {
+    const cols = this.colCount();
+    // Reserve at least 20 chars for content; on tiny terminals we
+    // give up on wrapping and just emit the raw text.
+    const indent = ' '.repeat(prefix.length);
+    const width = Math.max(20, cols - prefix.length);
+    const open = opts.dim ? '\x1b[2m' : '';
+    const close = opts.dim ? '\x1b[0m' : '';
+    const paragraphs = text.split('\n');
+    let firstLine = true;
+    for (const para of paragraphs) {
+      if (para.length === 0) {
+        // Preserve blank lines in the original text.
+        this.output.write(firstLine ? `${open}${prefix}${close}\n` : `${open}${close}\n`);
+        firstLine = false;
+        continue;
+      }
+      const wrapped = wrapToWidth(para, width);
+      for (let i = 0; i < wrapped.length; i++) {
+        const lead = firstLine && i === 0 ? prefix : indent;
+        this.output.write(`${open}${lead}${wrapped[i]}${close}\n`);
+      }
+      firstLine = false;
+    }
+  }
+
+  /**
+   * Faint horizontal divider before the next prompt. Visually
+   * separates assistant turns so longer outputs don't run together.
+   */
+  private writeTurnSeparator(): void {
+    const cols = Math.min(this.colCount(), 80);
+    if (cols <= 4) return;
+    this.output.write(`\x1b[2m${'─'.repeat(cols)}\x1b[0m\n`);
+  }
+
+  private colCount(): number {
+    const out = this.output as unknown as { columns?: number };
+    return out.columns && out.columns > 0 ? out.columns : 80;
+  }
+}
+
+/**
+ * Greedy soft-wrap on whitespace boundaries. A single token longer
+ * than the column budget is emitted on its own line untouched — we
+ * prefer spilling over to mid-token splits since URLs and code
+ * fragments are common in agent output.
+ */
+function wrapToWidth(text: string, width: number): string[] {
+  if (width <= 0 || text.length <= width) return [text];
+  const out: string[] = [];
+  const tokens = text.split(/(\s+)/);
+  let line = '';
+  for (const tok of tokens) {
+    if (tok.length === 0) continue;
+    if (line.length + tok.length > width) {
+      if (line.length > 0) {
+        out.push(line.replace(/\s+$/, ''));
+        line = '';
+      }
+      if (tok.length > width) {
+        // Token alone exceeds width — emit it whole.
+        out.push(tok);
+        continue;
+      }
+    }
+    if (line.length === 0 && /^\s+$/.test(tok)) continue;
+    line += tok;
+  }
+  if (line.length > 0) out.push(line.replace(/\s+$/, ''));
+  return out.length > 0 ? out : [''];
 }
