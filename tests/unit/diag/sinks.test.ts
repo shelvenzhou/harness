@@ -35,6 +35,7 @@ describe('JsonlDiagSink', () => {
       { projectedItems: 1, elidedCount: 0, estimatedTokens: 2, pinnedHandles: 0 },
     );
     expect(path).toBeDefined();
+    expect(path).toMatch(/0001-001-trn_[0-9a-f]+\.txt$/);
     const txt = await readFile(path!, 'utf8');
     expect(txt).toContain('# system');
 
@@ -60,6 +61,28 @@ describe('JsonlDiagSink', () => {
     expect(trace.split('\n').filter(Boolean)).toHaveLength(1);
     const parsed = JSON.parse(trace.trim());
     expect(parsed.kind).toBe('sampling_complete');
+  });
+
+  it('assigns monotonic per-thread turn ordinals so prompts sort chronologically', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'harness-diag-'));
+    cleanups.push(root);
+    const sink = new JsonlDiagSink({ root });
+    const threadId = newThreadId();
+    const turnA = newTurnId();
+    const turnB = newTurnId();
+    const request: SamplingRequest = { prefix: { systemPrompt: 's', tools: [] }, tail: [] };
+    const stats = { projectedItems: 0, elidedCount: 0, estimatedTokens: 0, pinnedHandles: 0 };
+
+    const a1 = await sink.onPrompt({ threadId, turnId: turnA, samplingIndex: 1 }, request, stats);
+    const a2 = await sink.onPrompt({ threadId, turnId: turnA, samplingIndex: 2 }, request, stats);
+    const b1 = await sink.onPrompt({ threadId, turnId: turnB, samplingIndex: 1 }, request, stats);
+
+    const names = [a1, a2, b1].map((p) => (p ?? '').split('/').pop());
+    expect(names[0]).toMatch(/^0001-001-/);
+    expect(names[1]).toMatch(/^0001-002-/);
+    expect(names[2]).toMatch(/^0002-001-/);
+    const sorted = [...names].sort();
+    expect(sorted).toEqual(names);
   });
 });
 
