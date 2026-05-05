@@ -72,11 +72,18 @@ export class StderrDiagSink implements DiagSink {
       }
       case 'turn_complete': {
         const p = event.payload;
+        // `summary` carries the final reply text on a `completed`
+        // turn — printing it whole here re-emits the assistant's
+        // entire response on stderr (the user already saw it on
+        // stdout). Keep just a one-line preview so the diag line
+        // stays a one-liner.
+        const summaryPreview =
+          p.summary !== undefined ? truncate(p.summary.replace(/\s+/g, ' '), 80) : undefined;
         const details =
-          p.summary && p.reason
-            ? ` "${p.summary}" reason=${p.reason}`
-            : p.summary
-              ? ` "${p.summary}"`
+          summaryPreview && p.reason
+            ? ` "${summaryPreview}" reason=${p.reason}`
+            : summaryPreview
+              ? ` "${summaryPreview}"`
               : p.reason
                 ? ` reason=${p.reason}`
                 : '';
