@@ -104,6 +104,10 @@ export type PreambleEvent = EventBase<'preamble', PreamblePayload>;
 
 export interface ReasoningPayload {
   text: string;
+  providerState?: {
+    providerId: string;
+    items: unknown[];
+  };
 }
 export type ReasoningEvent = EventBase<'reasoning', ReasoningPayload>;
 

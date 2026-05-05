@@ -7,6 +7,7 @@ import type {
   ResponseFormatTextConfig,
   ResponseInput,
   ResponseInputItem,
+  ResponseReasoningItem,
   ResponseStreamEvent,
 } from 'openai/resources/responses/responses.js';
 import type { Reasoning, ReasoningEffort } from 'openai/resources/shared.js';
@@ -90,7 +91,7 @@ export class OpenAIProvider implements LlmProvider {
   private readonly client: OpenAI;
   private readonly model: string;
   private readonly defaultMaxTokens: number;
-  private readonly defaultTemperature: number;
+  private readonly defaultTemperature: number | undefined;
   private readonly reasoning: Reasoning | undefined;
 
   constructor(opts: OpenAIProviderOptions) {
@@ -102,11 +103,7 @@ export class OpenAIProvider implements LlmProvider {
     });
     this.model = opts.model ?? DEFAULT_MODEL;
     this.defaultMaxTokens = opts.defaultMaxTokens ?? 32768;
-    this.defaultTemperature = opts.defaultTemperature ?? 0.7;
-    // Default to summary='auto' so reasoning streams without the
-    // caller having to opt in. effort is left unset so the API uses
-    // the model default (GPT-5.x defaults to 'none' or 'medium'
-    // depending on the model).
+    this.defaultTemperature = opts.defaultTemperature;
     if (opts.reasoning) {
       this.reasoning = {
         ...(opts.reasoning.effort !== undefined ? { effort: opts.reasoning.effort } : {}),
@@ -121,26 +118,14 @@ export class OpenAIProvider implements LlmProvider {
     request: SamplingRequest,
     signal: AbortSignal,
   ): AsyncIterable<SamplingDelta> {
-    const input = toResponsesInput(request.tail);
-    const tools = toResponsesTools(request.prefix);
-
-    const params: ResponseCreateParamsStreaming = {
-      model: request.model ?? this.model,
-      instructions: request.prefix.systemPrompt,
-      input,
-      ...(tools.length > 0 ? { tools } : {}),
-      stream: true,
-      // Stateless: don't have OpenAI persist responses on its side.
-      // Matches the Chat Completions behaviour we replaced and avoids
-      // accidentally leaking conversation state between sessions.
-      store: false,
-      max_output_tokens: request.maxTokens ?? this.defaultMaxTokens,
-      temperature: request.temperature ?? this.defaultTemperature,
-      ...(this.reasoning ? { reasoning: this.reasoning } : {}),
-      ...(request.responseFormat
-        ? { text: { format: toResponsesTextFormat(request.responseFormat) } }
+    const params = toResponsesCreateParams(request, {
+      model: this.model,
+      defaultMaxTokens: this.defaultMaxTokens,
+      ...(this.defaultTemperature !== undefined
+        ? { defaultTemperature: this.defaultTemperature }
         : {}),
-    };
+      ...(this.reasoning !== undefined ? { reasoning: this.reasoning } : {}),
+    });
 
     const stream = (await this.client.responses.create(params, {
       signal,
@@ -211,6 +196,10 @@ export class OpenAIProvider implements LlmProvider {
               promptTokens = u.input_tokens ?? 0;
               cachedPromptTokens = u.input_tokens_details?.cached_tokens ?? 0;
               completionTokens = u.output_tokens ?? 0;
+            }
+            const reasoningItems = event.response.output?.filter(isEncryptedReasoningItem) ?? [];
+            if (reasoningItems.length > 0) {
+              yield { kind: 'provider_state', providerId: this.id, items: reasoningItems };
             }
             // If the response carried any tool calls, the runner needs
             // to dispatch them — flag stop=tool_use so the agent loop
@@ -353,6 +342,17 @@ function toResponsesInput(tail: ProjectedItem[]): ResponseInput {
             arguments: JSON.stringify(c.args ?? {}),
           });
           break;
+        case 'provider_state':
+          if (textChunks.length > 0) {
+            items.push(easyMessage('assistant', textChunks.join('')));
+            textChunks.length = 0;
+          }
+          if (c.providerId === 'openai') {
+            for (const providerItem of c.items) {
+              if (isResponsesInputItem(providerItem)) items.push(providerItem);
+            }
+          }
+          break;
         case 'elided':
           textChunks.push(`[elided handle=${c.handle} ${c.originKind}] ${c.summary ?? ''}`);
           break;
@@ -428,8 +428,85 @@ function toResponsesTextFormat(spec: ResponseFormatSpec): ResponseFormatTextConf
   };
 }
 
+function toResponsesCreateParams(
+  request: SamplingRequest,
+  defaults: {
+    model: string;
+    defaultMaxTokens: number;
+    defaultTemperature?: number;
+    reasoning?: Reasoning;
+  },
+): ResponseCreateParamsStreaming {
+  const model = request.model ?? defaults.model;
+  const input = toResponsesInput(request.tail);
+  const tools = toResponsesTools(request.prefix);
+  const temperature = supportsTemperature(model)
+    ? (request.temperature ?? defaults.defaultTemperature)
+    : undefined;
+  const reasoning = reasoningForModel(model, defaults.reasoning);
+  const includeEncryptedReasoning = supportsReasoning(model) && tools.length > 0;
+
+  return {
+    model,
+    instructions: request.prefix.systemPrompt,
+    input,
+    ...(tools.length > 0 ? { tools } : {}),
+    stream: true,
+    // Stateless: don't have OpenAI persist responses on its side.
+    // Matches the Chat Completions behaviour we replaced and avoids
+    // accidentally leaking conversation state between sessions.
+    store: false,
+    ...(includeEncryptedReasoning ? { include: ['reasoning.encrypted_content'] } : {}),
+    max_output_tokens: request.maxTokens ?? defaults.defaultMaxTokens,
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(reasoning ? { reasoning } : {}),
+    ...(request.responseFormat
+      ? { text: { format: toResponsesTextFormat(request.responseFormat) } }
+      : {}),
+  };
+}
+
+function supportsTemperature(model: string): boolean {
+  const id = model.toLowerCase();
+  if (id.startsWith('gpt-5')) return false;
+  if (/^o\d/.test(id)) return false;
+  if (id.includes('codex')) return false;
+  return true;
+}
+
+function reasoningForModel(model: string, reasoning: Reasoning | undefined): Reasoning | undefined {
+  if (reasoning === undefined) return undefined;
+  return supportsReasoning(model) ? reasoning : undefined;
+}
+
+function supportsReasoning(model: string): boolean {
+  const id = model.toLowerCase();
+  return id.startsWith('gpt-5') || /^o\d/.test(id);
+}
+
+function isEncryptedReasoningItem(item: unknown): item is ResponseReasoningItem {
+  return (
+    typeof item === 'object' &&
+    item !== null &&
+    (item as { type?: unknown }).type === 'reasoning' &&
+    typeof (item as { encrypted_content?: unknown }).encrypted_content === 'string'
+  );
+}
+
+function isResponsesInputItem(item: unknown): item is ResponseInputItem {
+  return (
+    typeof item === 'object' &&
+    item !== null &&
+    typeof (item as { type?: unknown }).type === 'string'
+  );
+}
+
 export const __testOnly = {
   toResponsesInput,
   toResponsesTools,
   toResponsesTextFormat,
+  toResponsesCreateParams,
+  supportsTemperature,
+  supportsReasoning,
+  isEncryptedReasoningItem,
 };

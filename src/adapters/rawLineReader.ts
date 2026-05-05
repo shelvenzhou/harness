@@ -59,6 +59,13 @@ export class RawLineReader {
   private heredocActive = false;
   /** Number of terminal rows we last rendered, so we can erase them. */
   private renderedRows = 1;
+  /**
+   * Tracks whether the prompt is currently drawn at the cursor. After
+   * a submit (or before start()) it isn't, and eraseRendered must be
+   * a no-op or it would walk up and clobber the assistant's output
+   * that has since been written there.
+   */
+  private promptOnScreen = false;
   /** Column count we cached at last render — used for wrap math. */
   private lastCols = 80;
 
@@ -265,10 +272,9 @@ export class RawLineReader {
         const text = lastNl === -1 ? '' : this.buf.slice(0, lastNl);
         this.buf = '';
         this.heredocActive = false;
-        this.eraseRendered();
+        this.commitRendered();
         this.emit({ kind: 'line', text });
         this.renderedRows = 1;
-        this.renderBuf();
         return;
       }
       // Otherwise just commit a newline and keep editing.
@@ -287,10 +293,9 @@ export class RawLineReader {
 
     const text = this.buf;
     this.buf = '';
-    this.eraseRendered();
+    this.commitRendered();
     this.emit({ kind: 'line', text });
     this.renderedRows = 1;
-    this.renderBuf();
   }
 
   private renderBuf(): void {
@@ -304,9 +309,11 @@ export class RawLineReader {
       totalRows += this.rowsFor(prefix.length + lineText.length);
     }
     this.renderedRows = Math.max(1, totalRows);
+    this.promptOnScreen = true;
   }
 
   private eraseRendered(): void {
+    if (!this.promptOnScreen) return;
     // Move to start of the current row.
     this.output.write('\r');
     // Erase from there down: walk up renderedRows-1 lines, clearing each.
@@ -314,6 +321,13 @@ export class RawLineReader {
       this.output.write('\x1b[2K\x1b[1A');
     }
     this.output.write('\x1b[2K');
+    this.promptOnScreen = false;
+  }
+
+  private commitRendered(): void {
+    if (!this.promptOnScreen) return;
+    this.output.write('\n');
+    this.promptOnScreen = false;
   }
 
   private rowsFor(visualLen: number): number {

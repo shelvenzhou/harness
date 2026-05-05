@@ -20,6 +20,10 @@ function makeReader() {
   input.isTTY = true;
   input.setRawMode = () => {};
   const output = new PassThrough();
+  const writes: string[] = [];
+  output.on('data', (chunk: Buffer | string) => {
+    writes.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+  });
   // Drain output so write() never blocks.
   output.resume();
   const reader = new RawLineReader({
@@ -29,7 +33,7 @@ function makeReader() {
   const events: RawLineReaderEvent[] = [];
   reader.on((ev) => events.push(ev));
   reader.start();
-  return { reader, input, output, events };
+  return { reader, input, output, events, writes };
 }
 
 async function tick(): Promise<void> {
@@ -42,6 +46,19 @@ describe('RawLineReader', () => {
     input.write('hello\r');
     await tick();
     expect(events).toEqual([{ kind: 'line', text: 'hello' }]);
+    reader.stop();
+  });
+
+  it('does not redraw an empty prompt immediately after submitting', async () => {
+    const { reader, input, events, writes } = makeReader();
+    input.write('hello\r');
+    await tick();
+    expect(events).toEqual([{ kind: 'line', text: 'hello' }]);
+    expect(writes.join('')).toContain('\n');
+    expect(writes.join('')).not.toMatch(/» $/u);
+
+    reader.refresh();
+    expect(writes.join('')).toMatch(/» $/u);
     reader.stop();
   });
 

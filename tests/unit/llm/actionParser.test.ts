@@ -99,6 +99,18 @@ describe('parseSampling', () => {
     expect(parsed.actions[0]).toMatchObject({ kind: 'reply', text: 'answer' });
   });
 
+  it('collects provider_state separately from visible reasoning text', async () => {
+    const item = { type: 'reasoning', encrypted_content: 'enc' };
+    const parsed = await parseSampling(
+      stream([
+        { kind: 'provider_state', providerId: 'openai', items: [item] },
+        { kind: 'end', stopReason: 'tool_use' },
+      ]),
+    );
+    expect(parsed.providerState).toEqual([{ providerId: 'openai', items: [item] }]);
+    expect(parsed.reasoningText).toBe('');
+  });
+
   it('emits tool_call action with merged args', async () => {
     const tc = newToolCallId();
     const parsed = await parseSampling(

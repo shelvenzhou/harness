@@ -80,10 +80,25 @@ function projectEvent(
     }
     case 'reasoning': {
       if (!opts.keepReasoning) return null;
-      const p = ev.payload as { text: string };
+      const p = ev.payload as {
+        text: string;
+        providerState?: { providerId: string; items: unknown[] };
+      };
+      const content: ProjectedContent[] = [];
+      if (p.providerState) {
+        content.push({
+          kind: 'provider_state',
+          providerId: p.providerState.providerId,
+          items: p.providerState.items,
+        });
+      }
+      if (p.text) {
+        content.push({ kind: 'text', text: `[reasoning] ${p.text}` });
+      }
+      if (content.length === 0) return null;
       return {
         role: 'assistant',
-        content: [{ kind: 'text', text: `[reasoning] ${p.text}` }],
+        content,
         cacheTag: ev.id,
       };
     }

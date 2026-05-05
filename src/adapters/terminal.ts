@@ -2,7 +2,7 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 
 import { newEventId } from '@harness/core/ids.js';
 import type { EventBus } from '@harness/bus/eventBus.js';
-import type { StreamBus, StreamSubscription } from '@harness/bus/streamBus.js';
+import type { StreamEvent, StreamSubscription } from '@harness/bus/streamBus.js';
 import type { ThreadId } from '@harness/core/ids.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
@@ -306,6 +306,7 @@ export class TerminalAdapter implements Adapter {
         // we already showed it; otherwise emit a dimmed block so
         // users on non-streaming providers see it.
         const p = ev.payload as { text: string };
+        if (!p.text) break;
         if (this.streamed.reasoning === p.text && p.text.length > 0) {
           this.streamed.reasoning = '';
         } else {
@@ -356,7 +357,7 @@ export class TerminalAdapter implements Adapter {
     }
   }
 
-  private onStreamEvent(ev: import('@harness/bus/streamBus.js').StreamEvent): void {
+  private onStreamEvent(ev: StreamEvent): void {
     if (ev.kind === 'sampling_flush') {
       // Don't clear streamed buffers here — the persisted reply /
       // preamble / reasoning events for *this* sampling haven't fired

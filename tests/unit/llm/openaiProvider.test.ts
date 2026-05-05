@@ -104,6 +104,22 @@ describe('OpenAIProvider Responses-API input translation', () => {
     const outputJson = JSON.parse((input[0] as { output: string }).output) as Record<string, unknown>;
     expect(outputJson).toMatchObject({ elided: true, handle: 'h_xyz' });
   });
+
+  it('passes OpenAI provider_state items back into Responses input', () => {
+    const reasoningItem = {
+      type: 'reasoning',
+      id: 'rs_123',
+      summary: [],
+      encrypted_content: 'enc',
+    };
+    const input = __testOnly.toResponsesInput([
+      {
+        role: 'assistant',
+        content: [{ kind: 'provider_state', providerId: 'openai', items: [reasoningItem] }],
+      },
+    ]);
+    expect(input).toEqual([reasoningItem]);
+  });
 });
 
 describe('OpenAIProvider Responses-API tools translation', () => {
@@ -165,5 +181,78 @@ describe('OpenAIProvider Responses-API text.format translation', () => {
       strict: false,
       description: 'shape doc',
     });
+  });
+});
+
+describe('OpenAIProvider Responses-API create params', () => {
+  const request = {
+    prefix: { systemPrompt: 'sys', tools: [] },
+    tail: [{ role: 'user' as const, content: [{ kind: 'text' as const, text: 'hello' }] }],
+  };
+
+  it('omits temperature unless configured for a model that supports it', () => {
+    const params = __testOnly.toResponsesCreateParams(request, {
+      model: 'gpt-4o-mini',
+      defaultMaxTokens: 32768,
+    });
+    expect(params).not.toHaveProperty('temperature');
+  });
+
+  it('passes configured temperature for non-reasoning models', () => {
+    const params = __testOnly.toResponsesCreateParams(request, {
+      model: 'gpt-4o-mini',
+      defaultMaxTokens: 32768,
+      defaultTemperature: 0.2,
+    });
+    expect(params).toMatchObject({ temperature: 0.2 });
+  });
+
+  it('suppresses temperature for reasoning models even when env configured it', () => {
+    const params = __testOnly.toResponsesCreateParams(request, {
+      model: 'gpt-5.4',
+      defaultMaxTokens: 32768,
+      defaultTemperature: 0.7,
+    });
+    expect(params).not.toHaveProperty('temperature');
+  });
+
+  it('only sends reasoning controls to reasoning-capable models', () => {
+    const reasoning = { summary: 'auto' as const };
+    const gpt5 = __testOnly.toResponsesCreateParams(request, {
+      model: 'gpt-5.4',
+      defaultMaxTokens: 32768,
+      reasoning,
+    });
+    const gpt4o = __testOnly.toResponsesCreateParams(request, {
+      model: 'gpt-4o-mini',
+      defaultMaxTokens: 32768,
+      reasoning,
+    });
+    expect(gpt5).toMatchObject({ reasoning });
+    expect(gpt4o).not.toHaveProperty('reasoning');
+  });
+
+  it('requests encrypted reasoning when a reasoning model can call tools', () => {
+    const params = __testOnly.toResponsesCreateParams(
+      {
+        prefix: {
+          systemPrompt: 'sys',
+          tools: [
+            {
+              name: 'read',
+              description: 'read a file',
+              argsSchema: { type: 'object', properties: {} },
+            },
+          ],
+        },
+        tail: request.tail,
+      },
+      {
+        model: 'gpt-5.4',
+        defaultMaxTokens: 32768,
+      },
+    );
+    expect(params).toMatchObject({ include: ['reasoning.encrypted_content'] });
+    expect(params).not.toHaveProperty('reasoning');
   });
 });

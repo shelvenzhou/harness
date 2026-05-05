@@ -57,6 +57,7 @@ export type ProjectedContent =
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; toolCallId: ToolCallId; name: string; args: unknown }
   | { kind: 'tool_result'; toolCallId: ToolCallId; ok: boolean; output?: unknown; error?: string }
+  | { kind: 'provider_state'; providerId: string; items: unknown[] }
   | {
       kind: 'elided';
       handle: string;
@@ -115,6 +116,7 @@ export type SamplingDelta =
   | { kind: 'tool_call_begin'; toolCallId: ToolCallId; name: string }
   | { kind: 'tool_call_arg_delta'; toolCallId: ToolCallId; argsPartial: string }
   | { kind: 'tool_call_end'; toolCallId: ToolCallId; args: unknown }
+  | { kind: 'provider_state'; providerId: string; items: unknown[] }
   | { kind: 'usage'; tokens: TokenUsage }
   | { kind: 'end'; stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' };
 

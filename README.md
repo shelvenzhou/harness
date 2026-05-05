@@ -20,8 +20,8 @@ with a typed interface. Current state:
 - ✅ Event bus, session store (memory + JSONL), action / event protocol types
 - ✅ `ActiveTurn` state machine + two-phase mailbox (`CurrentTurn` /
   `NextTurn`) matching Codex's model
-- ✅ LLM provider interface; OpenAI-compatible provider (real streaming +
-  tool calls), works against any OpenAI-compatible endpoint via `OPENAI_BASE_URL`
+- ✅ LLM provider interface; OpenAI Responses API provider (real streaming +
+  tool calls), works against endpoints that implement `/v1/responses` via `OPENAI_BASE_URL`
 - ✅ Real `shell` (process-group kill, byte cap, handle elision) and
   `web_fetch` (undici); `read`/`write`(overwrite) real; `memory` real
   with three backends (in-memory / JSONL / mem0); `web_search` stub
@@ -113,9 +113,11 @@ Configuration is read from `.env` (see [.env.example](.env.example)):
 |----------------------|-------------------------------------------------------|
 | `OPENAI_API_KEY`     | required                                              |
 | `OPENAI_MODEL`       | default `gpt-4o-mini`                                 |
-| `OPENAI_BASE_URL`    | override for Azure / OpenRouter / vLLM / Ollama etc.  |
-| `OPENAI_MAX_TOKENS`  | default 1024                                          |
-| `OPENAI_TEMPERATURE` | default 0.7                                           |
+| `OPENAI_BASE_URL`    | override endpoint; must implement OpenAI's Responses API |
+| `OPENAI_MAX_TOKENS`  | default `32768`; includes visible output and reasoning tokens |
+| `OPENAI_TEMPERATURE` | optional; suppressed for GPT-5 / o-series models that reject it |
+| `OPENAI_REASONING_EFFORT` | optional Responses API reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `OPENAI_REASONING_SUMMARY`| optional visible reasoning summary stream: `auto`, `concise`, `detailed`, `off`; default `auto` |
 | `HARNESS_STORE_ROOT` | persist session events to this directory              |
 | `HARNESS_MEMORY_FILE`| JSONL memory log path (cross-session memory; off if unset) |
 | `MEM0_API_KEY`       | enable mem0 backend (cloud or self-hosted) — overrides `HARNESS_MEMORY_FILE` |

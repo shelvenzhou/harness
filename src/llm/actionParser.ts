@@ -16,6 +16,7 @@ export interface ParsedSampling {
   actions: Action[];
   /** Concatenated reasoning text (if any). Kept separate from reply actions. */
   reasoningText: string;
+  providerState: Array<{ providerId: string; items: unknown[] }>;
   stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error';
   usage?: { promptTokens: number; cachedPromptTokens: number; completionTokens: number };
   ttftMs?: number;
@@ -39,6 +40,7 @@ export async function parseSampling(
   let replyBuf = '';
   let replyChannel: 'reply' | 'preamble' | undefined;
   let reasoningBuf = '';
+  const providerState: Array<{ providerId: string; items: unknown[] }> = [];
   const toolCallsInFlight = new Map<ToolCallId, { name: string; args?: unknown }>();
   const actions: Action[] = [];
   let stopReason: ParsedSampling['stopReason'];
@@ -119,6 +121,9 @@ export async function parseSampling(
         });
         break;
       }
+      case 'provider_state':
+        providerState.push({ providerId: delta.providerId, items: delta.items });
+        break;
       case 'usage':
         usage = { ...delta.tokens };
         break;
@@ -145,6 +150,7 @@ export async function parseSampling(
   return {
     actions,
     reasoningText: reasoningBuf,
+    providerState,
     ...(stopReason !== undefined ? { stopReason } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(firstByteAt !== undefined ? { ttftMs: firstByteAt - startedAt } : {}),

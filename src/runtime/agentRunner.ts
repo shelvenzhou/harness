@@ -421,11 +421,27 @@ export class AgentRunner {
     const wallMs = Date.now() - startedAt;
     this.handles.clearPins();
 
-    // Record reasoning if emitted.
-    if (parsed.reasoningText) {
+    // Record reasoning if emitted. Provider state stores opaque items
+    // that a provider needs for correct stateless continuation.
+    const providerStateItems = parsed.providerState.flatMap((s) =>
+      s.items.map((item) => ({ providerId: s.providerId, item })),
+    );
+    if (parsed.reasoningText || providerStateItems.length > 0) {
       await this.appendEvent({
         kind: 'reasoning',
-        payload: { text: parsed.reasoningText },
+        payload: {
+          text: parsed.reasoningText,
+          ...(providerStateItems.length > 0
+            ? {
+                providerState: {
+                  providerId: this.opts.provider.id,
+                  items: providerStateItems
+                    .filter((x) => x.providerId === this.opts.provider.id)
+                    .map((x) => x.item),
+                },
+              }
+            : {}),
+        },
         ...(at.turnId !== undefined ? { turnId: at.turnId } : {}),
       });
     }
