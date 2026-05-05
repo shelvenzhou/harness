@@ -416,17 +416,28 @@ function toResponseFormat(
 
 /**
  * Pull the model's reasoning text out of a streaming delta. The
- * official ChatCompletionChunk type doesn't declare these fields, so we
- * widen and probe both `reasoning_content` (o1/o3 + Responses API
- * passthrough) and `reasoning` (alternate spelling on some compatible
- * endpoints). Returns the empty string when neither field is set.
+ * official ChatCompletionChunk type doesn't declare these fields, so
+ * we widen and probe several common spellings:
+ *   - `reasoning_content` — o1/o3 family on the Chat Completions API
+ *     and the Responses API passthrough.
+ *   - `reasoning` — OpenRouter's `reasoning` extension and some other
+ *     OpenAI-compatible gateways.
+ *   - `thinking` — Anthropic-style; surfaces on Anthropic-compatible
+ *     shims that pretend to be OpenAI.
+ *   - `reasoning.text` / `thinking.text` — object forms used by a few
+ *     gateways that wrap Anthropic's structured `thinking` blocks.
+ * Returns the empty string when none are set.
  */
 function readReasoningField(delta: unknown): string {
   if (!delta || typeof delta !== 'object') return '';
   const obj = delta as Record<string, unknown>;
-  const a = obj['reasoning_content'];
-  if (typeof a === 'string') return a;
-  const b = obj['reasoning'];
-  if (typeof b === 'string') return b;
+  for (const key of ['reasoning_content', 'reasoning', 'thinking']) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+    if (v && typeof v === 'object') {
+      const text = (v as Record<string, unknown>)['text'];
+      if (typeof text === 'string' && text.length > 0) return text;
+    }
+  }
   return '';
 }
