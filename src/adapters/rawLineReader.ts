@@ -195,26 +195,53 @@ export class RawLineReader {
       }
       return 1;
     }
-    // Drop other C0 controls except TAB, which we render as a literal.
-    if (c < ' ' && c !== '\t') {
-      return 1;
-    }
-    // Escape sequences (CSI, SS3) — best-effort skip without acting.
+    // Escape sequences (CSI, SS3, Alt-prefix) — handle Alt+Enter and
+    // the Kitty/WezTerm CSI u shift+enter as "insert newline"; eat
+    // everything else (arrows, function keys) without acting. This
+    // MUST come before the C0 drop below, since ESC (0x1b) is itself
+    // a C0 control and would otherwise be eaten silently.
     if (c === '\x1b') {
       if (s.length < 2) return 0;
       const next = s[1];
+      // Alt+Enter / Option+Return: ESC + CR or ESC + LF. This is the
+      // most portable "newline without submit" key — every terminal
+      // emulator surfaces Option/Alt+Return as the meta-prefixed CR.
+      if (next === '\r' || next === '\n') {
+        this.appendChars('\n');
+        return 2;
+      }
       if (next === '[' || next === 'O') {
         let i = 2;
         while (i < s.length) {
           const code = s.charCodeAt(i);
           // CSI final byte is in 0x40..0x7e.
-          if (code >= 0x40 && code <= 0x7e) return i + 1;
+          if (code >= 0x40 && code <= 0x7e) {
+            // Kitty keyboard protocol: ESC [ <keycode> ; <mods> u.
+            // Modifiers are bit-encoded with shift=1 (so mods=2 means
+            // "shift only", mods=4 alt, mods=6 alt+shift, etc.). Any
+            // modified Enter is treated as "insert newline" — the
+            // unmodified Enter is delivered as plain CR and never
+            // reaches this branch.
+            if (code === 0x75 /* 'u' */) {
+              const seq = s.slice(2, i);
+              const m = /^(\d+)(?:;(\d+))?$/.exec(seq);
+              if (m && (m[1] === '13' || m[1] === '10')) {
+                this.appendChars('\n');
+                return i + 1;
+              }
+            }
+            return i + 1;
+          }
           i++;
         }
         return 0; // partial CSI
       }
       // ESC + single char — eat both.
       return 2;
+    }
+    // Drop other C0 controls except TAB, which we render as a literal.
+    if (c < ' ' && c !== '\t') {
+      return 1;
     }
     // Regular character (handles UTF-8 because input is set to utf8).
     this.appendChars(c);

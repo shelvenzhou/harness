@@ -77,6 +77,23 @@ describe('RawLineReader', () => {
     reader.stop();
   });
 
+  it('inserts a newline on Alt+Enter (ESC + CR) and submits on plain Enter', async () => {
+    const { reader, input, events } = makeReader();
+    input.write('first\x1b\rsecond\r');
+    await tick();
+    expect(events).toEqual([{ kind: 'line', text: 'first\nsecond' }]);
+    reader.stop();
+  });
+
+  it('inserts a newline on Kitty CSI u shift+enter', async () => {
+    const { reader, input, events } = makeReader();
+    // ESC [ 13 ; 2 u → Shift+Enter under the kitty keyboard protocol.
+    input.write('foo\x1b[13;2ubar\r');
+    await tick();
+    expect(events).toEqual([{ kind: 'line', text: 'foo\nbar' }]);
+    reader.stop();
+  });
+
   it('uses """ heredoc fences so users can compose multi-line input by hand', async () => {
     const { reader, input, events } = makeReader();
     input.write('"""\r');
