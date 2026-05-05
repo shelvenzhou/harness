@@ -24,10 +24,12 @@ with a typed interface. Current state:
   tool calls), works against endpoints that implement `/v1/responses` via `OPENAI_BASE_URL`
 - ✅ Real `shell` (process-group kill, byte cap, handle elision) and
   `web_fetch` (undici); `read`/`write`(overwrite) real; `memory` real
-  with three backends (in-memory / JSONL / mem0); `web_search` stub
+  with three backends (in-memory / JSONL / mem0); `web_search` real via
+  Google Programmable Search or Tavily when configured
 - ✅ Context projection + handle registry + deterministic Level-1
   pruning + **hot-path micro-compaction** (sliding window, no LLM
-  call); static cold-path compactor stub
+  call); cold-path compaction trigger/handler with static or
+  subagent-backed compactor
 - ✅ Pluggable `MemoryStore`: KV path (`get`/`set`/...) **and**
   ingestion path (`ingest(messages)`); pinned entries auto-injected
   into the system prefix on every sampling
@@ -39,13 +41,13 @@ with a typed interface. Current state:
   interrupt propagation
 - ✅ Terminal adapter + CLI; three-layer diagnostics (prompt dumps,
   JSONL trace, stderr summary)
-- ✅ 58 unit/smoke tests green; live e2e (OpenAI + mem0) skipped
+- ✅ 193 unit/smoke tests green; live e2e (OpenAI + mem0) skipped
   behind `HARNESS_E2E=1`
 
-**Phase 2** (next) replaces the static compactor with a subagent-spawn
-compactor, lands `write(patch)` unified-diff mode, adds an Anthropic
-provider with `cache_control` + `cache_edits`, and wires `web_search`
-to a real backend. See [design-docs/08-roadmap.md](design-docs/08-roadmap.md).
+**Phase 2** (next) focuses on the remaining primitive depth: `write(patch)`
+unified-diff mode, an Anthropic provider with `cache_control` + `cache_edits`,
+better pruning estimates, memory ingestion at turn boundaries, and docs /
+diagnostics polish. See [design-docs/08-roadmap.md](design-docs/08-roadmap.md).
 
 ## Architecture at a glance
 
@@ -132,9 +134,12 @@ E2E tests that hit the real API are skipped unless you set `HARNESS_E2E=1`:
 HARNESS_E2E=1 pnpm test:e2e
 ```
 
+Offline smoke coverage uses inline scripted providers in the test files; the
+runtime no longer ships a built-in mock provider.
+
 ## Walkthrough: what happens on a user turn
 
-Phase 1 mock-provider path, end-to-end:
+Configured-provider path, end-to-end:
 
 1. User types `hello` in the terminal.
 2. [`TerminalAdapter`](src/adapters/terminal.ts) appends a `user_turn_start`
@@ -198,10 +203,11 @@ wires `bootstrap()` to an instance of your adapter.
 ## Tutorial: swapping the LLM provider
 
 Implement [`LlmProvider`](src/llm/provider.ts) — one method, `sample(request,
-signal)` returning an `AsyncIterable<SamplingDelta>`. See
-[`MockProvider`](src/llm/mockProvider.ts) for the minimal shape. The phase-2
-[`AnthropicProvider`](src/llm/anthropicProvider.ts) lands streaming +
-`cache_control` + `cache_edits`.
+signal)` returning an `AsyncIterable<SamplingDelta>`. For a minimal
+implementation, see the inline scripted providers in
+[`tests/smoke/replLoop.test.ts`](tests/smoke/replLoop.test.ts) and the unit
+tests. Production providers should translate native streaming output into the
+provider-agnostic `SamplingDelta` contract.
 
 ## Layout
 
@@ -211,7 +217,7 @@ src/
   bus/           — EventBus + typed channels
   store/         — SessionStore (append-only event log) + projections
   runtime/       — AgentRunner, ActiveTurn, subagent pool, scheduler
-  llm/           — provider interface + mock + anthropic
+  llm/           — provider interface + OpenAI Responses API provider
   tools/         — minimal tool set + executor + registry
   context/       — projection, compactor, handle registry
   adapters/      — terminal (today), discord/tg (future)

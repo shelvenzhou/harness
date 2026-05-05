@@ -95,7 +95,8 @@ These are not priorities for the initial landing, but the indirection is.
 
 - Complete architecture surface: every box in the diagram exists in code with
   a typed interface.
-- A working terminal adapter + mock LLM provider end-to-end.
+- A working terminal adapter + configured LLM provider end-to-end; offline
+  smoke tests use inline scripted providers.
 - Unit / smoke tests run offline. E2E tests opt-in via `HARNESS_E2E=1`.
 - Design docs checked in; README links to them.
 
@@ -106,8 +107,9 @@ These are not priorities for the initial landing, but the indirection is.
   long-running PTY state, etc. are deferred).
 - Persistent storage (SessionStore is memory + JSONL append; no DB).
 - UI polish beyond a working REPL.
-- Compaction LLM prompts tuned; the pipeline exists, the summarizer can be a
-  stub or mock-only.
+- Compaction LLM prompts tuned; the pipeline exists, and the default
+  summarizer can remain static unless explicitly configured for subagent
+  compaction.
 
 ## Prior art we lean on
 

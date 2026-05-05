@@ -187,8 +187,8 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   - ⚪ Confidence + provenance metadata + async verifier subagent —
     deferred until a poisoning incident motivates it. See
     [09-memory.md](design-docs/09-memory.md#future-confidence-and-provenance).
-- 🟡 **`restore`** — pins a handle but projection's rehydration rules
-  are incomplete (see context).
+- 🟢 **`restore`** — pins a handle for exactly the next sampling; projection
+  rehydrates pinned handles and clears pins after the step.
 - 🟢 **`wait`** — yield semantics work for `user_input` /
   `subtask_complete` / `tool_result` / `kind` / `session`. `timer`
   matcher schedules a real one-shot timer when given `delayMs`;
@@ -275,17 +275,18 @@ Whole document is deferred until a trigger condition lands.
 
 ## Testing
 
-- 🟡 **Unit + smoke tests** — 41 active, 2 e2e skipped. Gaps:
+- 🟡 **Unit + smoke tests** — `pnpm test` currently covers 42 active
+  unit/smoke files and skips 4 live e2e files unless `HARNESS_E2E=1`.
+  Gaps:
   - ⚪ `HandleRegistry` pinning / clearPins semantics.
   - ⚪ `promptDebug.renderPromptText` snapshot.
-  - ⚪ `Scheduler` timer firing + cancellation.
-  - ⚪ Compaction round-trip smoke test.
-- 🟡 **E2E** — 1 real OpenAI round-trip; add one that exercises a tool
-  call through the model.
+- 🟡 **E2E** — live suites cover OpenAI, resume, eval, and mem0 paths when
+  enabled with real credentials. Add/keep at least one live task that forces a
+  model-issued tool call.
 
 ## Docs
 
-- 🟡 Phase-1 status in [README](README.md) is current.
+- 🟢 Phase-1 status in [README](README.md) is current.
 - ⚪ Tutorial for "adding a new LLM provider" (today only has tools /
   adapters).
 - ⚪ `design-docs/07-diagnostics.md` needs a refresh now that the diag

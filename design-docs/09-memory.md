@@ -80,35 +80,36 @@ is visible to the parent on the next sampling. This matches mem0's
 shared-store semantics and makes role-based sub-agents (researcher,
 verifier, …) usefully collaborative.
 
-## mem0 wiring plan
+## mem0 wiring
 
-`Mem0Store` is stubbed in `src/memory/mem0Store.ts`. To turn it on:
+`Mem0Store` is implemented in `src/memory/mem0Store.ts`. To turn it on:
 
-1. `pnpm add mem0ai`, dynamic-import the client.
-2. Map `MemoryNamespace` → mem0's `userId / agentId / runId`.
-3. KV path: round-trip via metadata — `set(key, value)` becomes
+1. Set `MEM0_API_KEY`; set `MEM0_BASE_URL` only for a self-hosted server.
+2. Optional: set `MEM0_USER_ID` to override the default fallback user id
+   (`harness`).
+3. The backend maps `MemoryNamespace` → mem0's `userId / agentId / runId`.
+4. KV path round-trips via metadata — `set(key, value)` becomes
    `mem0.add` with `{metadata: {kvKey: key}}`; `get(key)` is a metadata
    filter. mem0 has no native key-based lookup.
-4. `ingest(messages)` → `mem0.add(messages, namespace)` — straight
+5. `ingest(messages)` → `mem0.add(messages, namespace)` — straight
    passthrough; this is mem0's strong suit.
-5. Auth: `MEM0_API_KEY` (cloud) or `MEM0_BASE_URL` (self-hosted).
 
 ## Persistence
 
 The default backend (`InMemoryStore`) is process-scoped. For
-cross-session memory the user picks a persistent backend at bootstrap:
+cross-session memory the user picks a persistent backend via env or
+bootstrap:
 
 ```ts
 bootstrap({
   provider,
   systemPrompt,
-  memory: new JsonlMemoryStore({root: '.harness/memory.jsonl'}),
+  memory: new JsonlMemoryStore({path: '.harness/memory.jsonl'}),
 });
 ```
 
-The JSONL backend is not implemented yet; mem0 is the next likely
-target. The interface is stable enough that adding either is purely
-implementation work, no caller changes.
+`HARNESS_MEMORY_FILE` wires the JSONL backend in the CLI. `MEM0_API_KEY`
+wires the mem0 backend and takes precedence over `HARNESS_MEMORY_FILE`.
 
 ## Future: confidence and provenance
 
