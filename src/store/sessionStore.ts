@@ -165,7 +165,7 @@ export class MemorySessionStore implements SessionStore {
     state.events[idx] = { ...ev, elided } as HarnessEvent;
   }
 
-  async fork(opts: import('./sessionStore.js').ForkOptions): Promise<Thread> {
+  async fork(opts: ForkOptions): Promise<Thread> {
     const src = this.expectThread(opts.source);
     if (this.threads.has(opts.newThreadId)) {
       throw new Error(`thread ${opts.newThreadId} already exists`);

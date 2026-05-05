@@ -93,7 +93,7 @@ export const webFetchTool: Tool<typeof FetchArgs, FetchOutput> = {
       const chunks: Uint8Array[] = [];
       let collected = 0;
       try {
-        while (true) {
+        for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
           if (!value) continue;

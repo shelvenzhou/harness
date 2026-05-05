@@ -7,6 +7,9 @@ import type {
   SamplingRequest,
 } from '@harness/llm/provider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
+import type { EventBus } from '@harness/bus/eventBus.js';
+import type { ThreadId } from '@harness/core/ids.js';
+import type { SessionStore } from '@harness/store/sessionStore.js';
 
 /**
  * Regression: when a `user_turn_start` for a new turn arrives while the
@@ -43,12 +46,12 @@ class SimpleProvider implements LlmProvider {
 }
 
 async function runOneTurn(
-  bus: import('@harness/bus/eventBus.js').EventBus,
-  store: import('@harness/store/sessionStore.js').SessionStore,
-  threadId: import('@harness/core/ids.js').ThreadId,
+  bus: EventBus,
+  store: SessionStore,
+  threadId: ThreadId,
   text: string,
 ): Promise<{ status: 'completed' | 'interrupted' | 'errored'; summary?: string }> {
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('timeout')), 2_000);
     const sub = bus.subscribe(
       (ev) => {
@@ -63,8 +66,9 @@ async function runOneTurn(
       },
       { threadId },
     );
-    const seed = await store.append({ threadId, kind: 'user_turn_start', payload: { text } });
-    bus.publish(seed);
+    void store
+      .append({ threadId, kind: 'user_turn_start', payload: { text } })
+      .then((seed) => bus.publish(seed), reject);
   });
 }
 

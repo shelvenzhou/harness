@@ -8,6 +8,9 @@ import type {
 } from '@harness/llm/provider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import type { ToolCallId } from '@harness/core/ids.js';
+import type { EventBus } from '@harness/bus/eventBus.js';
+import type { ThreadId } from '@harness/core/ids.js';
+import type { SessionStore } from '@harness/store/sessionStore.js';
 
 /**
  * `usage` tool — pull-style accounting. The model asks; the runtime
@@ -38,9 +41,9 @@ class ScriptedProvider implements LlmProvider {
 }
 
 async function runTurn(
-  bus: import('@harness/bus/eventBus.js').EventBus,
-  store: import('@harness/store/sessionStore.js').SessionStore,
-  threadId: import('@harness/core/ids.js').ThreadId,
+  bus: EventBus,
+  store: SessionStore,
+  threadId: ThreadId,
   text: string,
 ): Promise<void> {
   const completion = new Promise<void>((resolve, reject) => {

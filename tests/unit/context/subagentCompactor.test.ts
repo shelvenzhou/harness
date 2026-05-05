@@ -59,16 +59,33 @@ class HangProvider implements LlmProvider {
     nativeReasoning: false,
     maxContextTokens: 100_000,
   };
-  async *sample(_req: SamplingRequest, signal: AbortSignal): AsyncIterable<SamplingDelta> {
-    await new Promise<void>((resolve) => {
-      const onAbort = (): void => {
-        signal.removeEventListener('abort', onAbort);
-        resolve();
-      };
-      if (signal.aborted) resolve();
-      else signal.addEventListener('abort', onAbort, { once: true });
-    });
+  sample(_req: SamplingRequest, signal: AbortSignal): AsyncIterable<SamplingDelta> {
+    return waitForAbort(signal);
   }
+}
+
+function waitForAbort(signal: AbortSignal): AsyncIterable<SamplingDelta> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<SamplingDelta> {
+      let done = false;
+      return {
+        async next(): Promise<IteratorResult<SamplingDelta>> {
+          if (!done) {
+            done = true;
+            await new Promise<void>((resolve) => {
+              const onAbort = (): void => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+              };
+              if (signal.aborted) resolve();
+              else signal.addEventListener('abort', onAbort, { once: true });
+            });
+          }
+          return { done: true, value: undefined as never };
+        },
+      };
+    },
+  };
 }
 
 async function buildRequest(

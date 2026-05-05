@@ -8,7 +8,7 @@ import type {
   SamplingRequest,
 } from '@harness/llm/provider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
-import { newToolCallId } from '@harness/core/ids.js';
+import type { newToolCallId } from '@harness/core/ids.js';
 import { ToolRegistry } from '@harness/tools/registry.js';
 import { sessionTool, waitTool } from '@harness/tools/impl/index.js';
 import type { Tool } from '@harness/tools/tool.js';

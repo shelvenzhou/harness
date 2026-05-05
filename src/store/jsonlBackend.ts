@@ -159,7 +159,7 @@ export class JsonlSessionStore implements SessionStore {
     await appendElision(this.root, threadId, eventId, elided);
   }
 
-  async fork(opts: ForkOptions): Promise<import('@harness/core/thread.js').Thread> {
+  async fork(opts: ForkOptions): Promise<Thread> {
     await this.ready;
     const thread = await this.mem.fork(opts);
     // The mem fork already issued createThread + a series of append()

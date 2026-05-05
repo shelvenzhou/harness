@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { AddressInfo } from 'node:net';
+import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { newHandleRef, newThreadId, newToolCallId, newTurnId } from '@harness/core/ids.js';

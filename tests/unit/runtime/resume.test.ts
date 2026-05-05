@@ -13,6 +13,8 @@ import type {
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { resume } from '@harness/runtime/resume.js';
 import type { ThreadId } from '@harness/core/ids.js';
+import type { EventBus } from '@harness/bus/eventBus.js';
+import type { SessionStore } from '@harness/store/sessionStore.js';
 
 /**
  * Resume: rehydrate a runtime from a previous session's JSONL store.
@@ -52,12 +54,12 @@ class CountingProvider implements LlmProvider {
 }
 
 async function runOneTurn(
-  bus: import('@harness/bus/eventBus.js').EventBus,
-  store: import('@harness/store/sessionStore.js').SessionStore,
+  bus: EventBus,
+  store: SessionStore,
   threadId: ThreadId,
   text: string,
 ): Promise<{ status: 'completed' | 'interrupted' | 'errored'; summary?: string }> {
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('timeout')), 3_000);
     const sub = bus.subscribe(
       (ev) => {
@@ -72,8 +74,9 @@ async function runOneTurn(
       },
       { threadId },
     );
-    const seed = await store.append({ threadId, kind: 'user_turn_start', payload: { text } });
-    bus.publish(seed);
+    void store
+      .append({ threadId, kind: 'user_turn_start', payload: { text } })
+      .then((seed) => bus.publish(seed), reject);
   });
 }
 

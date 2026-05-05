@@ -13,7 +13,7 @@ import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import { toToolSpec } from '@harness/tools/tool.js';
 
-import { HandleRegistry } from './handleRegistry.js';
+import type { HandleRegistry } from './handleRegistry.js';
 import { estimateTokens, projectEvents, type PruningOptions } from './pruning.js';
 
 /**

@@ -135,15 +135,27 @@ describe('eval/runner', () => {
     const stuck: LlmProvider = {
       id: 'stuck',
       capabilities: provider.capabilities,
-      async *sample(_r, signal) {
-        // Sleep until aborted.
-        await new Promise((resolve) => {
-          const t = setTimeout(resolve, 5_000);
-          signal.addEventListener('abort', () => {
-            clearTimeout(t);
-            resolve(undefined);
-          });
-        });
+      sample(_r, signal) {
+        return {
+          [Symbol.asyncIterator](): AsyncIterator<SamplingDelta> {
+            let done = false;
+            return {
+              async next(): Promise<IteratorResult<SamplingDelta>> {
+                if (!done) {
+                  done = true;
+                  await new Promise((resolve) => {
+                    const t = setTimeout(resolve, 5_000);
+                    signal.addEventListener('abort', () => {
+                      clearTimeout(t);
+                      resolve(undefined);
+                    });
+                  });
+                }
+                return { done: true, value: undefined as never };
+              },
+            };
+          },
+        };
       },
     };
     const runtime = await bootstrap({ provider: stuck, systemPrompt: 'sys' });

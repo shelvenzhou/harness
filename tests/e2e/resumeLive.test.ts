@@ -8,6 +8,8 @@ import 'dotenv/config';
 import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
 import { bootstrap } from '@harness/runtime/bootstrap.js';
 import { resume } from '@harness/runtime/resume.js';
+import type { EventBus } from '@harness/bus/eventBus.js';
+import type { ThreadId } from '@harness/core/ids.js';
 
 /**
  * Live resume: bootstrap → 1 real turn → resume → 1 more real turn.
@@ -31,8 +33,8 @@ function makeProvider(): OpenAIProvider {
 }
 
 async function awaitTurnComplete(
-  bus: import('@harness/bus/eventBus.js').EventBus,
-  threadId: import('@harness/core/ids.js').ThreadId,
+  bus: EventBus,
+  threadId: ThreadId,
   budgetMs = 30_000,
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
