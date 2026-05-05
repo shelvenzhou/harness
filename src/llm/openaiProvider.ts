@@ -1,11 +1,15 @@
 import OpenAI from 'openai';
 import type { Stream } from 'openai/core/streaming.js';
 import type {
-  ChatCompletionChunk,
-  ChatCompletionCreateParamsStreaming,
-  ChatCompletionMessageParam,
-  ChatCompletionTool,
-} from 'openai/resources/chat/completions.js';
+  EasyInputMessage,
+  FunctionTool,
+  ResponseCreateParamsStreaming,
+  ResponseFormatTextConfig,
+  ResponseInput,
+  ResponseInputItem,
+  ResponseStreamEvent,
+} from 'openai/resources/responses/responses.js';
+import type { Reasoning, ReasoningEffort } from 'openai/resources/shared.js';
 
 import type { ToolCallId } from '@harness/core/ids.js';
 
@@ -21,14 +25,29 @@ import type {
 } from './provider.js';
 
 /**
- * OpenAI-compatible chat-completions provider.
+ * OpenAI Responses-API provider.
  *
- * Uses the Chat Completions API so this provider also works against any
- * OpenAI-compatible endpoint (Azure, Together, Groq, OpenRouter, local
- * vLLM, etc.) by pointing `baseURL` elsewhere.
+ * The Chat Completions API doesn't surface reasoning text on the
+ * stream — for o1/o3/gpt-5 you only see the final answer plus a
+ * reasoning_tokens count. The Responses API streams `response
+ * .reasoning_text.delta` (and the older `response.reasoning_summary
+ * _text.delta`) in addition to `response.output_text.delta`, so
+ * thinking is actually visible.
  *
- * Translates StablePrefix + ProjectedItem[] into the API's messages
- * array, and the streaming chunks back into our SamplingDelta shape.
+ * Translation overview:
+ *   StablePrefix.systemPrompt      → `instructions`
+ *   StablePrefix.tools             → `tools` (FunctionTool, top-level
+ *                                     `name`/`parameters`)
+ *   ProjectedItem[]                → `input` (ResponseInput); each
+ *                                     assistant tool_use becomes its
+ *                                     own `function_call` input item
+ *                                     and each tool_result becomes a
+ *                                     `function_call_output` item
+ *   stream events                  → SamplingDelta
+ *
+ * Non-OpenAI endpoints that don't implement Responses API will fail
+ * here. That's the trade-off the caller asked for: thinking text
+ * everywhere, at the cost of cross-vendor portability.
  */
 
 export interface OpenAIProviderOptions {
@@ -41,11 +60,18 @@ export interface OpenAIProviderOptions {
    * Per-request retry budget for transport-level failures (network
    * errors, 5xx, 408, 429). Mid-stream errors are NOT retried — only
    * the initial connect/handshake. Default 2 (3 total attempts).
-   * The OpenAI SDK exposes the same knob; we forward via the
-   * client constructor so the same budget applies to non-streaming
-   * paths if any are added later.
    */
   maxRetries?: number;
+  /**
+   * Optional reasoning controls. `effort` selects how much budget the
+   * model can spend thinking; `summary` opts into the reasoning
+   * summary stream. Defaults to `{ summary: 'auto' }` so reasoning
+   * text shows up automatically on reasoning-capable models.
+   */
+  reasoning?: {
+    effort?: ReasoningEffort | null;
+    summary?: 'auto' | 'concise' | 'detailed' | null;
+  };
 }
 
 const DEFAULT_MODEL = 'gpt-4o-mini';
@@ -54,10 +80,10 @@ const DEFAULT_MAX_RETRIES = 2;
 export class OpenAIProvider implements LlmProvider {
   readonly id = 'openai';
   readonly capabilities: LlmCapabilities = {
-    prefixCache: false, // OpenAI caches automatically for long prefixes; no client control.
+    prefixCache: false, // Server-side automatic caching; no client knob.
     cacheEdits: false,
     nativeToolUse: true,
-    nativeReasoning: false,
+    nativeReasoning: true,
     maxContextTokens: 128_000,
   };
 
@@ -65,6 +91,7 @@ export class OpenAIProvider implements LlmProvider {
   private readonly model: string;
   private readonly defaultMaxTokens: number;
   private readonly defaultTemperature: number;
+  private readonly reasoning: Reasoning | undefined;
 
   constructor(opts: OpenAIProviderOptions) {
     if (!opts.apiKey) throw new Error('OpenAIProvider requires an apiKey');
@@ -76,126 +103,145 @@ export class OpenAIProvider implements LlmProvider {
     this.model = opts.model ?? DEFAULT_MODEL;
     this.defaultMaxTokens = opts.defaultMaxTokens ?? 32768;
     this.defaultTemperature = opts.defaultTemperature ?? 0.7;
+    // Default to summary='auto' so reasoning streams without the
+    // caller having to opt in. effort is left unset so the API uses
+    // the model default (GPT-5.x defaults to 'none' or 'medium'
+    // depending on the model).
+    if (opts.reasoning) {
+      this.reasoning = {
+        ...(opts.reasoning.effort !== undefined ? { effort: opts.reasoning.effort } : {}),
+        ...(opts.reasoning.summary !== undefined ? { summary: opts.reasoning.summary } : {}),
+      };
+    } else {
+      this.reasoning = { summary: 'auto' };
+    }
   }
 
   async *sample(
     request: SamplingRequest,
     signal: AbortSignal,
   ): AsyncIterable<SamplingDelta> {
-    const messages = toChatMessages(request.prefix, request.tail);
-    const tools = toChatTools(request.prefix);
+    const input = toResponsesInput(request.tail);
+    const tools = toResponsesTools(request.prefix);
 
-    // OpenAI renamed `max_tokens` to `max_completion_tokens` for newer
-    // (reasoning) models. `max_completion_tokens` is accepted across all
-    // currently-supported chat-completions models, so we send that
-    // universally.
-    const stream = (await this.client.chat.completions.create(
-      {
-        model: request.model ?? this.model,
-        messages,
-        ...(tools.length > 0 ? { tools } : {}),
-        stream: true,
-        stream_options: { include_usage: true },
-        max_completion_tokens: request.maxTokens ?? this.defaultMaxTokens,
-        temperature: request.temperature ?? this.defaultTemperature,
-        ...(request.responseFormat
-          ? { response_format: toResponseFormat(request.responseFormat) }
-          : {}),
-      },
-      { signal },
-    )) as unknown as Stream<ChatCompletionChunk>;
-
-    // Tool-call chunks arrive indexed; accumulate arg JSON per index and
-    // emit SamplingDelta lifecycle events once complete.
-    interface PartialToolCall {
-      id: ToolCallId;
-      name: string;
-      argsText: string;
-      began: boolean;
-    }
-    const partials = new Map<number, PartialToolCall>();
-    // With `stream_options.include_usage: true`, OpenAI sends the usage
-    // chunk AFTER the chunk that carries finish_reason (as a standalone
-    // chunk with no `choices`). Defer the `end` delta until the loop
-    // closes so we can emit `usage` first.
-    let finalUsage:
-      | {
-          prompt_tokens?: number;
-          completion_tokens?: number;
-          prompt_tokens_details?: { cached_tokens?: number };
-        }
-      | undefined;
-    let pendingStop: ReturnType<typeof mapStopReason> | undefined;
-    let toolEndsEmitted = false;
-
-    const emitToolEndsOnce = function* (): Generator<SamplingDelta> {
-      if (toolEndsEmitted) return;
-      toolEndsEmitted = true;
-      for (const p of partials.values()) {
-        if (!p.began) continue;
-        yield {
-          kind: 'tool_call_end',
-          toolCallId: p.id,
-          args: tryParseJson(p.argsText),
-        };
-      }
+    const params: ResponseCreateParamsStreaming = {
+      model: request.model ?? this.model,
+      instructions: request.prefix.systemPrompt,
+      input,
+      ...(tools.length > 0 ? { tools } : {}),
+      stream: true,
+      // Stateless: don't have OpenAI persist responses on its side.
+      // Matches the Chat Completions behaviour we replaced and avoids
+      // accidentally leaking conversation state between sessions.
+      store: false,
+      max_output_tokens: request.maxTokens ?? this.defaultMaxTokens,
+      temperature: request.temperature ?? this.defaultTemperature,
+      ...(this.reasoning ? { reasoning: this.reasoning } : {}),
+      ...(request.responseFormat
+        ? { text: { format: toResponsesTextFormat(request.responseFormat) } }
+        : {}),
     };
 
+    const stream = (await this.client.responses.create(params, {
+      signal,
+    })) as unknown as Stream<ResponseStreamEvent>;
+
+    // Function-call lifecycle is keyed by the streaming `item_id` (an
+    // internal id different from `call_id` — call_id is the stable id
+    // tools see and what we surface as ToolCallId).
+    interface PendingToolCall {
+      callId: ToolCallId;
+      name: string;
+      began: boolean;
+    }
+    const pending = new Map<string, PendingToolCall>();
+    let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' | undefined;
+    let promptTokens = 0;
+    let cachedPromptTokens = 0;
+    let completionTokens = 0;
+    let usageEmitted = false;
+
     try {
-      for await (const chunk of stream) {
+      for await (const event of stream) {
         if (signal.aborted) return;
-        if (chunk.usage) finalUsage = chunk.usage;
-        const choice = chunk.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta;
-        if (delta?.content) {
-          // Don't tag with channel here. Let actionParser apply the
-          // preamble heuristic: text flushed because of a following
-          // tool_call gets `preamble`; trailing text gets `reply`.
-          yield { kind: 'text_delta', text: delta.content };
-        }
-        // Reasoning content is non-standard on the Chat Completions API
-        // surface — newer reasoning models (o1/o3 family + the OpenAI
-        // Responses API shim) attach a `reasoning_content` field on the
-        // delta; some compatible endpoints use `reasoning`. Probe both.
-        const reasoningText = readReasoningField(delta);
-        if (reasoningText) {
-          yield { kind: 'reasoning_delta', text: reasoningText };
-        }
-        if (delta?.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            let p = partials.get(idx);
-            if (!p) {
-              p = {
-                id: (tc.id ?? `tc_${idx}`) as ToolCallId,
-                name: tc.function?.name ?? '',
-                argsText: '',
-                began: false,
-              };
-              partials.set(idx, p);
-            } else if (tc.id && p.id !== (tc.id as ToolCallId)) {
-              p.id = tc.id as ToolCallId;
-            }
-            if (tc.function?.name && !p.name) p.name = tc.function.name;
-            if (tc.function?.arguments) p.argsText += tc.function.arguments;
-            if (!p.began && p.name) {
-              p.began = true;
-              yield { kind: 'tool_call_begin', toolCallId: p.id, name: p.name };
-            }
-            if (tc.function?.arguments) {
-              yield {
-                kind: 'tool_call_arg_delta',
-                toolCallId: p.id,
-                argsPartial: tc.function.arguments,
-              };
-            }
+        switch (event.type) {
+          case 'response.output_text.delta': {
+            yield { kind: 'text_delta', text: event.delta };
+            break;
           }
-        }
-        if (choice.finish_reason) {
-          pendingStop = mapStopReason(choice.finish_reason);
-          for (const d of emitToolEndsOnce()) yield d;
-          // Don't yield `end` yet — wait for the trailing usage chunk.
+          case 'response.reasoning_text.delta':
+          case 'response.reasoning_summary_text.delta': {
+            yield { kind: 'reasoning_delta', text: event.delta };
+            break;
+          }
+          case 'response.output_item.added': {
+            const item = event.item;
+            if (item.type === 'function_call') {
+              const callId = item.call_id as ToolCallId;
+              const itemId = item.id ?? callId;
+              pending.set(itemId, { callId, name: item.name, began: true });
+              yield { kind: 'tool_call_begin', toolCallId: callId, name: item.name };
+            }
+            break;
+          }
+          case 'response.function_call_arguments.delta': {
+            const tc = pending.get(event.item_id);
+            if (!tc) break;
+            yield {
+              kind: 'tool_call_arg_delta',
+              toolCallId: tc.callId,
+              argsPartial: event.delta,
+            };
+            break;
+          }
+          case 'response.function_call_arguments.done': {
+            const tc = pending.get(event.item_id);
+            if (!tc) break;
+            yield {
+              kind: 'tool_call_end',
+              toolCallId: tc.callId,
+              args: tryParseJson(event.arguments),
+            };
+            pending.delete(event.item_id);
+            break;
+          }
+          case 'response.completed': {
+            const u = event.response.usage;
+            if (u) {
+              promptTokens = u.input_tokens ?? 0;
+              cachedPromptTokens = u.input_tokens_details?.cached_tokens ?? 0;
+              completionTokens = u.output_tokens ?? 0;
+            }
+            // If the response carried any tool calls, the runner needs
+            // to dispatch them — flag stop=tool_use so the agent loop
+            // continues sampling after results come back.
+            const hasTool = event.response.output?.some(
+              (o) => o.type === 'function_call',
+            );
+            stopReason = stopReason ?? (hasTool ? 'tool_use' : 'end_turn');
+            break;
+          }
+          case 'response.incomplete': {
+            const reason = event.response.incomplete_details?.reason;
+            stopReason = reason === 'max_output_tokens' ? 'max_tokens' : 'error';
+            const u = event.response.usage;
+            if (u) {
+              promptTokens = u.input_tokens ?? 0;
+              cachedPromptTokens = u.input_tokens_details?.cached_tokens ?? 0;
+              completionTokens = u.output_tokens ?? 0;
+            }
+            break;
+          }
+          case 'response.failed': {
+            stopReason = 'error';
+            break;
+          }
+          default:
+            // Ignore other event types (output_item.done,
+            // content_part.added, refusal events, audio, web/file
+            // search calls, etc.) — they don't affect our action
+            // contract.
+            break;
         }
       }
     } catch (err) {
@@ -203,84 +249,72 @@ export class OpenAIProvider implements LlmProvider {
       throw err;
     }
 
-    // Stream closed — emit any tool_call_ends we missed (defensive), the
-    // usage if it arrived, and the terminal `end`.
-    for (const d of emitToolEndsOnce()) yield d;
-    if (finalUsage) {
+    // Defensive: if a tool_call item never received a `done` event
+    // (truncated stream), close it with whatever we have. The runner
+    // expects every begun tool_call to end.
+    for (const tc of pending.values()) {
+      if (!tc.began) continue;
+      yield { kind: 'tool_call_end', toolCallId: tc.callId, args: {} };
+    }
+    pending.clear();
+
+    if (!usageEmitted && (promptTokens || completionTokens)) {
       yield {
         kind: 'usage',
         tokens: {
-          promptTokens: finalUsage.prompt_tokens ?? 0,
-          cachedPromptTokens: finalUsage.prompt_tokens_details?.cached_tokens ?? 0,
-          completionTokens: finalUsage.completion_tokens ?? 0,
+          promptTokens,
+          cachedPromptTokens,
+          completionTokens,
         },
       };
+      usageEmitted = true;
     }
-    yield { kind: 'end', stopReason: pendingStop ?? 'end_turn' };
+    yield { kind: 'end', stopReason: stopReason ?? 'end_turn' };
   }
 }
 
 // ─── translation helpers ───────────────────────────────────────────────────
 
-function toChatMessages(
-  prefix: StablePrefix,
-  tail: ProjectedItem[],
-): ChatCompletionMessageParam[] {
-  const messages: ChatCompletionMessageParam[] = [];
-  // Pinned memory + compacted summary now arrive as synthetic head-of-tail
-  // items (with cacheTags PINNED_MEMORY_CACHE_TAG / COMPACTED_SUMMARY_CACHE_TAG)
-  // so the system message stays byte-stable across pin/unpin and compaction
-  // events. The provider's automatic prompt-prefix cache hits as long as
-  // system + tools don't mutate.
-  messages.push({ role: 'system', content: prefix.systemPrompt });
-
-  let pendingAssistant:
-    | {
-        textChunks: string[];
-        toolCalls: NonNullable<
-          Extract<ChatCompletionMessageParam, { role: 'assistant' }>['tool_calls']
-        >;
-      }
-    | undefined;
-  const flushAssistant = (): void => {
-    if (!pendingAssistant) return;
-    messages.push({
-      role: 'assistant',
-      ...(pendingAssistant.textChunks.length > 0
-        ? { content: pendingAssistant.textChunks.join('') }
-        : { content: null }),
-      ...(pendingAssistant.toolCalls.length > 0 ? { tool_calls: pendingAssistant.toolCalls } : {}),
-    });
-    pendingAssistant = undefined;
-  };
-
+/**
+ * Translate the projected tail into Responses API input items.
+ *
+ * Each assistant tool_use becomes its own `function_call` input item
+ * (call_id is the stable id the API echoes back on tool results).
+ * Each tool_result becomes a `function_call_output` item paired by
+ * call_id. User text is wrapped in `EasyInputMessage`.
+ *
+ * Elided handles get one of two treatments:
+ *   - elided tool_result → still emitted as `function_call_output`
+ *     with a stub body so the API's pairing invariant holds; the LLM
+ *     can `restore(handle)` to rehydrate.
+ *   - elided non-tool block → flattened into a user-role message so
+ *     it's still in context.
+ */
+function toResponsesInput(tail: ProjectedItem[]): ResponseInput {
+  const items: ResponseInputItem[] = [];
   for (const item of tail) {
     if (item.role === 'user') {
-      flushAssistant();
-      messages.push({ role: 'user', content: contentToText(item.content) });
+      items.push(
+        easyMessage('user', contentToText(item.content)),
+      );
       continue;
     }
     if (item.role === 'tool_result') {
-      flushAssistant();
       for (const c of item.content) {
         if (c.kind === 'tool_result') {
-          messages.push({
-            role: 'tool',
-            tool_call_id: c.toolCallId,
-            content: JSON.stringify(c.ok ? (c.output ?? null) : { error: c.error ?? 'error' }),
+          items.push({
+            type: 'function_call_output',
+            call_id: c.toolCallId,
+            output: JSON.stringify(
+              c.ok ? (c.output ?? null) : { error: c.error ?? 'error' },
+            ),
           });
         } else if (c.kind === 'elided') {
-          // Elided tool_result. We MUST still emit a `tool` role message
-          // with the original tool_call_id so OpenAI's pairing invariant
-          // holds — otherwise the next request errors with
-          // "tool_calls did not have response messages". Body becomes a
-          // compact placeholder; the LLM can `restore(handle)` to inline
-          // the full content on the next sampling.
           if (c.toolCallId) {
-            messages.push({
-              role: 'tool',
-              tool_call_id: c.toolCallId,
-              content: JSON.stringify({
+            items.push({
+              type: 'function_call_output',
+              call_id: c.toolCallId,
+              output: JSON.stringify({
                 elided: true,
                 handle: c.handle,
                 kind: c.originKind,
@@ -289,37 +323,34 @@ function toChatMessages(
               }),
             });
           } else {
-            // Elided block that wasn't standing in for a tool_result —
-            // safe to render as plain user text.
-            messages.push({
-              role: 'user',
-              content: `[elided handle=${c.handle} kind=${c.originKind}] ${c.summary ?? ''}`,
-            });
+            items.push(
+              easyMessage(
+                'user',
+                `[elided handle=${c.handle} kind=${c.originKind}] ${c.summary ?? ''}`,
+              ),
+            );
           }
         }
       }
       continue;
     }
-    if (!pendingAssistant) {
-      pendingAssistant = { textChunks: [], toolCalls: [] };
-    }
+    // assistant
     const textChunks: string[] = [];
-    const toolCalls: NonNullable<
-      Extract<ChatCompletionMessageParam, { role: 'assistant' }>['tool_calls']
-    > = [];
     for (const c of item.content) {
       switch (c.kind) {
         case 'text':
           textChunks.push(c.text);
           break;
         case 'tool_use':
-          toolCalls.push({
-            id: c.toolCallId,
-            type: 'function',
-            function: {
-              name: c.name,
-              arguments: JSON.stringify(c.args ?? {}),
-            },
+          if (textChunks.length > 0) {
+            items.push(easyMessage('assistant', textChunks.join('')));
+            textChunks.length = 0;
+          }
+          items.push({
+            type: 'function_call',
+            call_id: c.toolCallId,
+            name: c.name,
+            arguments: JSON.stringify(c.args ?? {}),
           });
           break;
         case 'elided':
@@ -330,29 +361,33 @@ function toChatMessages(
           break;
       }
     }
-    pendingAssistant.textChunks.push(...textChunks);
-    pendingAssistant.toolCalls.push(...toolCalls);
+    if (textChunks.length > 0) {
+      items.push(easyMessage('assistant', textChunks.join('')));
+    }
   }
-
-  flushAssistant();
-
-  return messages;
+  return items;
 }
 
-export const __testOnly = {
-  toChatMessages,
-  toResponseFormat,
-  readReasoningField,
-};
+function easyMessage(
+  role: EasyInputMessage['role'],
+  content: string,
+): EasyInputMessage {
+  return { role, content };
+}
 
-function toChatTools(prefix: StablePrefix): ChatCompletionTool[] {
+function toResponsesTools(prefix: StablePrefix): FunctionTool[] {
   return prefix.tools.map((t) => ({
     type: 'function',
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: (t.argsSchema as Record<string, unknown>) ?? { type: 'object', properties: {} },
+    name: t.name,
+    description: t.description,
+    parameters: (t.argsSchema as Record<string, unknown>) ?? {
+      type: 'object',
+      properties: {},
     },
+    // strict=true would force OpenAI to reject any args that don't
+    // match parameters exactly. Most tools in the harness don't ship
+    // schemas tight enough for that, so leave it off.
+    strict: false,
   }));
 }
 
@@ -375,69 +410,26 @@ function tryParseJson(text: string): unknown {
   }
 }
 
-function mapStopReason(
-  reason: string,
-): 'end_turn' | 'max_tokens' | 'tool_use' | 'error' {
-  switch (reason) {
-    case 'stop':
-      return 'end_turn';
-    case 'length':
-      return 'max_tokens';
-    case 'tool_calls':
-    case 'function_call':
-      return 'tool_use';
-    default:
-      return 'error';
-  }
-}
-
 /**
- * Translate the harness's `ResponseFormatSpec` into the OpenAI Chat
- * Completions `response_format` shape. JSON-schema mode picks up
- * `strict: true` by default so the API enforces shape; callers can
- * opt out by setting `strict: false`.
+ * Translate the harness's `ResponseFormatSpec` into the Responses API
+ * `text.format` shape (note: nested under `text`, not top-level
+ * `response_format` like Chat Completions).
  */
-function toResponseFormat(
-  spec: ResponseFormatSpec,
-): NonNullable<ChatCompletionCreateParamsStreaming['response_format']> {
+function toResponsesTextFormat(spec: ResponseFormatSpec): ResponseFormatTextConfig {
   if (spec.type === 'json_object') {
     return { type: 'json_object' };
   }
   return {
     type: 'json_schema',
-    json_schema: {
-      name: spec.name,
-      schema: spec.schema as Record<string, unknown>,
-      strict: spec.strict ?? true,
-      ...(spec.description !== undefined ? { description: spec.description } : {}),
-    },
+    name: spec.name,
+    schema: spec.schema as Record<string, unknown>,
+    strict: spec.strict ?? true,
+    ...(spec.description !== undefined ? { description: spec.description } : {}),
   };
 }
 
-/**
- * Pull the model's reasoning text out of a streaming delta. The
- * official ChatCompletionChunk type doesn't declare these fields, so
- * we widen and probe several common spellings:
- *   - `reasoning_content` — o1/o3 family on the Chat Completions API
- *     and the Responses API passthrough.
- *   - `reasoning` — OpenRouter's `reasoning` extension and some other
- *     OpenAI-compatible gateways.
- *   - `thinking` — Anthropic-style; surfaces on Anthropic-compatible
- *     shims that pretend to be OpenAI.
- *   - `reasoning.text` / `thinking.text` — object forms used by a few
- *     gateways that wrap Anthropic's structured `thinking` blocks.
- * Returns the empty string when none are set.
- */
-function readReasoningField(delta: unknown): string {
-  if (!delta || typeof delta !== 'object') return '';
-  const obj = delta as Record<string, unknown>;
-  for (const key of ['reasoning_content', 'reasoning', 'thinking']) {
-    const v = obj[key];
-    if (typeof v === 'string' && v.length > 0) return v;
-    if (v && typeof v === 'object') {
-      const text = (v as Record<string, unknown>)['text'];
-      if (typeof text === 'string' && text.length > 0) return text;
-    }
-  }
-  return '';
-}
+export const __testOnly = {
+  toResponsesInput,
+  toResponsesTools,
+  toResponsesTextFormat,
+};

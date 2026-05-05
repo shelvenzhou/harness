@@ -108,12 +108,14 @@ function buildProvider(args: BuildProviderArgs): LlmProvider {
       const baseURL = args.baseURL ?? process.env['OPENAI_BASE_URL'];
       const maxTokens = envNumber('OPENAI_MAX_TOKENS');
       const temperature = envNumber('OPENAI_TEMPERATURE');
+      const reasoning = buildReasoningOptions();
       return new OpenAIProvider({
         apiKey,
         ...(model !== undefined ? { model } : {}),
         ...(baseURL !== undefined ? { baseURL } : {}),
         ...(maxTokens !== undefined ? { defaultMaxTokens: maxTokens } : {}),
         ...(temperature !== undefined ? { defaultTemperature: temperature } : {}),
+        ...(reasoning !== undefined ? { reasoning } : {}),
       });
     }
     default:
@@ -143,6 +145,34 @@ function buildDiagSinks(): DiagSink[] {
     );
   }
   return sinks;
+}
+
+/**
+ * Read the OpenAI Responses-API reasoning controls from env. Both
+ * fields are optional; when the user sets nothing, OpenAIProvider
+ * defaults to `summary='auto'` so reasoning streams without further
+ * config.
+ *
+ *   OPENAI_REASONING_EFFORT   none | minimal | low | medium | high | xhigh
+ *   OPENAI_REASONING_SUMMARY  auto | concise | detailed | off
+ */
+function buildReasoningOptions():
+  | { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null }
+  | undefined {
+  const effortRaw = process.env['OPENAI_REASONING_EFFORT']?.toLowerCase();
+  const summaryRaw = process.env['OPENAI_REASONING_SUMMARY']?.toLowerCase();
+  if (effortRaw === undefined && summaryRaw === undefined) return undefined;
+  const validEfforts = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+  const out: { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null } = {};
+  if (effortRaw && validEfforts.has(effortRaw)) {
+    out.effort = effortRaw as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  }
+  if (summaryRaw === 'off') {
+    out.summary = null;
+  } else if (summaryRaw === 'auto' || summaryRaw === 'concise' || summaryRaw === 'detailed') {
+    out.summary = summaryRaw;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function envNumber(key: string): number | undefined {
@@ -236,6 +266,8 @@ function printUsage(): void {
       '  OPENAI_BASE_URL      override endpoint (OpenAI-compatible)',
       '  OPENAI_MAX_TOKENS    default 32768',
       '  OPENAI_TEMPERATURE   default 0.7',
+      '  OPENAI_REASONING_EFFORT   none|minimal|low|medium|high|xhigh (model default if unset)',
+      '  OPENAI_REASONING_SUMMARY  auto|concise|detailed|off (default auto — streams thinking)',
       '  HARNESS_PROVIDER     default openai',
       '  HARNESS_SYSTEM_PROMPT',
       '  HARNESS_STORE_ROOT   persist session events to this directory',
