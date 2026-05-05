@@ -47,6 +47,24 @@ Exit criteria:
 - Multi-adapter CLI.
 - Thread resume / fork / archive CLI subcommands.
 
+## Phase 3.5 — self-update / remote ops
+
+See [11-self-update.md](11-self-update.md) for the full requirement.
+Operator drives the harness's own evolution from Discord; harness
+delegates implementation work to a coding-agent backend (Codex /
+Claude Code), self-reviews (tests + diff + docs), opens a PR for
+human review, and restarts itself blue/green so a dead-on-arrival
+build can never strand the operator. Sandbox (phase 4) is **not** a
+prerequisite.
+
+- R1 — Discord adapter (overlaps Phase 3).
+- R2 — coding-agent backend exposed as an `LlmProvider` (so it
+  composes with `spawn`, budgets, interrupts), plus `usage()`
+  introspection and a `quota_exhausted` stop reason.
+- R3 — supervisor + blue/green restart with a `ready` health probe;
+  pre-deploy main-agent review gate (tests + diff + docs).
+- R4 — GitHub PR flow via `gh` (no new tool; `shell` only).
+
 ## Phase 4 — sandbox & permissions
 
 - Executor indirection hardened.
