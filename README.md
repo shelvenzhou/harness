@@ -220,7 +220,7 @@ src/
   llm/           — provider interface + OpenAI Responses API provider
   tools/         — minimal tool set + executor + registry
   context/       — projection, compactor, handle registry
-  adapters/      — terminal (today), discord/tg (future)
+  adapters/      — terminal, Discord, future TG/HTTP surfaces
   cli/           — entry points
 design-docs/     — architecture docs (link target from README)
 tests/

@@ -134,6 +134,13 @@ export interface Runtime {
   subagents: SubagentPool;
   rootThreadId: ThreadId;
   runner: AgentRunner;
+  createRootThread(input?: { title?: string }): Promise<ThreadId>;
+  /**
+   * Ensure a runner is running for an existing thread (replays events
+   * from the store first). No-op if a runner is already attached.
+   * Used by adapters that restore channel→thread mappings on startup.
+   */
+  adoptRootThread(threadId: ThreadId): Promise<void>;
   searchBackend?: SearchBackend;
   diag?: { stop: () => Promise<void> };
   /** Cold-path compaction trigger (only present if `compactionTrigger` opt was passed). */
@@ -190,24 +197,41 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
       : {}),
   });
 
-  const runner = new AgentRunner({
-    threadId: rootThreadId,
-    bus,
-    streamBus,
-    store,
-    registry,
-    executor,
-    provider: opts.provider,
-    systemPrompt: opts.systemPrompt,
-    memory,
-    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
-    ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
-    ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
-    ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
-    ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
-    onSpawn: (req) => subagents.spawn(req),
-  });
-  runner.start();
+  const rootRunners = new Map<ThreadId, AgentRunner>();
+  const buildRootRunner = (threadId: ThreadId): AgentRunner => {
+    const runner = new AgentRunner({
+      threadId,
+      bus,
+      streamBus,
+      store,
+      registry,
+      executor,
+      provider: opts.provider,
+      systemPrompt: opts.systemPrompt,
+      memory,
+      ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
+      ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
+      ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
+      ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
+      ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
+      onSpawn: (req) => subagents.spawn(req),
+    });
+    rootRunners.set(threadId, runner);
+    return runner;
+  };
+  const startRootRunner = (threadId: ThreadId): AgentRunner => {
+    const runner = buildRootRunner(threadId);
+    runner.start();
+    return runner;
+  };
+  const adoptRootThread = async (threadId: ThreadId): Promise<void> => {
+    if (rootRunners.has(threadId)) return;
+    const runner = buildRootRunner(threadId);
+    await runner.hydrateFromStore();
+    runner.start();
+  };
+
+  const runner = startRootRunner(rootThreadId);
 
   let compactionTrigger: CompactionTrigger | undefined;
   if (opts.compactionTrigger) {
@@ -251,6 +275,17 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     subagents,
     rootThreadId,
     runner,
+    createRootThread: async (input) => {
+      const threadId = newThreadId();
+      await store.createThread({
+        id: threadId,
+        rootTraceparent: newRootTraceparent(),
+        ...(input?.title !== undefined ? { title: input.title } : {}),
+      });
+      startRootRunner(threadId);
+      return threadId;
+    },
+    adoptRootThread,
     ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(diag !== undefined ? { diag } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),

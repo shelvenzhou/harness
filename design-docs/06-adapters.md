@@ -40,13 +40,68 @@ for its threads and renders them.
 - `Ctrl-C` sends `Interrupt` once (soft); twice in a second sends `Shutdown`.
 - Single thread bound at startup (`threadBinding: { kind: 'single' }`).
 
-## Future: Discord / TG / HTTP
+## Discord adapter (v1)
 
-Sketches, not implemented in phase 1:
+`src/adapters/discord.ts`. Supports fixed-channel and per-channel
+binding. With `DISCORD_CHANNEL_ID`, one designated channel maps to the
+root thread. Without it, each Discord channel gets its own root
+thread/session, created only when the first message in that channel
+explicitly mentions the bot.
 
-- **Discord**: DM = thread; guild channel = thread. `per-channel` binding.
-  Long messages split into multiple `Reply`s at Discord's 2000-char limit.
-  Attachments become `read` tool calls at the model's discretion.
+- inbound `MessageCreate` on a bound channel becomes `user_turn_start`
+  (no active turn) or `user_input` (active turn). Bot authors are
+  dropped. In dynamic per-channel mode, unbound channels are ignored
+  unless the message mentions the bot; that first mention binds the
+  channel and strips the mention from the user text. A bare `@bot`
+  with no other content binds the channel and posts a one-line
+  greeting without starting a turn. `/interrupt` publishes an
+  `Interrupt` event for that channel's thread.
+- channel→thread mappings persist across restarts. Each per-channel
+  thread is stored under the title `discord:<channelId>`; on
+  startup the adapter scans the store, repopulates `channelThreads`,
+  and asks the runtime to re-adopt each runner (`Runtime.adoptRoot
+  Thread`). Non-mention follow-ups in a previously-bound channel
+  keep working after a bounce.
+- outbound rendering uses **live message editing** for streaming
+  channels: the first delta posts a placeholder; subsequent deltas
+  edit it (throttled to ~750ms) until it hits a 1900-char soft cap,
+  at which point the message is finalised and a continuation opens.
+  Channel switches (e.g. preamble → reply, or reasoning → reply)
+  close the current live message before the next stream starts.
+- reasoning-echo handling: the model often emits its reasoning
+  summary as preflight text prefixed with `[reasoning]` because
+  pruning projects past reasoning back as `[reasoning] X` assistant
+  content and the model parrots that pattern. At sampling flush we
+  detect the prefix on a still-open live message and re-edit it
+  with the gray `> …` quote-block reasoning rendering (marker stripped), so
+  the user sees one gray block per reasoning instead of black + gray.
+- discrete events: `tool_call` posts a `-# 🔧 <name> <arg>` status
+  line; the matching successful `tool_result` edits that line in
+  place to `-# ✓ …`, while a failure posts a separate `-# ✗ tool
+  failed: …` line. `wait` and `session` calls (and `running`
+  results) stay hidden. `subtask_complete` lands as a Discord embed
+  (↩️). `interrupt` posts a `-# ⏸️ interrupt …` line.
+  `compaction_event` posts a one-line summary. `turn_complete` is
+  silent for completed turns and posts `-# turn <status> — …` for
+  non-completed ones.
+- the persisted `reply` / `preamble` / `reasoning` events dedupe
+  against the streamed buffer on any channel; mismatches (provider
+  didn't stream, or parser reclassified mid-stream) post a fresh
+  fallback. Persisted reply/preamble whose text starts with
+  `[reasoning]` is also routed to the gray reasoning render.
+- the discord.js client lives behind a `DiscordTransport` interface
+  so unit tests inject a fake (no real login). The real transport
+  lazy-imports `discord.js` so the module loads without the package
+  available.
+
+Wired at `--adapter discord` (or `HARNESS_ADAPTER=discord`) with
+`DISCORD_BOT_TOKEN`. `DISCORD_CHANNEL_ID` is optional; unset means
+dynamic per-channel sessions.
+
+## Future: Telegram / HTTP
+
+Sketches, not implemented:
+
 - **Telegram**: per-chat binding. Typing indicator driven by turn state.
 - **HTTP / webhook**: one-shot turns; the HTTP handler synthesises
   `UserTurnStart`, `await`s `TurnComplete`, returns the summary.

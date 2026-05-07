@@ -13,6 +13,8 @@ import { GoogleSearchBackend } from '@harness/search/googleSearch.js';
 import { TavilySearchBackend } from '@harness/search/tavilySearch.js';
 import type { SearchBackend } from '@harness/search/types.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
+import { DiscordAdapter } from '@harness/adapters/discord.js';
+import type { Adapter, ThreadBinding } from '@harness/adapters/adapter.js';
 import {
   JsonlDiagSink,
   StderrDiagSink,
@@ -31,6 +33,7 @@ async function main(): Promise<void> {
       'base-url': { type: 'string' },
       system: { type: 'string' },
       'store-root': { type: 'string' },
+      adapter: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
     allowPositionals: true,
@@ -77,15 +80,57 @@ async function main(): Promise<void> {
     ...(useSubagentCompactor ? { useSubagentCompactor: true } : {}),
   });
 
-  const adapter = new TerminalAdapter({ store: runtime.store });
+  const adapterName =
+    typeof values.adapter === 'string'
+      ? values.adapter
+      : (process.env['HARNESS_ADAPTER'] ?? 'terminal');
+
+  let adapter: Adapter;
+  let threadBinding: ThreadBinding;
+  if (adapterName === 'discord') {
+    const token = process.env['DISCORD_BOT_TOKEN'];
+    const channelId = process.env['DISCORD_CHANNEL_ID'];
+    if (!token) {
+      throw new Error('DiscordAdapter requires DISCORD_BOT_TOKEN env var');
+    }
+    adapter = new DiscordAdapter({
+      store: runtime.store,
+      token,
+      ...(channelId ? { channelId } : {}),
+    });
+    if (channelId) {
+      threadBinding = { kind: 'single', threadId: runtime.rootThreadId };
+    } else {
+      threadBinding = {
+        kind: 'per-channel',
+        resolve: async (externalChannelId) => {
+          const title = `discord:${externalChannelId}`;
+          const existing = (await runtime.store.listThreads()).find(
+            (t) => t.title === title,
+          );
+          if (existing) {
+            await runtime.adoptRootThread(existing.id);
+            return existing.id;
+          }
+          return runtime.createRootThread({ title });
+        },
+      };
+    }
+  } else if (adapterName === 'terminal') {
+    adapter = new TerminalAdapter({ store: runtime.store });
+    threadBinding = { kind: 'single', threadId: runtime.rootThreadId };
+  } else {
+    throw new Error(`unknown adapter: ${adapterName}`);
+  }
+
   await adapter.start({
     bus: runtime.bus,
     streamBus: runtime.streamBus,
-    threadBinding: { kind: 'single', threadId: runtime.rootThreadId },
+    threadBinding,
   });
 
   process.stdout.write(
-    `harness started. provider=${provider.id} thread=${runtime.rootThreadId}. Type your message, /exit to quit.\n`,
+    `harness started. provider=${provider.id} adapter=${adapter.id} thread=${runtime.rootThreadId}.\n`,
   );
 }
 
@@ -258,7 +303,7 @@ function buildMicroCompactOptions():
 function printUsage(): void {
   process.stdout.write(
     [
-      'Usage: harness [--provider openai] [--model <id>] [--base-url <url>] [--system <prompt>] [--store-root <dir>]',
+      'Usage: harness [--provider openai] [--model <id>] [--base-url <url>] [--system <prompt>] [--store-root <dir>] [--adapter terminal|discord]',
       '',
       'Environment (also loaded from .env):',
       '  OPENAI_API_KEY       required',
@@ -291,6 +336,9 @@ function printUsage(): void {
       '  TAVILY_API_KEY            enable Tavily search backend',
       '  TAVILY_SEARCH_DEPTH       basic | advanced (default basic)',
       '  TAVILY_INCLUDE_ANSWER     1 to request a synthesized one-line answer',
+      '  HARNESS_ADAPTER           terminal (default) | discord',
+      '  DISCORD_BOT_TOKEN         required when --adapter discord',
+      '  DISCORD_CHANNEL_ID        optional; if unset, @bot binds each channel to its own session',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',

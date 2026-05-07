@@ -8,7 +8,8 @@ import {
   type CompactionTriggerOptions,
 } from '@harness/context/compactionTrigger.js';
 import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
-import type { ThreadId } from '@harness/core/ids.js';
+import { newThreadId, type ThreadId } from '@harness/core/ids.js';
+import { newRootTraceparent } from '@harness/core/traceparent.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
@@ -98,23 +99,41 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
       : {}),
   });
 
-  const runner = new AgentRunner({
-    threadId: opts.threadId,
-    bus,
-    streamBus,
-    store,
-    registry,
-    executor,
-    provider: opts.provider,
-    systemPrompt: opts.systemPrompt,
-    memory,
-    ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
-    ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
-    ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
-    ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
-    ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
-    onSpawn: (req) => subagents.spawn(req),
-  });
+  const rootRunners = new Map<ThreadId, AgentRunner>();
+  const buildRootRunner = (threadId: ThreadId): AgentRunner => {
+    const runner = new AgentRunner({
+      threadId,
+      bus,
+      streamBus,
+      store,
+      registry,
+      executor,
+      provider: opts.provider,
+      systemPrompt: opts.systemPrompt,
+      memory,
+      ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
+      ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
+      ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
+      ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
+      ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
+      onSpawn: (req) => subagents.spawn(req),
+    });
+    rootRunners.set(threadId, runner);
+    return runner;
+  };
+  const startRootRunner = (threadId: ThreadId): AgentRunner => {
+    const runner = buildRootRunner(threadId);
+    runner.start();
+    return runner;
+  };
+  const adoptRootThread = async (threadId: ThreadId): Promise<void> => {
+    if (rootRunners.has(threadId)) return;
+    const runner = buildRootRunner(threadId);
+    await runner.hydrateFromStore();
+    runner.start();
+  };
+
+  const runner = buildRootRunner(opts.threadId);
   await runner.hydrateFromStore();
   runner.start();
 
@@ -135,6 +154,17 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     subagents,
     rootThreadId: opts.threadId,
     runner,
+    createRootThread: async (input) => {
+      const threadId = newThreadId();
+      await store.createThread({
+        id: threadId,
+        rootTraceparent: newRootTraceparent(),
+        ...(input?.title !== undefined ? { title: input.title } : {}),
+      });
+      startRootRunner(threadId);
+      return threadId;
+    },
+    adoptRootThread,
     ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(diag !== undefined ? { diag } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),

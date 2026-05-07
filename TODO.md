@@ -232,8 +232,42 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
   `whenShutdown()`), and `interrupt` events are rendered inline so
   the unwind window has visible feedback. Multi-thread binding is
   the remaining item.
-- ⚪ **DiscordAdapter / TelegramAdapter / HTTPAdapter**. Interface and
-  docs exist; no implementations.
+- 🟢 **DiscordAdapter** — fixed-channel or per-channel binding. With
+  `DISCORD_CHANNEL_ID`, one designated channel maps to the root
+  thread. Without it, the first `@bot` message in each channel
+  creates and binds a separate root thread/session; later messages
+  in that channel continue the same session. A bare `@bot` with no
+  text still binds the channel and posts a one-line greeting. Bot
+  authors and unbound non-mention messages are dropped. Channel →
+  thread mappings persist across restarts via the
+  `discord:<channelId>` thread title — the adapter scans the store
+  on start and re-adopts each runner (`Runtime.adoptRootThread`).
+  Outbound: `text_delta` streams as live message edits (throttled
+  ~750ms) until the 1900-char soft cap, then opens a continuation;
+  `reasoning_delta` is suppressed in favor of the persisted
+  reasoning event. Reasoning-echo content (model emitting
+  `[reasoning] X` as preamble because of `pruning.ts` projection)
+  is reclassified at flush time to the gray `> …` quote-block
+  rendering with the marker stripped, so it shows once. Discrete
+  events: `tool_call` posts `-# 🔧 …` and the matching successful
+  `tool_result` edits it in place to `-# ✓ …`; failures post a
+  separate `-# ✗` line; `wait`/`session` and `running` results stay
+  hidden. `subtask_complete` is a Discord embed (↩️). `interrupt`
+  posts `-# ⏸️ …`. `compaction_event` posts a one-line summary.
+  `turn_complete` is silent for completed turns. Persisted
+  reply/preamble/reasoning dedupe against the streamed buffer on
+  any channel; mismatches post a fresh fallback. Real client lives
+  behind a `DiscordTransport` interface so unit tests inject a
+  fake without `discord.js`. CLI: `--adapter discord` +
+  `DISCORD_BOT_TOKEN`; `DISCORD_CHANNEL_ID` optional. Missing:
+  - ⚪ Operator ACL (private-server v1 assumes the bound channel is
+    trusted).
+  - ⚪ Slash-command surface beyond plain `/interrupt` text.
+  - ⚪ Pruning-side fix to stop projecting `[reasoning] X` as plain
+    assistant text when encrypted `provider_state` already
+    round-trips reasoning (the discord reclassification is a
+    band-aid for the real cause).
+- ⚪ **TelegramAdapter / HTTPAdapter**.
 - ⚪ Multi-adapter bootstrap (one runtime, N adapters).
 
 ## Diagnostics
