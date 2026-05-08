@@ -93,10 +93,12 @@ async function main(): Promise<void> {
     if (!token) {
       throw new Error('DiscordAdapter requires DISCORD_BOT_TOKEN env var');
     }
+    const devGuildId = process.env['DISCORD_DEV_GUILD_ID'];
     adapter = new DiscordAdapter({
       store: runtime.store,
       token,
       ...(channelId ? { channelId } : {}),
+      ...(devGuildId ? { devGuildId } : {}),
     });
     if (channelId) {
       threadBinding = { kind: 'single', threadId: runtime.rootThreadId };
@@ -127,6 +129,10 @@ async function main(): Promise<void> {
     bus: runtime.bus,
     streamBus: runtime.streamBus,
     threadBinding,
+    router: {
+      createThread: (input) => runtime.createRootThread(input),
+      adoptThread: (threadId) => runtime.adoptRootThread(threadId),
+    },
   });
 
   process.stdout.write(
@@ -339,10 +345,14 @@ function printUsage(): void {
       '  HARNESS_ADAPTER           terminal (default) | discord',
       '  DISCORD_BOT_TOKEN         required when --adapter discord',
       '  DISCORD_CHANNEL_ID        optional; if unset, @bot binds each channel to its own session',
+      '  DISCORD_DEV_GUILD_ID      optional; register slash commands to this guild for instant propagation',
       '',
       'Interactive commands:',
       '  /exit, /quit         leave the REPL',
       '  /interrupt           cancel the running turn',
+      '  /status              show current thread + recent threads',
+      '  /new                 start a fresh thread (auto-interrupts active turn)',
+      '  /resume <idx|prefix> switch to an existing thread (use /status to list)',
       '',
     ].join('\n'),
   );

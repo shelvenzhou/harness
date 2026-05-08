@@ -1,18 +1,68 @@
 import { newEventId } from '@harness/core/ids.js';
 import type { EventBus } from '@harness/bus/eventBus.js';
-import type { StreamEvent, StreamSubscription } from '@harness/bus/streamBus.js';
+import type { StreamBus, StreamEvent, StreamSubscription } from '@harness/bus/streamBus.js';
 import type { ThreadId } from '@harness/core/ids.js';
 import type { HarnessEvent } from '@harness/core/events.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
-import type { Adapter, AdapterStartOptions, ThreadBinding } from './adapter.js';
+import type {
+  Adapter,
+  AdapterStartOptions,
+  SessionRouter,
+  ThreadBinding,
+} from './adapter.js';
 import {
   RealDiscordTransport,
   type DiscordEmbed,
+  type DiscordIncomingAutocomplete,
+  type DiscordIncomingInteraction,
   type DiscordIncomingMessage,
   type DiscordMessageRef,
   type DiscordTransport,
 } from './discordTransport.js';
+import {
+  attachPreviews,
+  parseSessionCommand,
+  recentThreads,
+  resolveThreadRef,
+  shortId,
+  type ListedThread,
+  type SessionCommand,
+} from './sessionCommands.js';
+
+/** How many recent threads /status surfaces (and /resume <idx> indexes into). */
+const RECENT_LIMIT = 10;
+/** Title prefix used to mark per-channel threads that have been retired by /new or /resume. */
+const ARCHIVED_TITLE_PREFIX = 'discord:archived:';
+
+/**
+ * Sink that consumes a slash-command response line. The message-text
+ * path uses one that posts each line as a `-#` channel message; the
+ * slash-interaction path uses one that buffers lines and emits them as
+ * a single `interaction.editReply()` at the end. Keeping the surface
+ * an async function (vs an array sink) means status output — which
+ * arrives as a single multi-line block — also flows through cleanly.
+ */
+type Responder = (text: string) => Promise<void>;
+
+/** Names registered as native Discord slash commands by this adapter. */
+const SLASH_COMMAND_SPECS = [
+  { name: 'status', description: 'Show current thread + recent threads' },
+  { name: 'new', description: 'Start a fresh thread (auto-interrupts active turn)' },
+  {
+    name: 'resume',
+    description: 'Switch to an existing thread by index or id-prefix',
+    // Autocomplete-driven: users typing `/resume ` get a dropdown of
+    // recent threads with title + preview, no need to /status first.
+    option: {
+      name: 'target',
+      description: 'Pick a recent thread (or type an id prefix)',
+      required: false,
+      autocomplete: true,
+    },
+  },
+  { name: 'interrupt', description: 'Cancel the running turn' },
+] as const;
 
 /**
  * DiscordAdapter — Discord channel/thread bridge.
@@ -63,6 +113,7 @@ interface DiscordThreadState {
   toolCallRefs: Map<string, { ref: DiscordMessageRef; rendered: string }>;
 }
 
+
 /** Title prefix used to persist Discord channel → thread mappings. */
 export const DISCORD_THREAD_TITLE_PREFIX = 'discord:';
 
@@ -75,6 +126,12 @@ export interface DiscordAdapterOptions {
   channelId?: string;
   /** Edit-throttle interval in ms. Default 750. */
   editIntervalMs?: number;
+  /**
+   * Optional dev guild id. When set, slash commands register as
+   * guild-scoped (instant propagation in that guild). Omit to register
+   * globally (Discord may take up to an hour to surface them).
+   */
+  devGuildId?: string;
 }
 
 export class DiscordAdapter implements Adapter {
@@ -84,11 +141,16 @@ export class DiscordAdapter implements Adapter {
   private readonly transport: DiscordTransport;
   private readonly configuredChannelId: string | undefined;
   private readonly editIntervalMs: number;
+  private readonly devGuildId: string | undefined;
 
-  private bus?: EventBus;
-  private threadBinding?: ThreadBinding;
-  private subscription?: { unsubscribe(): void };
-  private streamSubscription?: StreamSubscription;
+  private bus: EventBus | undefined;
+  private streamBus: StreamBus | undefined;
+  private router: SessionRouter | undefined;
+  private threadBinding: ThreadBinding | undefined;
+  private subscription: { unsubscribe(): void } | undefined;
+  private streamSubscription: StreamSubscription | undefined;
+  /** Per-channel /status listings, used by /resume <idx>. */
+  private readonly channelLastListed = new Map<string, ListedThread[]>();
   /** Serializes all Discord writes so streamed edits and bus events cannot interleave. */
   private outputTail: Promise<void> = Promise.resolve();
   private readonly channelThreads = new Map<string, ThreadId>();
@@ -102,6 +164,7 @@ export class DiscordAdapter implements Adapter {
     this.store = opts.store;
     this.configuredChannelId = opts.channelId;
     this.editIntervalMs = opts.editIntervalMs ?? DEFAULT_EDIT_INTERVAL_MS;
+    this.devGuildId = opts.devGuildId;
     if (opts.transport) {
       this.transport = opts.transport;
     } else {
@@ -121,6 +184,8 @@ export class DiscordAdapter implements Adapter {
 
   async start(opts: AdapterStartOptions): Promise<void> {
     this.bus = opts.bus;
+    this.streamBus = opts.streamBus;
+    this.router = opts.router;
     this.threadBinding = opts.threadBinding;
     if (opts.threadBinding.kind === 'single' && this.configuredChannelId) {
       this.bindChannel(this.configuredChannelId, opts.threadBinding.threadId);
@@ -152,34 +217,16 @@ export class DiscordAdapter implements Adapter {
       }
     }
 
-    this.subscription = opts.bus.subscribe((ev) => this.enqueueOutput(() => this.handleBusEvent(ev)), {
-      ...(opts.threadBinding.kind === 'single' ? { threadId: opts.threadBinding.threadId } : {}),
-      kinds: [
-        'reply',
-        'preamble',
-        'reasoning',
-        'tool_call',
-        'tool_result',
-        'subtask_complete',
-        'turn_complete',
-        'compaction_event',
-        'interrupt',
-      ],
-    });
-
-    if (opts.streamBus) {
-      this.streamSubscription = opts.streamBus.subscribe(
-        (ev) => {
-          void this.enqueueOutput(() => this.handleStreamEvent(ev));
-        },
-        opts.threadBinding.kind === 'single' ? { threadId: opts.threadBinding.threadId } : {},
-      );
-    }
+    this.attachSubscriptions();
 
     await this.transport.start({
       onMessage: (msg) => {
         void this.onIncoming(msg);
       },
+      slashCommands: SLASH_COMMAND_SPECS.map((s) => ({ ...s })),
+      ...(this.devGuildId !== undefined ? { devGuildId: this.devGuildId } : {}),
+      onInteraction: (it) => this.onSlashInteraction(it),
+      onAutocomplete: (req) => this.onAutocomplete(req),
     });
   }
 
@@ -234,6 +281,14 @@ export class DiscordAdapter implements Adapter {
       return;
     }
 
+    const cmd = parseSessionCommand(text);
+    if (cmd) {
+      await this.handleSessionCommand(cmd, msg.channelId, threadId, state, (text) =>
+        this.safeSendNotice(msg.channelId, text),
+      );
+      return;
+    }
+
     if (state.turnActive) {
       await this.publishUserInput(threadId, text);
     } else {
@@ -241,6 +296,123 @@ export class DiscordAdapter implements Adapter {
       await this.publishUserTurnStart(threadId, text);
       await this.safeStartTyping(msg.channelId);
     }
+  }
+
+  /**
+   * Discord-side autocomplete: user typing into `/resume target:`
+   * gets a dropdown of recent threads with index, title, and preview
+   * of the first user prompt. Selecting a choice returns its `value`
+   * (the thread id) to the bot, which then runs the same /resume
+   * resolution path as text/typed-arg invocations.
+   */
+  private async onAutocomplete(req: DiscordIncomingAutocomplete): Promise<void> {
+    if (req.name !== 'resume') {
+      await req.respond([]);
+      return;
+    }
+    const recent = await attachPreviews(
+      this.store,
+      recentThreads(await this.store.listThreads(), RECENT_LIMIT),
+    );
+    // Cache so a follow-up /resume <idx> on the same channel resolves
+    // against the same indices the user just saw.
+    this.channelLastListed.set(req.channelId, recent);
+    const q = req.query.toLowerCase().trim();
+    const matches = recent
+      .map((t, i) => ({ t, idx: i + 1 }))
+      .filter(({ t, idx }) => {
+        if (q.length === 0) return true;
+        return (
+          t.threadId.toLowerCase().includes(q) ||
+          t.title?.toLowerCase().includes(q) ||
+          t.preview?.toLowerCase().includes(q) ||
+          String(idx) === q
+        );
+      });
+    const now = Date.now();
+    const choices = matches.map(({ t, idx }) => {
+      const age = formatAgeShort(now - Date.parse(t.updatedAt));
+      // Prefer the user's first prompt over the thread title — for
+      // per-channel threads the title is just `discord:<channelId>`
+      // and offers no signal to the user. Falls back to title for
+      // threads with no user message yet.
+      const summary = t.preview ?? t.title ?? '(empty)';
+      const label = truncateTo(`${idx}. ${summary}`, 90);
+      return { name: `${label} · ${age}`.slice(0, 100), value: t.threadId };
+    });
+    await req.respond(choices);
+  }
+
+  /**
+   * Native slash-command entrypoint. Bot ignores its own interactions
+   * (impossible in practice but defensive). Status / new / resume go
+   * through `handleSessionCommand` with a responder that buffers the
+   * notice text and emits one combined `interaction.respond()` call —
+   * Discord interactions only support a single primary reply, so
+   * multiple notices fired by /new (e.g. interrupt notice + switch
+   * confirmation) are joined with newlines into one ephemeral reply.
+   *
+   * /interrupt is forwarded to the existing publish path.
+   */
+  private async onSlashInteraction(it: DiscordIncomingInteraction): Promise<void> {
+    if (it.userIsBot) return;
+    if (this.configuredChannelId && it.channelId !== this.configuredChannelId) {
+      await it.respond('this bot is bound to a different channel', { ephemeral: true });
+      return;
+    }
+
+    if (it.name === 'interrupt') {
+      const bound = this.channelThreads.get(it.channelId);
+      if (!bound) {
+        await it.respond('no active thread in this channel', { ephemeral: true });
+        return;
+      }
+      await this.publishInterrupt(bound, 'user requested interrupt');
+      await it.respond('⏸️ interrupt sent', { ephemeral: true });
+      return;
+    }
+
+    const cmdLine =
+      it.name === 'resume'
+        ? `/resume${it.options.target ? ` ${it.options.target}` : ''}`
+        : `/${it.name}`;
+    const cmd = parseSessionCommand(cmdLine);
+    if (!cmd) {
+      await it.respond(`unknown command /${it.name}`, { ephemeral: true });
+      return;
+    }
+
+    // Slash commands implicitly bind the channel (per-channel mode):
+    // running /new in an unbound channel should be a perfectly fine
+    // way to start a session, so we resolve a thread the same way an
+    // @bot mention would.
+    const boundThreadId = this.channelThreads.get(it.channelId);
+    let threadId: ThreadId;
+    if (boundThreadId) {
+      threadId = boundThreadId;
+    } else {
+      try {
+        threadId = await this.resolveThreadForChannel(it.channelId);
+      } catch {
+        await it.respond('this channel is not bound to a thread', { ephemeral: true });
+        return;
+      }
+    }
+    const state = this.stateFor(threadId);
+
+    const collected: string[] = [];
+    const responder: Responder = async (text) => {
+      collected.push(text);
+    };
+    try {
+      await this.handleSessionCommand(cmd, it.channelId, threadId, state, responder);
+    } catch {
+      await it.respond('command failed', { ephemeral: true });
+      return;
+    }
+    await it.respond(collected.length > 0 ? collected.join('\n\n') : '✓', {
+      ephemeral: true,
+    });
   }
 
   private async resolveThreadForChannel(channelId: string): Promise<ThreadId> {
@@ -319,6 +491,247 @@ export class DiscordAdapter implements Adapter {
       await this.transport.startTyping(channelId);
     } catch {
       // Typing indicator is cosmetic — never fail a turn over it.
+    }
+  }
+
+  // ─── session commands (/status, /new, /resume) ────────────────────────────
+
+  private attachSubscriptions(): void {
+    if (!this.bus || !this.threadBinding) return;
+    const binding = this.threadBinding;
+    this.subscription = this.bus.subscribe(
+      (ev) => this.enqueueOutput(() => this.handleBusEvent(ev)),
+      {
+        ...(binding.kind === 'single' ? { threadId: binding.threadId } : {}),
+        kinds: [
+          'reply',
+          'preamble',
+          'reasoning',
+          'tool_call',
+          'tool_result',
+          'subtask_complete',
+          'turn_complete',
+          'compaction_event',
+          'interrupt',
+        ],
+      },
+    );
+
+    if (this.streamBus) {
+      this.streamSubscription = this.streamBus.subscribe(
+        (ev) => {
+          void this.enqueueOutput(() => this.handleStreamEvent(ev));
+        },
+        binding.kind === 'single' ? { threadId: binding.threadId } : {},
+      );
+    }
+  }
+
+  private async handleSessionCommand(
+    cmd: SessionCommand,
+    channelId: string,
+    threadId: ThreadId,
+    state: DiscordThreadState,
+    respond: Responder,
+  ): Promise<void> {
+    if (cmd.kind === 'status') {
+      await this.renderStatusForChannel(channelId, threadId, state.turnActive, respond);
+      return;
+    }
+    if (cmd.kind === 'new') {
+      if (!this.router) {
+        await respond('/new requires a session router (not wired)');
+        return;
+      }
+      await this.maybeAutoInterrupt(threadId, state, respond);
+      await this.switchChannelToNewThread(channelId, threadId, respond);
+      return;
+    }
+    if (cmd.kind === 'resume') {
+      if (!this.router) {
+        await respond('/resume requires a session router (not wired)');
+        return;
+      }
+      // Bare `/resume` returns a listing rather than an error so the
+      // user can pick without running /status first. With an arg we
+      // honour the cached listing if present (so the indices the user
+      // saw still apply) and fall back to a fresh scan otherwise.
+      if (cmd.arg === undefined) {
+        await this.renderStatusForChannel(channelId, threadId, state.turnActive, respond);
+        await respond('select with /resume <index> or /resume <id-prefix>');
+        return;
+      }
+      let listed = this.channelLastListed.get(channelId) ?? [];
+      if (listed.length === 0) {
+        listed = recentThreads(await this.store.listThreads(), RECENT_LIMIT);
+      }
+      const resolved = resolveThreadRef(listed, cmd.arg);
+      if (!resolved.ok) {
+        await respond(resolved.message);
+        return;
+      }
+      if (resolved.threadId === threadId) {
+        await respond(`already on ${shortId(resolved.threadId)}`);
+        return;
+      }
+      await this.maybeAutoInterrupt(threadId, state, respond);
+      await this.switchChannelToExistingThread(channelId, threadId, resolved.threadId, respond);
+      return;
+    }
+  }
+
+  private async renderStatusForChannel(
+    channelId: string,
+    threadId: ThreadId,
+    turnActive: boolean,
+    respond: Responder,
+  ): Promise<void> {
+    const threads = await this.store.listThreads();
+    const recent = await attachPreviews(this.store, recentThreads(threads, RECENT_LIMIT));
+    this.channelLastListed.set(channelId, recent);
+    const current = threads.find((t) => t.id === threadId);
+    const lines: string[] = [];
+    const titleSuffix = current?.title ? ` "${current.title}"` : '';
+    const turnLabel = turnActive ? 'turn: running' : 'turn: idle';
+    lines.push(`📍 current: \`${shortId(threadId)}\`${titleSuffix} — ${turnLabel}`);
+    if (recent.length === 0) {
+      lines.push('recent: (none)');
+    } else {
+      lines.push('recent:');
+      recent.forEach((t, i) => {
+        const idx = i + 1;
+        const marker = t.threadId === threadId ? ' ← current' : '';
+        const title = t.title ? ` "${t.title}"` : '';
+        lines.push(`  ${idx}. \`${shortId(t.threadId)}\`${title}${marker}`);
+        if (t.preview) lines.push(`       › ${t.preview}`);
+      });
+      lines.push('/resume <index|id-prefix> to switch · /new for a fresh thread');
+    }
+    await respond(lines.join('\n'));
+  }
+
+  /**
+   * single-mode switch: configured channel rebinds to a brand-new thread.
+   * per-channel switch: archive the old thread's title (so the startup scan
+   * stops mapping the channel to it) and create a new thread that inherits
+   * `discord:<channelId>`.
+   */
+  private async switchChannelToNewThread(
+    channelId: string,
+    oldThreadId: ThreadId,
+    respond: Responder,
+  ): Promise<void> {
+    if (!this.router || !this.threadBinding) return;
+    const binding = this.threadBinding;
+    if (binding.kind === 'per-channel') {
+      await this.archiveOldChannelThread(channelId, oldThreadId);
+      const newId = await this.router.createThread({
+        title: `${DISCORD_THREAD_TITLE_PREFIX}${channelId}`,
+      });
+      this.bindChannel(channelId, newId);
+      this.resetThreadState(oldThreadId);
+      await respond(`switched to new thread \`${shortId(newId)}\``);
+    } else {
+      // single mode: re-subscribe with the new threadId.
+      const newId = await this.router.createThread();
+      this.subscription?.unsubscribe();
+      this.streamSubscription?.unsubscribe();
+      this.subscription = undefined;
+      this.streamSubscription = undefined;
+      this.threadBinding = { kind: 'single', threadId: newId };
+      this.bindChannel(channelId, newId);
+      this.resetThreadState(oldThreadId);
+      this.attachSubscriptions();
+      await respond(`switched to new thread \`${shortId(newId)}\``);
+    }
+  }
+
+  private async switchChannelToExistingThread(
+    channelId: string,
+    oldThreadId: ThreadId,
+    targetThreadId: ThreadId,
+    respond: Responder,
+  ): Promise<void> {
+    if (!this.router || !this.threadBinding) return;
+    const binding = this.threadBinding;
+    await this.router.adoptThread(targetThreadId);
+    if (binding.kind === 'per-channel') {
+      await this.archiveOldChannelThread(channelId, oldThreadId);
+      // Hand the discord:<channelId> title to the target so the next
+      // restart's startup scan rebinds the channel to it.
+      try {
+        await this.store.updateThread(targetThreadId, {
+          title: `${DISCORD_THREAD_TITLE_PREFIX}${channelId}`,
+        });
+      } catch {
+        // updateThread can fail if the thread vanished underneath us;
+        // the bind below still works for the live process.
+      }
+      this.bindChannel(channelId, targetThreadId);
+      this.resetThreadState(oldThreadId);
+      await respond(`resumed thread \`${shortId(targetThreadId)}\``);
+    } else {
+      this.subscription?.unsubscribe();
+      this.streamSubscription?.unsubscribe();
+      this.subscription = undefined;
+      this.streamSubscription = undefined;
+      this.threadBinding = { kind: 'single', threadId: targetThreadId };
+      this.bindChannel(channelId, targetThreadId);
+      this.resetThreadState(oldThreadId);
+      this.attachSubscriptions();
+      await respond(`resumed thread \`${shortId(targetThreadId)}\``);
+    }
+  }
+
+  private async archiveOldChannelThread(
+    channelId: string,
+    oldThreadId: ThreadId,
+  ): Promise<void> {
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      await this.store.updateThread(oldThreadId, {
+        title: `${ARCHIVED_TITLE_PREFIX}${channelId}:${stamp}`,
+      });
+    } catch {
+      // If the rename fails, the new thread still claims discord:<channelId>;
+      // worst case the startup scan finds two and the later one wins.
+    }
+    this.threadChannels.delete(oldThreadId);
+  }
+
+  private resetThreadState(threadId: ThreadId): void {
+    const state = this.states.get(threadId);
+    if (!state) return;
+    if (state.live?.pendingTimer) clearTimeout(state.live.pendingTimer);
+    state.live = undefined;
+    state.streamed = { reply: '', preamble: '', reasoning: '' };
+    state.flushed = false;
+    state.toolCallRefs.clear();
+    state.turnActive = false;
+  }
+
+  private async maybeAutoInterrupt(
+    threadId: ThreadId,
+    state: DiscordThreadState,
+    respond: Responder,
+  ): Promise<void> {
+    if (!state.turnActive) return;
+    await this.publishInterrupt(threadId, 'session switch');
+    await respond('interrupting current turn before switching');
+  }
+
+  private async safeSendNotice(channelId: string, text: string): Promise<void> {
+    // Discord subtext (`-#`) only applies to the line it's on, so a
+    // multi-line notice (e.g. /status output) needs the prefix per
+    // line. Single-line notices behave the same as before.
+    const prefixed = text
+      .split('\n')
+      .map((l) => `-# ${l}`)
+      .join('\n');
+    try {
+      await this.transport.sendText(channelId, prefixed);
+    } catch {
+      // Notice is cosmetic — never crash on transport failure.
     }
   }
 
@@ -805,4 +1218,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function shortenId(id: string): string {
   return id.length > 12 ? id.slice(0, 8) + '…' + id.slice(-3) : id;
+}
+
+function formatAgeShort(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return 'now';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h`;
+  return `${Math.floor(hr / 24)}d`;
+}
+
+function truncateTo(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
 }

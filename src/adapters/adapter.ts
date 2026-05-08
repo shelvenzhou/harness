@@ -17,6 +17,18 @@ export type ThreadBinding =
       resolve: (externalChannelId: string) => ThreadId | Promise<ThreadId>;
     };
 
+/**
+ * Hooks the adapter calls when handling /new and /resume. The runtime
+ * owns thread/runner lifecycle; the adapter just asks for "create one"
+ * or "make sure this one has a runner attached" and then re-binds its
+ * subscriptions. Without a router, the session-switching commands
+ * surface a "not supported" notice instead of silently breaking.
+ */
+export interface SessionRouter {
+  createThread(input?: { title?: string }): Promise<ThreadId>;
+  adoptThread(threadId: ThreadId): Promise<void>;
+}
+
 export interface AdapterStartOptions {
   bus: EventBus;
   /**
@@ -27,6 +39,8 @@ export interface AdapterStartOptions {
    */
   streamBus?: StreamBus;
   threadBinding: ThreadBinding;
+  /** Optional. Required for /new and /resume to function. */
+  router?: SessionRouter;
 }
 
 export interface Adapter {

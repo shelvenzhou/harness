@@ -2,12 +2,23 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 
 import { newEventId } from '@harness/core/ids.js';
 import type { EventBus } from '@harness/bus/eventBus.js';
-import type { StreamEvent, StreamSubscription } from '@harness/bus/streamBus.js';
+import type { StreamBus, StreamEvent, StreamSubscription } from '@harness/bus/streamBus.js';
 import type { ThreadId } from '@harness/core/ids.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
-import type { Adapter, AdapterStartOptions } from './adapter.js';
+import type { Adapter, AdapterStartOptions, SessionRouter } from './adapter.js';
 import { RawLineReader } from './rawLineReader.js';
+import {
+  attachPreviews,
+  formatStatus,
+  parseSessionCommand,
+  recentThreads,
+  resolveThreadRef,
+  type ListedThread,
+} from './sessionCommands.js';
+
+/** How many recent threads /status shows (and /resume <idx> indexes into). */
+const RECENT_LIMIT = 10;
 
 /**
  * Terminal adapter — stdin/stdout REPL.
@@ -45,11 +56,19 @@ export class TerminalAdapter implements Adapter {
 
   private rl: ReadlineInterface | undefined;
   private rawReader: RawLineReader | undefined;
-  private bus?: EventBus;
-  private threadId?: ThreadId;
-  private subscription?: { unsubscribe(): void };
-  private streamSubscription?: StreamSubscription;
+  private bus: EventBus | undefined;
+  private streamBus: StreamBus | undefined;
+  private router: SessionRouter | undefined;
+  private threadId: ThreadId | undefined;
+  private subscription: { unsubscribe(): void } | undefined;
+  private streamSubscription: StreamSubscription | undefined;
   private turnActive = false;
+  /**
+   * Most recent /status listing, used by /resume <idx> to map indices
+   * to thread ids. Cleared on switch since the next /status will be a
+   * fresh scan.
+   */
+  private lastListedThreads: ListedThread[] = [];
   /**
    * Per-channel streaming state. We track the text already streamed
    * inline so the persisted reply/preamble events can be deduped (we
@@ -106,22 +125,11 @@ export class TerminalAdapter implements Adapter {
       throw new Error('TerminalAdapter only supports single thread binding in phase 1');
     }
     this.bus = opts.bus;
+    this.streamBus = opts.streamBus;
+    this.router = opts.router;
     this.threadId = opts.threadBinding.threadId;
 
-    this.subscription = opts.bus.subscribe(
-      (ev) => this.onBusEvent(ev),
-      {
-        threadId: this.threadId,
-        kinds: ['reply', 'preamble', 'reasoning', 'turn_complete', 'compaction_event', 'interrupt'],
-      },
-    );
-
-    if (opts.streamBus) {
-      this.streamSubscription = opts.streamBus.subscribe(
-        (ev) => this.onStreamEvent(ev),
-        { threadId: this.threadId },
-      );
-    }
+    this.attachSubscriptions();
 
     // SIGINT: first hit interrupts the turn, second within the window
     // shuts the adapter down. Without this the CLI shell killed the
@@ -235,6 +243,12 @@ export class TerminalAdapter implements Adapter {
       return;
     }
 
+    const cmd = parseSessionCommand(text);
+    if (cmd) {
+      await this.handleSessionCommand(cmd);
+      return;
+    }
+
     if (this.turnActive) {
       await this.publishUserInput(text);
     } else {
@@ -261,6 +275,126 @@ export class TerminalAdapter implements Adapter {
       payload: { text },
     });
     this.bus!.publish(event);
+  }
+
+  private attachSubscriptions(): void {
+    if (!this.bus || !this.threadId) return;
+    this.subscription = this.bus.subscribe((ev) => this.onBusEvent(ev), {
+      threadId: this.threadId,
+      kinds: ['reply', 'preamble', 'reasoning', 'turn_complete', 'compaction_event', 'interrupt'],
+    });
+    if (this.streamBus) {
+      this.streamSubscription = this.streamBus.subscribe(
+        (ev) => this.onStreamEvent(ev),
+        { threadId: this.threadId },
+      );
+    }
+  }
+
+  private async handleSessionCommand(
+    cmd: ReturnType<typeof parseSessionCommand>,
+  ): Promise<void> {
+    if (!cmd) return;
+    if (cmd.kind === 'status') {
+      await this.renderStatus();
+      this.writePrompt();
+      return;
+    }
+    if (cmd.kind === 'new') {
+      if (!this.router) {
+        this.writeNotice('/new requires a session router (not wired in this adapter)');
+        this.writePrompt();
+        return;
+      }
+      this.maybeAutoInterrupt();
+      const newId = await this.router.createThread();
+      this.switchToThread(newId);
+      this.writeNotice(`switched to new thread ${newId}`);
+      this.writePrompt();
+      return;
+    }
+    if (cmd.kind === 'resume') {
+      if (!this.router) {
+        this.writeNotice('/resume requires a session router (not wired in this adapter)');
+        this.writePrompt();
+        return;
+      }
+      // Bare `/resume` (no arg) renders the same listing /status uses
+      // and primes lastListedThreads — the user can then type
+      // `/resume <idx>` without running /status first. With an arg we
+      // try the cached list first so the user-visible indices stay
+      // stable, falling back to a fresh scan for id-prefix matches.
+      if (cmd.arg === undefined) {
+        await this.renderStatus();
+        this.writeNotice('select with /resume <index> or /resume <id-prefix>');
+        this.writePrompt();
+        return;
+      }
+      let listed = this.lastListedThreads;
+      if (listed.length === 0) {
+        listed = recentThreads(await this.store.listThreads(), RECENT_LIMIT);
+      }
+      const resolved = resolveThreadRef(listed, cmd.arg);
+      if (!resolved.ok) {
+        this.writeNotice(resolved.message);
+        this.writePrompt();
+        return;
+      }
+      if (resolved.threadId === this.threadId) {
+        this.writeNotice(`already on ${resolved.threadId}`);
+        this.writePrompt();
+        return;
+      }
+      this.maybeAutoInterrupt();
+      await this.router.adoptThread(resolved.threadId);
+      this.switchToThread(resolved.threadId);
+      this.writeNotice(`resumed thread ${resolved.threadId}`);
+      this.writePrompt();
+      return;
+    }
+  }
+
+  private async renderStatus(): Promise<void> {
+    if (!this.threadId) return;
+    const threads = await this.store.listThreads();
+    const recent = await attachPreviews(this.store, recentThreads(threads, RECENT_LIMIT));
+    const current = threads.find((t) => t.id === this.threadId);
+    const block = formatStatus({
+      currentThreadId: this.threadId,
+      currentTitle: current?.title,
+      turnActive: this.turnActive,
+      recent,
+    });
+    this.lastListedThreads = recent;
+    // Dimmed so /status doesn't read like assistant output.
+    this.output.write(`\x1b[2m${block}\x1b[0m\n`);
+  }
+
+  private maybeAutoInterrupt(): void {
+    if (!this.turnActive) return;
+    // Fire-and-forget: the runner unwinds asynchronously on the old
+    // thread; we don't await turn_complete because we're about to drop
+    // the subscription anyway. The old thread's tail still persists
+    // cleanly via its own runner.
+    void this.publishInterrupt();
+    this.writeNotice('interrupting current turn before switching');
+  }
+
+  private switchToThread(threadId: ThreadId): void {
+    this.subscription?.unsubscribe();
+    this.streamSubscription?.unsubscribe();
+    this.subscription = undefined;
+    this.streamSubscription = undefined;
+    this.threadId = threadId;
+    this.turnActive = false;
+    this.streamed = { reply: '', preamble: '', reasoning: '' };
+    this.openChannel = 'none';
+    this.flushed = false;
+    this.attachSubscriptions();
+  }
+
+  private writeNotice(text: string): void {
+    this.output.write(`\x1b[2m[${text}]\x1b[0m\n`);
   }
 
   private async publishInterrupt(): Promise<void> {
