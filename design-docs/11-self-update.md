@@ -87,8 +87,11 @@ composition story:
 ```
 spawn({ role: 'implementer',
         provider: 'cc',           // or 'codex'
+        cwd: '../harness-feat-tg',
         budget: { maxWallMs, maxTokens, … },
-        contextRefs: [...] })
+        contextRefs: [...],
+        providerSessionId?: 'sess_abc',   // resume cc's internal session
+        continueThreadId?: 'thr_X' })     // reopen a prior child thread
 ```
 
 The wrapper translates CLI-shaped streaming events onto
@@ -102,6 +105,66 @@ the live serving copy, so a half-finished edit can never break the
 next restart's build. Successful runs land as commits on a feature
 branch.
 
+#### R2 — Implementation contract
+
+The wrapper is degenerate: each `sample()` call corresponds to **one
+end-to-end coding-agent invocation**, not a multi-step LLM dialogue.
+The harness child runner sees one streaming response, no harness-level
+tool calls, then `turn_complete`. cc / codex's internal edit/test loop
+is opaque to the parent.
+
+`CodingAgentProvider` (new file `src/llm/codingAgentProvider.ts`):
+
+- Construction: `{ kind: 'cc' | 'codex', cwd, model?, env?, binaryPath? }`.
+  `cwd` is mandatory and is the sibling worktree for this spawn.
+- Invocation: `claude -p <task> --output-format stream-json --session-id <providerSessionId?>`
+  (or `codex exec --json …`). The "task" is the last user message of
+  `SamplingRequest.tail`; `StablePrefix.systemPrompt` rides on
+  `--system-prompt` / equivalent.
+- Stream translation:
+  - `assistant` text chunks → `text_delta(channel:'reply')`
+  - `thinking` / `reasoning` chunks → `reasoning_delta`
+  - internal `tool_use` / `tool_result` events → **dropped** (cc handles
+    them; harness has no use for them in the parent's projection)
+  - process exit (success) → `end{stopReason:'end_turn'}`
+  - quota / rate-limit terminal event → `end{stopReason:'quota_exhausted', resetAt}`
+    (see R2a)
+  - other terminal errors → `end{stopReason:'error'}`
+- `system_init` event (cc emits one at the start with its session id)
+  is captured; the provider exposes the captured `providerSessionId`
+  via a getter so the runner can attach it to `subtask_complete`.
+- Cancellation: SIGTERM the child on `signal.aborted`; SIGKILL after
+  a grace window. Mirror the group-kill pattern in the existing
+  [shell.ts](../src/tools/impl/shell.ts) tool.
+- Child harness tool registry is **empty** for spawns whose provider
+  is a coding agent. cc owns its own tools internally; exposing
+  harness `shell`/`write` would just duplicate.
+
+Per-spawn provider selection requires plumbing (none exists today —
+`SubagentPool` shares one global `provider`):
+
+- `SpawnRequestInfo` gains `provider?: string`, `cwd?: string`,
+  `providerSessionId?: string`, `continueThreadId?: ThreadId`.
+- `SubagentPoolDeps` gains `providerFactories?: Record<string, (req) => LlmProvider>`.
+  The cc/codex factory builds a one-shot `CodingAgentProvider` bound
+  to `req.cwd` + `req.providerSessionId`. The default OpenAI provider
+  stays as the fallback when `provider` is omitted.
+- `spawn` tool schema (`src/tools/impl/spawn.ts`) gets the same four
+  fields. Description spells out: "use `provider:'cc'` for coding
+  work in a sibling worktree; default (omitted) uses the harness's
+  primary provider for orchestration / review".
+- `SubtaskCompletePayload` gains `providerSessionId?: string` so the
+  parent can stash it in `memory` and pass it back on the next spawn.
+
+`continueThreadId` semantics: when set, `spawn` reopens an existing
+child thread (must already exist in the store, must not have a live
+runner) and appends a new `user_turn_start` to it instead of creating
+a new thread. This keeps the "one feature, one harness audit thread"
+invariant when iterating with the same implementer over multiple
+spawn cycles. Pool implementation deferred to milestone 2 — schema
+ships in milestone 1 so the LLM sees the stable spawn shape from day
+one.
+
 #### R2a — Usage / quota introspection
 
 Coding-agent backends meter usage independently of the OpenAI account
@@ -112,22 +175,107 @@ and the operator need to see this in-band:
 - The `LlmProvider` interface gains an optional `usage()` method
   returning `{ provider, plan?, used, remaining?, resetAt?,
   unitsLastTurn }`. Implementations that can't introspect (raw
-  OpenAI Chat) return `unsupported`.
-- `SubagentPool` / `spawn` exposes a per-child `usage` field on
-  `subtask_complete` and on the existing `usage` poll the child can
-  already make ([TODO.md](../TODO.md), `SubagentPool` section). The
-  main agent reads this to decide whether to keep delegating or
-  switch providers.
+  OpenAI Chat) return `unsupported`. The cc / codex implementation
+  reads its data from the **stream-json events themselves** —
+  `system_init` carries plan + window, ratelimit / `usage` events
+  carry running totals — so `usage()` returns the latest cached
+  snapshot without invoking a separate CLI subcommand.
+- `SubagentPool` / `spawn` exposes a per-child `providerUsage` field
+  on `subtask_complete` (the snapshot at child-exit time). The main
+  agent reads this to decide whether to keep delegating or switch
+  providers. The existing `usage` tool inside the child also
+  surfaces it for the child's own pacing decisions.
 - **Quota exhaustion mid-task** is a normal failure mode, not a
   crash. The provider surfaces it as a typed
   `SamplingDelta{ kind: 'end', stopReason: 'quota_exhausted',
-  resetAt? }`. Runner translates into `subtask_complete` with
-  `reason: 'quota_exhausted'` and the same shape `budget_*`
-  interrupts use today, so the parent can `wait({ timer, until:
-  resetAt })` and retry, fall back to a different provider, or hand
-  back to the operator for a decision. Partial work already
-  committed by the child stays committed; the parent can resume
-  with `contextRefs` pointing at the child's last reply.
+  resetAt? }`. The runner translates into `turn_complete{status:'errored',
+  reason:'quota_exhausted', resetAt}`; the pool rewrites that into
+  `subtask_complete{reason:'quota_exhausted', resetAt}`. Partial
+  work already committed by the child stays committed; the parent
+  resumes by spawning again with `providerSessionId` (cc `--resume`)
+  and the same `cwd` / `continueThreadId`.
+
+##### Quota coordination across multiple subagents
+
+Quota is a **provider-account-level global**, not a per-spawn local.
+If five cc subagents all hit the same wall they share the same
+`resetAt`. Naive design — each one schedules its own `wait(timer)` —
+duplicates timers and triggers a thundering-herd retry the moment
+the quota refreshes. The runtime collapses this into one channel:
+
+- `CodingAgentProvider` carries a `QuotaState{ resetAt?, kind: 'session'|'weekly' }`
+  keyed by provider id (effectively per-account, since cc/codex
+  authenticate at process scope). Stream events update it.
+- The `Scheduler` schedules **one** timer per `(providerId, resetAt)`.
+  When it fires, the runtime publishes
+  `external_event{ source:'provider_ready', provider:'cc', resetAt }`
+  on the bus.
+- While `resetAt > now`, any `spawn(provider:'cc')` **fails fast
+  inside the pool** without launching a CLI process: the pool
+  synthesises an immediate `subtask_complete{reason:'quota_exhausted',
+  resetAt}` to the parent. This is the load-bearing optimisation —
+  the parent can fan-out queued work freely; only the first attempt
+  pays the wall, the rest short-circuit.
+- The parent agent's wait shape is canonical:
+  ```
+  wait({ matcher:'kind', kinds:['external_event'],
+         filter:{ source:'provider_ready', provider:'cc' },
+         timeoutMs: 6h })
+  ```
+  When the event fires it re-dispatches every queued spawn (state
+  kept in `memory`, e.g. key `pending:cc-resume`).
+
+##### Weekly limits
+
+`resetAt - now ≥ 6h` (effectively the cc/codex 7-day window) is
+**not** held in-process. The playbook in `memory:playbook:self-update`
+mandates: reply on Discord with the resetAt, store outstanding state
+in `memory`, then `turn_complete`. The next operator message is the
+trigger to resume. Avoids the supervisor having to keep a 7-day timer
+alive across restarts.
+
+### R2b — Subagent context reuse (cc-session vs harness-thread)
+
+The main agent has **two orthogonal levers** for deciding whether a
+new spawn is "fresh" or "continue":
+
+| Lever | What it controls | Owned by |
+|---|---|---|
+| harness `ThreadId` reuse | Whether `subtask_complete` is observed on a *new* child thread or appended to an existing one | harness store + `SubagentPool` |
+| coding-agent `providerSessionId` reuse | Whether cc / codex starts a fresh internal conversation or `--resume`s a prior session | the CLI's own session cache |
+
+The two are independent. `providerSessionId` reuse is the dominant
+token-saver — cc has already done internal compaction, so resuming
+costs almost nothing whereas re-explaining via `task` text or large
+`contextRefs` re-pays the bill. Harness `ThreadId` reuse is mainly
+about audit shape: keep one feature's iterations as a single
+inspectable thread.
+
+Decision matrix for the playbook:
+
+| Situation | thread | cc session |
+|---|---|---|
+| First implementation attempt | new | new |
+| Address reviewer feedback on the same diff | reuse (`continueThreadId`) | resume (`providerSessionId`) |
+| Resume after `quota_exhausted` | reuse | resume |
+| Different feature in the same subsystem | new | new + `contextRefs:[designerThread]` |
+| Previous attempt went off-rails | new | new (clean slate) |
+
+Mechanism in `spawn`:
+
+- `providerSessionId?: string` — opaque token, passed through to the
+  coding-agent provider. Returned on `subtask_complete.providerSessionId`
+  (captured from cc's `system_init` event).
+- `continueThreadId?: ThreadId` — if set, `SubagentPool` reopens the
+  named child thread (must exist in the store, must have no live
+  runner) and appends a fresh `user_turn_start` instead of creating
+  a new thread. Mismatch → `SpawnRefused`.
+
+The main agent's tokens stay flat across iterations because the
+state lives outside its prompt: git holds the diff, `memory` holds
+the design + per-feature record (e.g. `feature:tg.session = sess_abc`),
+the child thread holds the implementation transcript reachable via
+`contextRefs`. The parent only carries pointers.
 
 ### R3 — Remote restart, with anti-brick safeguards
 
@@ -260,15 +408,105 @@ target repo. No OAuth dance in v1. No new tool — `gh` via `shell`.
   serving runtime. Until then, the coding-agent child has full
   shell access — same as everything else.
 
-## Phasing
+## Milestones (top-priority track)
 
-Add to [08-roadmap.md](08-roadmap.md) as a new phase between current
-Phase 3 (second adapter) and Phase 4 (sandbox):
+Self-bootstrap is now the **highest-priority** track — the harness
+should be editing itself before any other Phase-2/3 polish lands. The
+ordering below is concrete enough to PR against. Each milestone is
+shippable on its own: the harness keeps working with no regressions
+even if work pauses between them.
 
-- **Phase 3.5 — self-update**: R1 (already in Phase 3), then R2 +
-  R2a, R3, R4 in that order. R4 is optional but lands cheap once
-  R2 is in place.
+### M1 — `CodingAgentProvider` + per-spawn provider plumbing
 
-Sandbox (phase 4) is **not** a prerequisite. Self-update ships
-operator-trusted on a single host; sandboxing tightens what the
-coding-agent child can touch when it lands.
+Goal: the main agent (running on the default OpenAI provider) can
+issue one `spawn(provider:'cc', cwd:'…', task:'…')` and observe a
+`subtask_complete` carrying cc's reply.
+
+- `LlmProvider.SamplingDelta.end.stopReason` extended union (adds
+  `'quota_exhausted'`, payload optional `resetAt`). Wiring through
+  runner / `turn_complete.reason` lands here so M2 only needs to
+  populate it.
+- New `src/llm/codingAgentProvider.ts` covering cc first
+  (codex follows the same shape; deferred behind a flag).
+  Stream-json parser; SIGTERM-on-abort; `system_init` capture for
+  `providerSessionId`.
+- `SpawnRequestInfo` and `spawn` tool schema gain `provider?`,
+  `cwd?`, `providerSessionId?`, `continueThreadId?` fields.
+  Schema-only for `providerSessionId` / `continueThreadId` in M1
+  (pool ignores them); shipping the shape now keeps the LLM-facing
+  contract stable across milestones.
+- `SubagentPoolDeps.providerFactories` registry; coding-agent
+  factory builds a one-shot `CodingAgentProvider` bound to the
+  spawn's `cwd`.
+- `SubtaskCompletePayload.providerSessionId?: string` populated
+  from the captured value.
+- `bootstrap.ts` registers cc factory under env (`HARNESS_CC_BIN`,
+  `CLAUDE_API_KEY` or wherever cc reads its auth).
+- One e2e test: a minimal harness session where the main agent is
+  prompted to spawn a cc child to write "hello" to a temp file in
+  a sibling dir, then verifies the file.
+
+### M2 — quota coordination
+
+Goal: cc subagents that hit a session limit pause cleanly, the
+parent waits once, and on `provider_ready` it re-dispatches the
+queued work.
+
+- `CodingAgentProvider` recognises ratelimit / quota terminal
+  events from cc's stream-json, emits
+  `end{stopReason:'quota_exhausted', resetAt}`, updates a per-id
+  `QuotaState`.
+- `SubagentPool.spawn` short-circuits when `QuotaState.resetAt > now`
+  for the requested provider id — no CLI process, immediate
+  synthesised `subtask_complete{reason:'quota_exhausted', resetAt}`.
+- One scheduled timer per `(providerId, resetAt)`; on fire, publish
+  `external_event{source:'provider_ready', provider, resetAt}`.
+- `continueThreadId` reopen path implemented in `SubagentPool`
+  (was schema-only in M1).
+- `wait` tool already supports `kind` filtering; verify
+  `external_event` filtering is sufficient or extend lightly.
+- E2E: simulate cc quota exhaustion (fake binary), parent waits on
+  `provider_ready`, then resumes.
+
+### M3 — usage introspection
+
+Goal: parent / operator can see "how much does this cc account have
+left this window" without running CLI commands by hand.
+
+- `LlmProvider.usage()` interface added; OpenAI returns
+  `'unsupported'`; cc returns last cached snapshot.
+- `SubtaskCompletePayload.providerUsage?: UsageReport`.
+- `usage` tool output extended with optional `providerUsage` block
+  for spawned children.
+
+### M4 — operator playbook (no code changes)
+
+Goal: a real "add a Telegram adapter" demo end-to-end, driven only
+by operator messages on Discord (or terminal in dev).
+
+- Author and pin `memory:playbook:self-update` containing:
+  - decision tree for designer / implementer / reviewer (R2b
+    matrix)
+  - the R3 step-1 acceptance checklist
+  - quota / weekly-limit handling (R2a)
+  - PR opening flow (R4)
+- Demo: operator says "add a Telegram adapter"; the main agent
+  fans out designer → implementer → reviewer; PR appears on
+  GitHub; tests green.
+
+### M5 — R3 supervisor (blue/green restart)
+
+Pre-existing R3 spec in this doc. Lands after M4 because we want
+the demo loop running before we automate restart.
+
+### M6 — codex parity
+
+Re-target `CodingAgentProvider` to codex; document any contract
+divergence in this file's R2 implementation contract section.
+
+### Out of scope until later
+
+- Sandbox (phase 4) is **not** a prerequisite for any of M1–M5.
+- A second non-OpenAI primary provider for the orchestrator
+  (Anthropic streaming) — orthogonal; lands when needed for
+  cost / capability reasons unrelated to self-update.

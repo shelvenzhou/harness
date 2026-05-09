@@ -8,6 +8,107 @@ Legend: ⚪ not started · 🟡 partial · 🔴 stub (compiles, returns fake res
 
 ---
 
+## Self-bootstrap (top priority)
+
+Full spec: [design-docs/11-self-update.md](design-docs/11-self-update.md).
+This track is now ahead of every other Phase 2 polish item — see
+the rationale in [08-roadmap.md](design-docs/08-roadmap.md).
+
+### M1 — CodingAgentProvider + per-spawn provider plumbing
+
+- ⚪ Extend `SamplingDelta.end.stopReason` union with
+  `'quota_exhausted'` (payload: optional `resetAt`). Update
+  `actionParser` and `agentRunner` translation to `turn_complete.reason`.
+- ⚪ New `src/llm/codingAgentProvider.ts`:
+  - cc first (`claude -p <task> --output-format stream-json …`),
+    codex shape-compatible.
+  - parse `assistant` / `thinking` / `system_init` / terminal
+    events → `SamplingDelta`.
+  - drop cc's internal `tool_use` / `tool_result` (black-box from
+    parent's POV).
+  - SIGTERM-on-abort with grace window; mirror the group-kill in
+    `src/tools/impl/shell.ts`.
+  - capture `providerSessionId` from `system_init`; expose via getter.
+- ⚪ `SpawnRequestInfo` adds `provider?: string`, `cwd?: string`,
+  `providerSessionId?: string`, `continueThreadId?: ThreadId`.
+- ⚪ `spawn` tool schema (`src/tools/impl/spawn.ts`) gains the same
+  four fields. Description spells out cc/codex use-case.
+  `providerSessionId` / `continueThreadId` are **schema-only** in
+  M1 — pool ignores them so the LLM-facing contract is stable
+  before M2 lands the behaviour.
+- ⚪ `SubagentPoolDeps.providerFactories?: Record<string, (req) => LlmProvider>`;
+  factory for cc instantiates per-spawn `CodingAgentProvider` with
+  `req.cwd`. Default global provider remains the OpenAI
+  orchestrator path.
+- ⚪ `SubtaskCompletePayload.providerSessionId?: string` populated
+  from the captured value.
+- ⚪ `bootstrap.ts` registers the cc factory under env (e.g.
+  `HARNESS_CC_BIN`, cc's own auth env). Codex factory stub behind a
+  flag.
+- ⚪ E2E: minimal session where main agent spawns cc to write a
+  fixed file in a temp sibling dir; assert `subtask_complete` +
+  file content.
+
+### M2 — Quota coordination
+
+- ⚪ `CodingAgentProvider` recognises ratelimit / quota terminal
+  events from cc's stream-json; emits
+  `end{stopReason:'quota_exhausted', resetAt}`.
+- ⚪ Per-provider-id `QuotaState{ resetAt?, kind:'session'|'weekly' }`
+  registry (module-scoped singleton keyed by provider id).
+- ⚪ `SubagentPool.spawn` short-circuits when `QuotaState.resetAt > now`:
+  no CLI process, synthesise an immediate
+  `subtask_complete{reason:'quota_exhausted', resetAt}` to the parent.
+- ⚪ One `Scheduler` timer per `(providerId, resetAt)` (dedupe on
+  unchanged resetAt); on fire, publish
+  `external_event{source:'provider_ready', provider, resetAt}`.
+- ⚪ `continueThreadId` reopen path implemented in `SubagentPool`
+  (was schema-only in M1): require thread exists, no live runner,
+  append fresh `user_turn_start`, restart runner.
+- ⚪ Verify `wait` `kind` matcher + filter (`source`, `provider`)
+  is sufficient to single out `provider_ready`; extend lightly if
+  not.
+- ⚪ E2E with a fake cc binary that emits a quota event; parent
+  waits on `provider_ready`; parent re-spawns with
+  `providerSessionId` + `continueThreadId`.
+
+### M3 — Usage introspection
+
+- ⚪ `LlmProvider.usage?(): Promise<UsageReport | 'unsupported'>`.
+- ⚪ `OpenAIProvider.usage()` → `'unsupported'`.
+- ⚪ `CodingAgentProvider.usage()` returns latest cached snapshot
+  parsed out of stream events (no extra CLI invocation).
+- ⚪ `SubtaskCompletePayload.providerUsage?: UsageReport`; pool
+  attaches at child exit.
+- ⚪ `usage` tool output gains optional `providerUsage` block (only
+  inside spawned children whose provider supports it).
+
+### M4 — Operator playbook (no code)
+
+- ⚪ Author and pin `memory:playbook:self-update` covering:
+  - role decision tree (designer / implementer / reviewer; R2b
+    matrix in 11-self-update.md)
+  - R3 step-1 acceptance checklist (tests + e2e + diff review +
+    docs sync)
+  - quota / weekly-limit handling (R2a)
+  - PR opening flow (R4)
+- ⚪ End-to-end demo: operator says "add a Telegram adapter";
+  observe full flow → PR on GitHub, tests green.
+
+### M5 — R3 supervisor (blue/green restart)
+
+Tracked in 11-self-update.md §R3. Lands after M4 so we have a
+working demo before automating restart. No code stubs yet.
+
+### M6 — codex parity
+
+- ⚪ Re-target `CodingAgentProvider` to codex (`codex exec --json`
+  or current equivalent flag).
+- ⚪ Document any contract divergence in 11-self-update.md R2
+  implementation contract section.
+
+---
+
 ## LLM providers
 
 - 🟢 **OpenAIProvider** — streaming + tool calls + usage reporting

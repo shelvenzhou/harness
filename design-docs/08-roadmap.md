@@ -30,7 +30,34 @@ Exit criteria:
 - `HARNESS_E2E=1 pnpm test:e2e` can be run with a real API key and
   exercises at least one real round-trip.
 
-## Phase 2 — make the primitives real
+## Phase 2 — self-bootstrap (top priority)
+
+**Promoted ahead of every other Phase 2/3 polish item.** The harness
+should be editing itself before we keep grinding on incremental
+primitive work — every later improvement is cheaper once the
+self-update loop closes. Full requirement spec in
+[11-self-update.md](11-self-update.md); concrete milestones M1–M6
+listed there.
+
+- M1 — `CodingAgentProvider` (cc first, codex shape-compatible) +
+  per-spawn provider/cwd/`providerSessionId`/`continueThreadId`
+  schema + `quota_exhausted` stopReason wired through.
+- M2 — quota coordination: per-account `QuotaState`, single timer
+  per `resetAt`, `external_event{provider_ready}`, `spawn`
+  fail-fast inside the pool, `continueThreadId` reopen.
+- M3 — `LlmProvider.usage()` + `subtask_complete.providerUsage`.
+- M4 — pinned-memory operator playbook + end-to-end "add a
+  Telegram adapter" demo (no new code).
+- M5 — R3 supervisor + blue/green restart.
+- M6 — codex parity.
+
+R1 (Discord adapter) is already done and is the operator's primary
+control channel for this work.
+
+## Phase 2-deferred — primitive polish
+
+Held until the self-update loop is closing PRs reliably. Order is
+opportunistic; nothing here blocks self-update.
 
 - `write` unified-patch mode.
 - Native providers beyond OpenAI-compatible endpoints, starting with
@@ -41,29 +68,12 @@ Exit criteria:
   interface.
 - Real compaction prompt tuning on top of the existing subagent compactor.
 
-## Phase 3 — second adapter
+## Phase 3 — adapter breadth
 
-- Discord adapter.
-- Multi-adapter CLI.
+- Multi-adapter CLI (run Discord + terminal + future adapters in one
+  process).
 - Thread resume / fork / archive CLI subcommands.
-
-## Phase 3.5 — self-update / remote ops
-
-See [11-self-update.md](11-self-update.md) for the full requirement.
-Operator drives the harness's own evolution from Discord; harness
-delegates implementation work to a coding-agent backend (Codex /
-Claude Code), self-reviews (tests + diff + docs), opens a PR for
-human review, and restarts itself blue/green so a dead-on-arrival
-build can never strand the operator. Sandbox (phase 4) is **not** a
-prerequisite.
-
-- R1 — Discord adapter (overlaps Phase 3).
-- R2 — coding-agent backend exposed as an `LlmProvider` (so it
-  composes with `spawn`, budgets, interrupts), plus `usage()`
-  introspection and a `quota_exhausted` stop reason.
-- R3 — supervisor + blue/green restart with a `ready` health probe;
-  pre-deploy main-agent review gate (tests + diff + docs).
-- R4 — GitHub PR flow via `gh` (no new tool; `shell` only).
+- TelegramAdapter / HTTPAdapter.
 
 ## Phase 4 — sandbox & permissions
 
