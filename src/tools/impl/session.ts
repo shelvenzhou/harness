@@ -24,16 +24,18 @@ const SessionArgs = z.object({
     .int()
     .positive()
     .optional()
-    .describe('Cap on returned output tokens. Defaults to 2048; truncated output sets `truncated:true`.'),
+    .describe(
+      'Cap on returned output tokens. Defaults to 2048; truncated output sets `truncated:true`.',
+    ),
 });
 
 export const sessionTool: Tool<typeof SessionArgs, unknown> = {
   name: 'session',
   concurrency: 'safe',
   description: [
-    'Read the captured output of a long-running tool by `sessionId`. Returns `status` (running|done|errored),',
-    'the captured `output` truncated to `maxTokens`, the full `totalTokens` estimate, and a `truncated` flag.',
-    'Use after `wait({matcher:"session", sessionIds:[...]})` wakes you, or to poll a still-running session.',
+    'Read the captured output of a long-running async tool by `sessionId`. Returns `sessionId`, `status` (running|done|errored), `toolName`, timestamps, optional `error`,',
+    'the captured `output` truncated to `maxTokens`, the full `totalTokens` estimate, `truncated`, and the effective `maxTokens`.',
+    'Use after `wait({matcher:"session", sessionIds:[...]})` wakes you, or to poll a still-running session. Unknown ids return `ok:false` with `error.kind:"unknown_session"`.',
   ].join(' '),
   schema: SessionArgs,
   async execute() {

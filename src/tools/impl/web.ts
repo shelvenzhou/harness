@@ -24,7 +24,10 @@ const FetchArgs = z.object({
   url: z.string().describe('Full URL (http:// or https://).'),
   method: z.enum(['GET', 'HEAD']).optional().describe('HTTP method; GET (default) or HEAD.'),
   timeoutMs: z.number().optional().describe('Hard timeout in ms (default 20000).'),
-  maxOutputBytes: z.number().optional().describe('Cap captured response bytes (default 262144).'),
+  maxOutputBytes: z
+    .number()
+    .optional()
+    .describe('Cap captured response body bytes (default 262144).'),
 });
 
 interface FetchOutput {
@@ -42,8 +45,8 @@ export const webFetchTool: Tool<typeof FetchArgs, FetchOutput> = {
   concurrency: 'safe',
   async: true,
   description: [
-    'Fetch a URL (GET or HEAD). Body is captured with a byte cap; oversize bodies are elided',
-    'and saved to a handle (use `restore` to pull the full body). Use for known URLs.',
+    'Start an HTTP(S) fetch as a long-running session. Immediate tool result is `{sessionId,status:"running",toolName:"web_fetch"}`; after `session_complete`, call `session({sessionId})` to read status/content-type/body.',
+    'Args: `url`, optional `method` (GET default, HEAD returns no body), `timeoutMs`, `maxOutputBytes`. Body is captured with a byte cap; oversize bodies are elided and saved to a handle (use `restore` to pull the full body). Use for known URLs.',
     "Use web_search when you don't yet have a URL.",
   ].join(' '),
   schema: FetchArgs,
@@ -196,7 +199,8 @@ export const webSearchTool: Tool<typeof SearchArgs, WebSearchOutput> = {
   concurrency: 'safe',
   async: true,
   description: [
-    "Search the web. Returns title/url/snippet triples from the configured backend (Google, Tavily, ...).",
+    'Start a web search as a long-running session. Immediate tool result is `{sessionId,status:"running",toolName:"web_search"}`; after `session_complete`, call `session({sessionId})` to read results.',
+    'Args: `query`, optional `topK` (default 8, hard cap 20), optional `safe`. Final output contains `query`, `provider`, title/url/snippet `results`, optional `answer`, and optional `truncated` with an elided handle.',
     "Use for open-ended lookup when you don't yet have a URL; use web_fetch when you do.",
   ].join(' '),
   schema: SearchArgs,

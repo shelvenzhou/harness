@@ -7,26 +7,37 @@ import { z } from 'zod';
 import type { Tool } from '../tool.js';
 
 const WriteArgs = z.object({
-  path: z.string(),
-  content: z.string(),
-  mode: z.enum(['overwrite', 'patch']).optional(),
+  path: z
+    .string()
+    .describe('File path to write. Relative paths resolve against the runtime process cwd.'),
+  content: z.string().describe('UTF-8 text content to write.'),
+  mode: z
+    .enum(['overwrite', 'patch'])
+    .optional()
+    .describe(
+      'Write mode. Default is overwrite. patch is advertised but currently returns not_implemented.',
+    ),
 });
 
 /**
  * Minimal `write` tool. Overwrite mode implemented; patch mode is a stub
  * until we add a unified-diff applier (phase 2).
  */
-export const writeTool: Tool<typeof WriteArgs, {
-  path: string;
-  bytesWritten: number;
-  sha256: string;
-}> = {
+export const writeTool: Tool<
+  typeof WriteArgs,
+  {
+    path: string;
+    bytesWritten: number;
+    sha256: string;
+  }
+> = {
   name: 'write',
   concurrency: 'serial',
   description: [
-    'Write UTF-8 content to a file. `mode: "overwrite"` replaces the file.',
-    '`mode: "patch"` expects a unified diff against the current file — NOT IMPLEMENTED (phase 2).',
-    'Prefer over shell for file writes so the diff is trackable.',
+    'Write UTF-8 content to a file. Args: `path`, `content`, optional `mode`.',
+    '`mode:"overwrite"` (default) creates parent directories and replaces the file. Returns absolute `path`, `bytesWritten`, and `sha256`.',
+    '`mode:"patch"` is NOT IMPLEMENTED and returns `ok:false` with `error.kind:"not_implemented"`.',
+    'Prefer over shell for simple file writes so the diff is trackable.',
   ].join(' '),
   schema: WriteArgs,
   async execute(args, ctx) {
@@ -49,7 +60,7 @@ export const writeTool: Tool<typeof WriteArgs, {
       ok: true,
       output: {
         path: abs,
-        bytesWritten: args.content.length,
+        bytesWritten: Buffer.byteLength(args.content, 'utf8'),
         sha256,
       },
     };

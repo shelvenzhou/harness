@@ -19,17 +19,20 @@ const RestoreArgs = z.object({
   handle: z.string().describe('Handle id returned in an `elided` block.'),
 });
 
-export const restoreTool: Tool<typeof RestoreArgs, {
-  handle: string;
-  scheduled: boolean;
-  note?: string;
-}> = {
+export const restoreTool: Tool<
+  typeof RestoreArgs,
+  {
+    handle: string;
+    pinned: boolean;
+    note?: string;
+  }
+> = {
   name: 'restore',
   concurrency: 'safe',
   description: [
-    'Rehydrate an elided event by handle. Use sparingly: the next sampling will include the full body.',
+    'Rehydrate an elided event by handle. Returns `{handle,pinned}`; when pinned is true, the next sampling will include the full body.',
     "Good for: 'I elided that web_fetch result, I actually need the body now.'",
-    "Bad for: 'Pull everything back just in case.' (That's what the prefix cache is for.)",
+    'Bad for: \'Pull everything back just in case.\' Unknown handles return `ok:false` with `error.kind:"unknown_handle"`.',
   ].join(' '),
   schema: RestoreArgs,
   async execute(args) {
@@ -37,7 +40,7 @@ export const restoreTool: Tool<typeof RestoreArgs, {
       ok: true,
       output: {
         handle: args.handle,
-        scheduled: true,
+        pinned: true,
         note: 'context projection will inline this handle on the next sampling',
       },
     };

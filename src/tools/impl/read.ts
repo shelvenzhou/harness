@@ -13,41 +13,50 @@ import type { Tool } from '../tool.js';
  */
 
 const ReadArgs = z.object({
-  path: z.string(),
+  path: z
+    .string()
+    .describe('File path to read. Relative paths resolve against the runtime process cwd.'),
   byteRange: z
     .object({ start: z.number(), end: z.number() })
     .optional()
-    .describe('Optional byte range [start, end) to read. Omit to read the whole file.'),
+    .describe(
+      'Optional byte range [start, end) to read from the file bytes. Omit to read the whole file.',
+    ),
 });
 
-export const readTool: Tool<typeof ReadArgs, {
-  path: string;
-  size: number;
-  sha256: string;
-  content?: string;
-  handle?: string;
-}> = {
+export const readTool: Tool<
+  typeof ReadArgs,
+  {
+    path: string;
+    size: number;
+    sha256: string;
+    content?: string;
+    handle?: string;
+  }
+> = {
   name: 'read',
   concurrency: 'safe',
   description: [
-    'Read a UTF-8 file. Prefer over shell(cat) because the body is registered as an elidable handle;',
-    'the LLM sees path + hash + size in its context and can restore() the body only if needed.',
+    'Read a UTF-8 file. Args: `path`, optional `byteRange:{start,end}`. Returns absolute `path`, full file `size`, slice `sha256`, `content`, and a restore `handle`.',
+    'Prefer over shell(cat) because the body is registered as an elidable handle; the LLM sees path + hash + size in compact context and can restore() the body only if needed.',
   ].join(' '),
   schema: ReadArgs,
   async execute(args, ctx) {
     const abs = resolve(args.path);
     const meta = await stat(abs);
     const buf = await readFile(abs);
-    const slice = args.byteRange
-      ? buf.subarray(args.byteRange.start, args.byteRange.end)
-      : buf;
+    const slice = args.byteRange ? buf.subarray(args.byteRange.start, args.byteRange.end) : buf;
     const content = slice.toString('utf8');
     const sha256 = createHash('sha256').update(slice).digest('hex');
 
-    const handle = ctx.registerHandle('read_content', { path: abs, content }, {
-      size: slice.byteLength,
-      sha256,
-    });
+    const handle = ctx.registerHandle(
+      'read_content',
+      { path: abs, content },
+      {
+        size: slice.byteLength,
+        sha256,
+      },
+    );
 
     return {
       ok: true,

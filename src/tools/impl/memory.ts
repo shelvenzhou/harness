@@ -13,18 +13,26 @@ import type { Tool } from '../tool.js';
  */
 
 const MemoryArgs = z.object({
-  op: z.enum(['get', 'set', 'delete', 'search', 'list', 'pin', 'unpin']).describe(
-    'Operation: get | set | delete | search | list | pin | unpin',
-  ),
+  op: z
+    .enum(['get', 'set', 'delete', 'search', 'list', 'pin', 'unpin'])
+    .describe('Operation: get | set | delete | search | list | pin | unpin'),
   key: z.string().optional().describe('Key for get / set / delete / pin / unpin.'),
   value: z.string().optional().describe('Value for set.'),
   query: z.string().optional().describe('Query for search.'),
-  topK: z.number().optional().describe('Max results for search (default 5).'),
+  topK: z
+    .number()
+    .optional()
+    .describe('Max results for search (default 5) or max entries for list (default 50).'),
   pinned: z
     .boolean()
     .optional()
     .describe('If true with op=set, the entry is auto-injected into the system prompt.'),
-  tags: z.array(z.string()).optional().describe('Tags applied with set; filters list/search.'),
+  tags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Tags applied with set. This tool currently does not pass tag filters to list/search.',
+    ),
 });
 
 export const memoryTool: Tool<typeof MemoryArgs> = {
@@ -33,9 +41,10 @@ export const memoryTool: Tool<typeof MemoryArgs> = {
   description: [
     'Long/short-term memory.',
     '`set` saves a key/value (use {pinned: true} to auto-include it in every prompt).',
-    '`get` reads one key. `delete` removes one. `list` enumerates entries.',
-    '`search` does keyword/substring lookup; backends with embeddings do semantic search.',
+    '`get` reads one key and returns `{key,value,found}`. `delete` removes one and returns `{key,deleted}`. `list` enumerates `{key,pinned,tags}` entries; `topK` limits list size.',
+    '`search` requires `query` and returns `{query,results:[{key,content,score,reason?}]}`; backends with embeddings do semantic search.',
     '`pin` / `unpin` toggle prefix-injection on an existing entry.',
+    'Returns `ok:false` with `error.kind:"unsupported"` when no memory store is configured; missing per-op fields return `error.kind:"schema"`.',
   ].join(' '),
   schema: MemoryArgs,
   async execute(args, ctx) {

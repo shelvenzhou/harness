@@ -12,36 +12,43 @@ import type { Tool } from '../tool.js';
  */
 
 const Budget = z.object({
-  maxTurns: z.number().optional(),
-  maxToolCalls: z.number().optional(),
-  maxWallMs: z.number().optional(),
-  maxTokens: z.number().optional(),
+  maxTurns: z.number().optional().describe('Maximum child sampling turns before budget_exceeded.'),
+  maxToolCalls: z.number().optional().describe('Maximum child tool calls before budget_exceeded.'),
+  maxWallMs: z
+    .number()
+    .optional()
+    .describe('Maximum child wall-clock runtime in ms before budget_exceeded.'),
+  maxTokens: z.number().optional().describe('Maximum child token usage before budget_exceeded.'),
 });
 
 const ContextRef = z.object({
-  sourceThreadId: z.string(),
-  fromEventId: z.string().optional(),
-  toEventId: z.string().optional(),
+  sourceThreadId: z
+    .string()
+    .describe('Thread id whose event slice should be prepended to the child context.'),
+  fromEventId: z.string().optional().describe('Optional first event id in the slice.'),
+  toEventId: z.string().optional().describe('Optional last event id in the slice.'),
 });
 
 const SpawnArgs = z.object({
-  task: z.string().describe('Freeform task description. Becomes the child\'s seed user input.'),
+  task: z.string().describe("Freeform task description. Becomes the child's seed user input."),
   role: z.string().optional().describe('Optional role tag (verifier, researcher, reviewer, …).'),
-  budget: Budget.describe('Budget caps. Breach → the child is killed and reports budget_exceeded.'),
+  budget: Budget.optional().describe(
+    'Optional budget caps. Breach -> the child is killed and reports budget_exceeded. Omit or pass {} for no per-child caps.',
+  ),
   contextRefs: z
     .array(ContextRef)
     .optional()
     .describe(
-      'Slices of other threads\' event logs the child should see prepended to its own tail. ' +
+      "Slices of other threads' event logs the child should see prepended to its own tail. " +
         'COW: source thread keeps appending after the snapshot range. ' +
-        'Use to give a verifier / reviewer subagent the parent\'s recent turns without inheriting the whole prompt.',
+        "Use to give a verifier / reviewer subagent the parent's recent turns without inheriting the whole prompt.",
     ),
   provider: z
     .string()
     .optional()
     .describe(
       'Override the LLM provider for this child. Omit to inherit the runtime default. ' +
-        "Set to 'cc' (Claude Code) or 'codex' to run the child as that coding-agent CLI: it has its " +
+        "Set to 'cc' (Claude Code) or 'codex' to run the child as that coding-agent CLI; when you do, `cwd` is required. The CLI has its " +
         'own filesystem / shell / edit tools internal to the CLI, runs in `cwd`, and returns its ' +
         "final reply as the child's `summary`. Its internal tool calls do not appear in this thread.",
     ),
@@ -73,8 +80,9 @@ export const spawnTool: Tool<typeof SpawnArgs, { childThreadId: string }> = {
   name: 'spawn',
   concurrency: 'safe',
   description: [
-    'Fork a subagent with its own context. Returns immediately; listen for subtask_complete',
-    '(or wait for it via the `wait` tool).',
+    'Fork a subagent with its own context. Immediate tool result is `{childThreadId}`;',
+    'the final child result arrives later as `subtask_complete{childThreadId,status,summary?,providerSessionId?}`.',
+    'Use `wait({matcher:"subtask_complete", childThreadId})` if you need that result before continuing.',
     '',
     'USE spawn when the child task can proceed without blocking your current decision path:',
     '  - background research ("look up how lib X handles Y while I keep coding")',
@@ -82,6 +90,11 @@ export const spawnTool: Tool<typeof SpawnArgs, { childThreadId: string }> = {
     '  - independent experiments you want to run in parallel',
     '  - delegating to a coding-agent provider (provider:"cc" / "codex"), which has its own',
     '    file / shell / edit tools and returns its final reply as the child summary',
+    '',
+    'For provider:"cc" or provider:"codex", ALWAYS include `cwd` (normally the current workspace/project directory).',
+    "Without `cwd`, the runtime rejects the spawn with `provider '<name>' requires cwd on spawn`.",
+    'Use `providerSessionId` from a prior subtask_complete only when continuing the same coding-agent session.',
+    '`continueThreadId` is currently schema-only and ignored by the runtime.',
     '',
     'DO NOT spawn for critical-path subtasks. Doing the work inline is cheaper and clearer than',
     'round-tripping through a child — spawn is for concurrency and context isolation, not delegation.',

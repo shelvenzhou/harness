@@ -24,13 +24,15 @@ const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const TAIL_INLINE_BYTES = 2048;
 
 const ShellArgs = z.object({
-  cmd: z.string().describe('Command line. Interpreted by /bin/sh -lc (POSIX) or cmd.exe (Windows).'),
+  cmd: z
+    .string()
+    .describe('Command line. Interpreted by /bin/sh -lc (POSIX) or cmd.exe (Windows).'),
   cwd: z.string().optional().describe('Working directory; defaults to the runtime process cwd.'),
   timeoutMs: z.number().optional().describe('Hard timeout in ms (default 60000).'),
   maxOutputBytes: z
     .number()
     .optional()
-    .describe('Cap total captured bytes across stdout + stderr (default 65536).'),
+    .describe('Cap captured bytes per output stream, stdout and stderr (default 65536 each).'),
 });
 
 interface ShellOutput {
@@ -49,10 +51,10 @@ export const shellTool: Tool<typeof ShellArgs, ShellOutput> = {
   concurrency: 'serial',
   async: true,
   description: [
-    'Run a shell command and return exit code + stdout/stderr. Output is captured with a byte cap;',
-    'oversized results are elided and saved to a handle (use `restore` to pull the full log).',
-    'Use for any side-effectful operation (build, test, git, git grep, curl when web_fetch won\'t do).',
-    "Prefer `read` / `write` when you only need file I/O — those emit structured, diffable results.",
+    'Start a shell command as a long-running session. Immediate tool result is `{sessionId,status:"running",toolName:"shell"}`; after `session_complete`, call `session({sessionId})` to read exit code + stdout/stderr.',
+    'Args: `cmd`, optional `cwd`, `timeoutMs`, `maxOutputBytes`. Output is captured with byte caps; oversized results are elided and saved to a handle (use `restore` to pull the full log if needed).',
+    'Use for side-effectful operations (build, test, git, git grep, curl when web_fetch will not do).',
+    'Prefer `read` / `write` when you only need file I/O — those emit structured, diffable results.',
   ].join(' '),
   schema: ShellArgs,
   async execute(args, ctx) {
@@ -126,12 +128,13 @@ export const shellTool: Tool<typeof ShellArgs, ShellOutput> = {
     if (ctx.signal.aborted) onAbort();
     ctx.signal.addEventListener('abort', onAbort, { once: true });
 
-    const { code, signalName } = await new Promise<{ code: number | null; signalName: NodeJS.Signals | null }>(
-      (resolve) => {
-        child.on('close', (c, s) => resolve({ code: c, signalName: s }));
-        child.on('error', () => resolve({ code: null, signalName: null }));
-      },
-    );
+    const { code, signalName } = await new Promise<{
+      code: number | null;
+      signalName: NodeJS.Signals | null;
+    }>((resolve) => {
+      child.on('close', (c, s) => resolve({ code: c, signalName: s }));
+      child.on('error', () => resolve({ code: null, signalName: null }));
+    });
     clearTimeout(timer);
     ctx.signal.removeEventListener('abort', onAbort);
 

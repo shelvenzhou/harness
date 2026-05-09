@@ -22,15 +22,27 @@ export function zodToJsonSchema(schema: ZodTypeAny): unknown {
     case 'ZodBoolean':
       return withDesc(schema, { type: 'boolean' });
     case 'ZodOptional':
-      return zodToJsonSchema(
-        (schema as unknown as { _def: { innerType: ZodTypeAny } })._def.innerType,
+      return withDesc(
+        schema,
+        asSchemaObject(
+          zodToJsonSchema(
+            (schema as unknown as { _def: { innerType: ZodTypeAny } })._def.innerType,
+          ),
+        ),
+      );
+    case 'ZodDefault':
+      return withDesc(
+        schema,
+        asSchemaObject(
+          zodToJsonSchema(
+            (schema as unknown as { _def: { innerType: ZodTypeAny } })._def.innerType,
+          ),
+        ),
       );
     case 'ZodArray':
       return withDesc(schema, {
         type: 'array',
-        items: zodToJsonSchema(
-          (schema as unknown as { _def: { type: ZodTypeAny } })._def.type,
-        ),
+        items: zodToJsonSchema((schema as unknown as { _def: { type: ZodTypeAny } })._def.type),
       });
     case 'ZodEnum':
       return withDesc(schema, {
@@ -49,7 +61,9 @@ export function zodToJsonSchema(schema: ZodTypeAny): unknown {
         ),
       });
     case 'ZodObject': {
-      const shape = (schema as unknown as { _def: { shape: () => Record<string, ZodTypeAny> } })._def.shape();
+      const shape = (
+        schema as unknown as { _def: { shape: () => Record<string, ZodTypeAny> } }
+      )._def.shape();
       const properties: Record<string, unknown> = {};
       const required: string[] = [];
       for (const [key, value] of Object.entries(shape)) {
@@ -73,6 +87,12 @@ export function zodToJsonSchema(schema: ZodTypeAny): unknown {
 function withDesc(schema: ZodTypeAny, base: Record<string, unknown>): Record<string, unknown> {
   const desc = (schema as unknown as { description?: string }).description;
   return desc ? { ...base, description: desc } : base;
+}
+
+function asSchemaObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 function isOptional(schema: ZodTypeAny): boolean {
