@@ -32,10 +32,14 @@ the rationale in [08-roadmap.md](design-docs/08-roadmap.md).
 - ⚪ `SpawnRequestInfo` adds `provider?: string`, `cwd?: string`,
   `providerSessionId?: string`, `continueThreadId?: ThreadId`.
 - ⚪ `spawn` tool schema (`src/tools/impl/spawn.ts`) gains the same
-  four fields. Description spells out cc/codex use-case.
-  `providerSessionId` / `continueThreadId` are **schema-only** in
-  M1 — pool ignores them so the LLM-facing contract is stable
-  before M2 lands the behaviour.
+  four fields. Description spells out cc/codex use-case + the
+  `providerSessionId` reuse rule.
+  - `provider` / `cwd` / `providerSessionId` are **fully wired** in
+    M1 — multi-turn design / iteration with cc requires the
+    sessionId to be threaded to `--resume` on every continuation
+    spawn.
+  - `continueThreadId` is **schema-only** in M1 (pool ignores it);
+    full reopen semantics land in M2.
 - ⚪ `SubagentPoolDeps.providerFactories?: Record<string, (req) => LlmProvider>`;
   factory for cc instantiates per-spawn `CodingAgentProvider` with
   `req.cwd`. Default global provider remains the OpenAI

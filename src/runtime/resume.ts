@@ -11,6 +11,7 @@ import type { MicroCompactorOptions } from '@harness/context/microCompactor.js';
 import { newThreadId, type ThreadId } from '@harness/core/ids.js';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
+import { ProviderUsageRegistry } from '@harness/llm/providerUsageRegistry.js';
 import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import type { SearchBackend } from '@harness/search/types.js';
@@ -73,6 +74,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
   const registry = opts.registry ?? createDefaultRegistry();
   const executor = new ToolExecutor(registry);
   const memory: MemoryStore = opts.memory ?? new InMemoryStore();
+  const providerUsageRegistry = new ProviderUsageRegistry();
 
   const diag =
     opts.diagSinks && opts.diagSinks.length > 0
@@ -116,6 +118,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
       ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
       ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
       ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
+      providerUsageRegistry,
       onSpawn: (req) => subagents.spawn(req),
     });
     rootRunners.set(threadId, runner);
@@ -151,6 +154,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     registry,
     executor,
     provider: opts.provider,
+    providerUsageRegistry,
     subagents,
     rootThreadId: opts.threadId,
     runner,

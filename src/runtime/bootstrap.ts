@@ -10,6 +10,12 @@ import type { ToolRegistry } from '@harness/tools/registry.js';
 import { ToolExecutor } from '@harness/tools/executor.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
 import {
+  CodingAgentProvider,
+  type CodingAgentKind,
+  type CodingAgentProviderOptions,
+} from '@harness/llm/codingAgentProvider.js';
+import { ProviderUsageRegistry } from '@harness/llm/providerUsageRegistry.js';
+import {
   attachDiag,
   composePromptHook,
   type DiagSink,
@@ -30,8 +36,8 @@ import { InMemoryStore } from '@harness/memory/inMemoryStore.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import type { SearchBackend } from '@harness/search/types.js';
 
-import { AgentRunner, type TokenBudget } from './agentRunner.js';
-import { SubagentPool } from './subagentPool.js';
+import { AgentRunner, type SpawnRequestInfo, type TokenBudget } from './agentRunner.js';
+import { SubagentPool, type ProviderFactory } from './subagentPool.js';
 
 /**
  * Convenience bootstrap: wire a full runtime (bus, store, registry,
@@ -121,6 +127,32 @@ export interface BootstrapOptions {
   useSubagentCompactor?:
     | boolean
     | { systemPrompt?: string; timeoutMs?: number; fallback?: Compactor };
+  /**
+   * Per-key `LlmProvider` factories registered with `SubagentPool`. The
+   * spawning LLM picks one by passing `provider: '<key>'` in its
+   * `spawn` call; the pool builds a one-shot provider instance per
+   * spawn from the matching factory. Caller-supplied factories take
+   * precedence over the built-in coding-agent factories below — set
+   * the same key to override.
+   */
+  providerFactories?: Record<string, ProviderFactory>;
+  /**
+   * Coding-agent factories (cc, codex). When `true` (the default for
+   * the corresponding key), the bootstrap registers a factory that
+   * builds a `CodingAgentProvider` per spawn against the requested
+   * `cwd` / `providerSessionId`. Passing options narrows the binary
+   * path / model / extra args. Passing `false` disables that key
+   * (no factory registered, spawn fails fast with `unknown_provider`).
+   *
+   * Auth flows through the CLI's own credential cache — there is no
+   * harness-level token. Set the binary's expected env (e.g.
+   * `ANTHROPIC_API_KEY` for cc, or rely on cc's interactive login)
+   * via the runtime environment or the factory's `env` override.
+   */
+  codingAgents?: {
+    cc?: boolean | Partial<Omit<CodingAgentProviderOptions, 'kind' | 'cwd' | 'providerSessionId'>>;
+    codex?: boolean | Partial<Omit<CodingAgentProviderOptions, 'kind' | 'cwd' | 'providerSessionId'>>;
+  };
 }
 
 export interface Runtime {
@@ -131,6 +163,8 @@ export interface Runtime {
   registry: ToolRegistry;
   executor: ToolExecutor;
   provider: LlmProvider;
+  /** Account-level snapshots reported by coding-agent providers. */
+  providerUsageRegistry: ProviderUsageRegistry;
   subagents: SubagentPool;
   rootThreadId: ThreadId;
   runner: AgentRunner;
@@ -158,6 +192,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
   const registry = opts.registry ?? createDefaultRegistry();
   const executor = new ToolExecutor(registry);
   const memory: MemoryStore = opts.memory ?? new InMemoryStore();
+  const providerUsageRegistry = new ProviderUsageRegistry();
 
   const rootThreadId = newThreadId();
   await store.createThread({
@@ -173,6 +208,8 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     opts.diagSinks && opts.diagSinks.length > 0
       ? composePromptHook(opts.diagSinks)
       : undefined;
+
+  const providerFactories = buildProviderFactories(opts, providerUsageRegistry);
 
   const subagents = new SubagentPool({
     bus,
@@ -195,6 +232,9 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     ...(opts.subagentMaxConcurrentTotal !== undefined
       ? { maxConcurrentTotal: opts.subagentMaxConcurrentTotal }
       : {}),
+    ...(Object.keys(providerFactories).length > 0
+      ? { providerFactories }
+      : {}),
   });
 
   const rootRunners = new Map<ThreadId, AgentRunner>();
@@ -214,6 +254,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
       ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
       ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
       ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
+      providerUsageRegistry,
       onSpawn: (req) => subagents.spawn(req),
     });
     rootRunners.set(threadId, runner);
@@ -272,6 +313,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     registry,
     executor,
     provider: opts.provider,
+    providerUsageRegistry,
     subagents,
     rootThreadId,
     runner,
@@ -291,4 +333,74 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
     ...(compactionHandler !== undefined ? { compactionHandler } : {}),
   };
+}
+
+/**
+ * Build the per-key `LlmProvider` factory map handed to `SubagentPool`.
+ *
+ * Order: caller-supplied `providerFactories` win, then built-in
+ * coding-agent factories (cc, codex) for keys the caller hasn't
+ * already claimed and that are enabled in `codingAgents`.
+ *
+ * Each coding-agent factory closes over the requested `cwd` /
+ * `providerSessionId` to build a one-shot `CodingAgentProvider`.
+ * `cwd` is mandatory for these backends — missing it throws so the
+ * pool surfaces `unknown_provider`-style `tool_result.ok=false` to
+ * the calling LLM rather than silently spawning in the harness's own
+ * working directory.
+ */
+function buildProviderFactories(
+  opts: BootstrapOptions,
+  usageRegistry: ProviderUsageRegistry,
+): Record<string, ProviderFactory> {
+  const out: Record<string, ProviderFactory> = {};
+
+  const enabled = (
+    cfg: BootstrapOptions['codingAgents'] extends infer C
+      ? C extends Record<string, unknown>
+        ? C[keyof C]
+        : never
+      : never,
+  ): boolean => cfg !== false;
+  const optionsFrom = (
+    cfg: unknown,
+  ): Partial<Omit<CodingAgentProviderOptions, 'kind' | 'cwd' | 'providerSessionId'>> =>
+    cfg && typeof cfg === 'object'
+      ? (cfg as Partial<Omit<CodingAgentProviderOptions, 'kind' | 'cwd' | 'providerSessionId'>>)
+      : {};
+
+  const codingFactory =
+    (kind: CodingAgentKind, base: Partial<Omit<CodingAgentProviderOptions, 'kind' | 'cwd' | 'providerSessionId'>>): ProviderFactory =>
+    (req: SpawnRequestInfo) => {
+      if (req.cwd === undefined) {
+        throw new Error(`provider '${kind}' requires \`cwd\` on spawn`);
+      }
+      return new CodingAgentProvider({
+        kind,
+        cwd: req.cwd,
+        ...base,
+        ...(req.providerSessionId !== undefined
+          ? { providerSessionId: req.providerSessionId }
+          : {}),
+        usageRegistry,
+      });
+    };
+
+  const builtins: Array<{ key: CodingAgentKind; cfg: unknown }> = [
+    { key: 'cc', cfg: opts.codingAgents?.cc ?? true },
+    { key: 'codex', cfg: opts.codingAgents?.codex ?? false }, // codex parity lands in M6
+  ];
+  for (const { key, cfg } of builtins) {
+    if (!enabled(cfg as never)) continue;
+    out[key] = codingFactory(key, optionsFrom(cfg));
+  }
+
+  // Caller overrides win.
+  if (opts.providerFactories) {
+    for (const [k, v] of Object.entries(opts.providerFactories)) {
+      out[k] = v;
+    }
+  }
+
+  return out;
 }

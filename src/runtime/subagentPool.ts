@@ -59,12 +59,36 @@ export class SpawnRefused extends Error {
   }
 }
 
+/**
+ * Per-spawn provider factory. Receives the spawn request (so it can
+ * read `cwd`, `providerSessionId`, etc.) and returns a fresh
+ * `LlmProvider` for that one child. Factories typically build a
+ * one-shot wrapper bound to the request's parameters; reuse across
+ * spawns is a factory implementation detail.
+ *
+ * Registered under string keys (e.g. `'cc'`, `'codex'`); when the
+ * spawn request carries `provider: 'cc'` and a matching factory is
+ * present, the pool routes the child through it. Without a match,
+ * spawn fails with `SpawnRefused('unknown_provider')`.
+ *
+ * The default `LlmProvider` (`SubagentPoolDeps.provider`) is used
+ * when the spawn request omits `provider` — it stays the
+ * orchestrator path.
+ */
+export type ProviderFactory = (req: SpawnRequestInfo) => LlmProvider;
+
 export interface SubagentPoolDeps {
   bus: EventBus;
   store: SessionStore;
   registry: ToolRegistry;
   executor: ToolExecutor;
   provider: LlmProvider;
+  /**
+   * Optional per-key provider factories. Looked up by
+   * `SpawnRequestInfo.provider`; absent or empty map = only the
+   * default provider is reachable (current behaviour).
+   */
+  providerFactories?: Record<string, ProviderFactory>;
   systemPromptFor: (role: string | undefined) => string;
   /** Children share the parent's memory backend. */
   memory?: MemoryStore;
@@ -123,6 +147,12 @@ interface ChildRecord {
   wallTimer?: ReturnType<typeof setTimeout>;
   budgetExceeded: boolean;
   exceededReason?: 'maxTurns' | 'maxToolCalls' | 'maxWallMs' | 'maxTokens';
+  /**
+   * The LlmProvider this child ran against. Held so we can read
+   * provider-specific state (e.g. CodingAgentProvider.lastSessionId)
+   * at child-exit time and surface it on `subtask_complete`.
+   */
+  provider: LlmProvider;
 }
 
 export class SubagentPool {
@@ -176,6 +206,10 @@ export class SubagentPool {
       }
     }
 
+    // Resolve provider before any side effects so an unknown-key spawn
+    // doesn't leave a half-created thread behind.
+    const childProvider = this.resolveProvider(req);
+
     const childThreadId = req.childThreadId ?? newThreadId();
     const traceparent = req.parentTraceparent ?? newRootTraceparent();
     await this.deps.store.createThread({
@@ -198,7 +232,7 @@ export class SubagentPool {
       store: this.deps.store,
       registry: this.deps.registry,
       executor: this.deps.executor,
-      provider: this.deps.provider,
+      provider: childProvider,
       systemPrompt,
       ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       ...(this.deps.searchBackend !== undefined
@@ -226,6 +260,7 @@ export class SubagentPool {
       toolCallsUsed: 0,
       tokensUsed: 0,
       budgetExceeded: false,
+      provider: childProvider,
     };
     if (record.budget.maxWallMs && record.budget.maxWallMs > 0) {
       record.wallTimer = setTimeout(
@@ -372,6 +407,26 @@ export class SubagentPool {
     };
   }
 
+  private resolveProvider(req: SpawnRequestInfo): LlmProvider {
+    if (req.provider === undefined) return this.deps.provider;
+    const factory = this.deps.providerFactories?.[req.provider];
+    if (!factory) {
+      throw new SpawnRefused(
+        'unknown_provider',
+        `spawn rejected: provider '${req.provider}' is not registered`,
+      );
+    }
+    try {
+      return factory(req);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new SpawnRefused(
+        'provider_factory_failed',
+        `spawn rejected: provider factory '${req.provider}' threw: ${message}`,
+      );
+    }
+  }
+
   private async onTurnComplete(event: HarnessEvent): Promise<void> {
     const record = this.children.get(event.threadId);
     if (!record) return; // not one of our children
@@ -396,6 +451,13 @@ export class SubagentPool {
         ? `budget exceeded (${record.exceededReason}); turns=${record.turnsUsed} toolCalls=${record.toolCallsUsed} tokens=${record.tokensUsed}`
         : undefined);
 
+    // Coding-agent providers expose `lastSessionId` on themselves so
+    // we can surface the cc / codex session token without leaking
+    // provider-specific types into SubagentPool. Anything without
+    // that field returns undefined and the optional payload key is
+    // dropped.
+    const providerSessionId = readProviderSessionId(record.provider);
+
     const evOut: HarnessEvent = {
       id: newEventId(),
       threadId: record.parentThreadId,
@@ -405,6 +467,7 @@ export class SubagentPool {
         childThreadId: event.threadId,
         status,
         ...(summary !== undefined ? { summary } : {}),
+        ...(providerSessionId !== undefined ? { providerSessionId } : {}),
         ...(record.budgetExceeded
           ? {
               reason: `budget:${record.exceededReason}`,
@@ -429,6 +492,14 @@ export class SubagentPool {
   get childCount(): number {
     return this.children.size;
   }
+}
+
+function readProviderSessionId(provider: LlmProvider): string | undefined {
+  // Duck-type the optional field. CodingAgentProvider sets
+  // `lastSessionId` directly on the instance; other providers
+  // (OpenAI, scripted test providers) leave it undefined.
+  const v = (provider as { lastSessionId?: unknown }).lastSessionId;
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
 function withBudgetGuidance(systemPrompt: string, budget: ChildBudget): string {

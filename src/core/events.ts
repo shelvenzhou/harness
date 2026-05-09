@@ -134,6 +134,27 @@ export interface SpawnRequestPayload {
   task: string;
   contextRefs?: ContextRef[];
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
+  /**
+   * Per-spawn provider selection. Omitted = inherit the runtime's
+   * default LlmProvider (the orchestrator). Set to a registered key
+   * (e.g. 'cc', 'codex') to route the child through a coding-agent
+   * backend running in `cwd`. See design-docs/11-self-update.md §R2.
+   */
+  provider?: string;
+  /** Working directory for coding-agent backends; required when `provider` is one. */
+  cwd?: string;
+  /**
+   * Resume token for the chosen provider. For cc this is the
+   * `session_id` captured from a prior spawn's `subtask_complete` —
+   * carry it forward to continue the same internal conversation
+   * without re-paying context tokens. Omit for a fresh session.
+   */
+  providerSessionId?: string;
+  /**
+   * Reuse an existing harness child thread instead of creating a new
+   * one. Schema-only in M1 — full reopen semantics land in M2.
+   */
+  continueThreadId?: ThreadId;
 }
 export type SpawnRequestEvent = EventBase<'spawn_request', SpawnRequestPayload>;
 
@@ -150,6 +171,14 @@ export interface SubtaskCompletePayload {
   summary?: string;
   reason?: string;
   budget?: SubtaskBudgetPayload;
+  /**
+   * Resume token for the provider the child used (e.g. cc's
+   * `session_id`). Captured by the provider during the run and
+   * surfaced here so the parent can pass it back via
+   * `spawn({providerSessionId})` to continue the same internal
+   * conversation without re-paying context tokens.
+   */
+  providerSessionId?: string;
 }
 export type SubtaskCompleteEvent = EventBase<'subtask_complete', SubtaskCompletePayload>;
 

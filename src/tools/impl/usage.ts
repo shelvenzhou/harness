@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import type { ProviderUsageSnapshot } from '@harness/llm/providerUsageRegistry.js';
+
 import type { Tool } from '../tool.js';
 
 /**
@@ -47,6 +49,14 @@ export interface UsageOutput {
       tokens?: number;
     };
   };
+  /**
+   * Per-provider account snapshots collected by the runtime over its
+   * lifetime. Populated only for providers that report something
+   * (today: cc / codex via `CodingAgentProvider`); raw OpenAI Chat
+   * does not introspect and is absent. Each entry is the most
+   * recent state seen — no history.
+   */
+  providers?: ProviderUsageSnapshot[];
 }
 
 export const usageTool: Tool<typeof UsageArgs, UsageOutput> = {
@@ -56,6 +66,8 @@ export const usageTool: Tool<typeof UsageArgs, UsageOutput> = {
     'Read the runtime\'s accounting: tokens consumed this turn / this thread, sampling steps so far, and any configured token caps.',
     '',
     'Inside a spawned child, this also reports the child budget caps and current usage/remaining counts so you can decide whether to wrap up now or keep exploring.',
+    '',
+    'When coding-agent providers (cc / codex) have run during this runtime, output also carries `providers[]` with each one\'s most recent account-level snapshot: last session id, last-run tokens / cost / model. Read this instead of asking a subagent over chat.',
     '',
     'Pull-only — the runtime never pushes "you have N tokens left" into your prompt; if you want to know, ask. Use it when the task is open-ended and you want to decide whether to keep iterating, summarise now, or hand off via spawn.',
     '',

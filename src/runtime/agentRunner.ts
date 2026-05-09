@@ -21,6 +21,7 @@ import type { EventBus } from '@harness/bus/eventBus.js';
 import type { StreamBus } from '@harness/bus/streamBus.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { LlmProvider, SamplingRequest } from '@harness/llm/provider.js';
+import type { ProviderUsageRegistry } from '@harness/llm/providerUsageRegistry.js';
 import { parseSampling } from '@harness/llm/actionParser.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { Tool, ToolExecutionContext } from '@harness/tools/tool.js';
@@ -127,6 +128,15 @@ export interface AgentRunnerOptions {
   /** Optional live budget snapshot for spawned children. */
   runtimeBudgetSnapshot?: () => RuntimeBudgetSnapshot | undefined;
   /**
+   * Optional provider usage registry. When set, the `usage` tool's
+   * output gains a `providers` section listing every provider that
+   * has reported account-level state during the runtime's lifetime
+   * (e.g. cc / codex last session id, last-run tokens, last cost).
+   * Read-only path — providers push into the registry from their
+   * own `sample()` runs.
+   */
+  providerUsageRegistry?: ProviderUsageRegistry;
+  /**
    * Called when the runner wants to spawn a child. Injected so subagent-
    * pool behaviour (budgets, shared bus, traceparent propagation) is
    * decided externally.
@@ -151,6 +161,18 @@ export interface SpawnRequestInfo {
   budget: { maxTurns?: number; maxToolCalls?: number; maxWallMs?: number; maxTokens?: number };
   contextRefs?: ContextRef[];
   parentTraceparent?: string;
+  /**
+   * Per-spawn provider key. Resolved by `SubagentPool` against
+   * `providerFactories`; falls back to the pool's default provider
+   * when undefined. See design-docs/11-self-update.md §R2.
+   */
+  provider?: string;
+  /** Working directory for the chosen provider (mandatory for coding-agent backends). */
+  cwd?: string;
+  /** Resume token forwarded to the provider (e.g. cc `--resume <id>`). */
+  providerSessionId?: string;
+  /** Schema-only in M1; reopen semantics land in M2. */
+  continueThreadId?: ThreadId;
 }
 
 export class AgentRunner {
@@ -854,6 +876,10 @@ export class AgentRunner {
         maxTokens?: number;
       };
       contextRefs?: ContextRef[];
+      provider?: string;
+      cwd?: string;
+      providerSessionId?: string;
+      continueThreadId?: ThreadId;
     };
     const childThreadId = newThreadId();
     const turnId = this.activeTurn?.turnId ?? newTurnId();
@@ -865,6 +891,14 @@ export class AgentRunner {
         task: args.task,
         ...(args.contextRefs !== undefined ? { contextRefs: args.contextRefs } : {}),
         budget: args.budget ?? {},
+        ...(args.provider !== undefined ? { provider: args.provider } : {}),
+        ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
+        ...(args.providerSessionId !== undefined
+          ? { providerSessionId: args.providerSessionId }
+          : {}),
+        ...(args.continueThreadId !== undefined
+          ? { continueThreadId: args.continueThreadId }
+          : {}),
       },
       turnId,
     });
@@ -879,6 +913,14 @@ export class AgentRunner {
           budget: args.budget ?? {},
           ...(args.contextRefs !== undefined ? { contextRefs: args.contextRefs } : {}),
           parentTraceparent: childOf(undefined),
+          ...(args.provider !== undefined ? { provider: args.provider } : {}),
+          ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
+          ...(args.providerSessionId !== undefined
+            ? { providerSessionId: args.providerSessionId }
+            : {}),
+          ...(args.continueThreadId !== undefined
+            ? { continueThreadId: args.continueThreadId }
+            : {}),
         });
         if (spawnedChildThreadId !== childThreadId) {
           throw new Error(
@@ -1040,6 +1082,7 @@ export class AgentRunner {
     // the runtime — only the raw numbers + the configured caps.
     const caps = this.opts.tokenBudget ?? {};
     const runtimeBudget = this.opts.runtimeBudgetSnapshot?.();
+    const providers = this.opts.providerUsageRegistry?.entries() ?? [];
     await this.persistToolResult(toolCallId, {
       ok: true,
       output: {
@@ -1053,6 +1096,7 @@ export class AgentRunner {
             : {}),
         },
         ...(runtimeBudget !== undefined ? { subagentBudget: runtimeBudget } : {}),
+        ...(providers.length > 0 ? { providers } : {}),
       },
     });
   }

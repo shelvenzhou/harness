@@ -152,7 +152,9 @@ Per-spawn provider selection requires plumbing (none exists today —
 - `spawn` tool schema (`src/tools/impl/spawn.ts`) gets the same four
   fields. Description spells out: "use `provider:'cc'` for coding
   work in a sibling worktree; default (omitted) uses the harness's
-  primary provider for orchestration / review".
+  primary provider for orchestration / review", and gives the
+  `providerSessionId` reuse rule (carry over to continue, omit to
+  start fresh).
 - `SubtaskCompletePayload` gains `providerSessionId?: string` so the
   parent can stash it in `memory` and pass it back on the next spawn.
 
@@ -432,9 +434,13 @@ issue one `spawn(provider:'cc', cwd:'…', task:'…')` and observe a
   `providerSessionId`.
 - `SpawnRequestInfo` and `spawn` tool schema gain `provider?`,
   `cwd?`, `providerSessionId?`, `continueThreadId?` fields.
-  Schema-only for `providerSessionId` / `continueThreadId` in M1
-  (pool ignores them); shipping the shape now keeps the LLM-facing
-  contract stable across milestones.
+  - `provider` / `cwd` / `providerSessionId` are **fully wired** in
+    M1 — the cc factory threads `providerSessionId` to the CLI as
+    `--resume <id>` so multi-turn design / iteration works without
+    re-paying context every spawn.
+  - `continueThreadId` is **schema-only** in M1 (pool ignores it).
+    Shipping the shape now keeps the LLM-facing contract stable
+    across milestones; full reopen semantics land in M2.
 - `SubagentPoolDeps.providerFactories` registry; coding-agent
   factory builds a one-shot `CodingAgentProvider` bound to the
   spawn's `cwd`.
