@@ -53,6 +53,11 @@ class ScriptedProvider implements LlmProvider {
   }
 }
 
+// Unix seconds for 2026-05-09T18:30:00Z (the "session resets at 6:30pm UTC"
+// vibe from cc's /usage screen). Used by the fake binary's rate_limit_event.
+const FIVE_HOUR_RESET_UNIX = Math.floor(Date.UTC(2026, 4, 9, 18, 30, 0) / 1000);
+const SEVEN_DAY_RESET_UNIX = Math.floor(Date.UTC(2026, 4, 16, 14, 0, 0) / 1000);
+
 function setupFakeCc(workdir: string, sessionId: string, replyText: string): string {
   const argvLog = join(workdir, 'last-argv.json');
   const script = join(workdir, 'fake-cc.cjs');
@@ -62,6 +67,8 @@ function setupFakeCc(workdir: string, sessionId: string, replyText: string): str
       `const fs = require('fs');`,
       `fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));`,
       `process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: ${JSON.stringify(sessionId)}, model: 'fake-claude-x' }) + '\\n');`,
+      `process.stdout.write(JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', resetsAt: ${FIVE_HOUR_RESET_UNIX}, rateLimitType: 'five_hour', utilization: 0.61, surpassedThreshold: 0.5, isUsingOverage: false } }) + '\\n');`,
+      `process.stdout.write(JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning', resetsAt: ${SEVEN_DAY_RESET_UNIX}, rateLimitType: 'seven_day', utilization: 0.89, surpassedThreshold: 0.75, isUsingOverage: false } }) + '\\n');`,
       `process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, duration_ms: 5, num_turns: 3, total_cost_usd: 0.0123, usage: { input_tokens: 11, output_tokens: 22, cache_read_input_tokens: 5 }, result: ${JSON.stringify(replyText)}, session_id: ${JSON.stringify(sessionId)} }) + '\\n');`,
     ].join('\n'),
   );
@@ -172,6 +179,22 @@ describe.skipIf(process.platform === 'win32')('smoke: spawn(provider:"cc")', () 
       inputTokens: 11,
       outputTokens: 22,
       cacheReadInputTokens: 5,
+    });
+    // Account-level windowed quota: cc's `rate_limit_event` for the
+    // 5-hour rolling session and the 7-day rolling week.
+    expect(snap!.fiveHour).toEqual({
+      utilization: 0.61,
+      resetsAt: new Date(FIVE_HOUR_RESET_UNIX * 1000).toISOString(),
+      status: 'allowed',
+      surpassedThreshold: 0.5,
+      isUsingOverage: false,
+    });
+    expect(snap!.sevenDay).toEqual({
+      utilization: 0.89,
+      resetsAt: new Date(SEVEN_DAY_RESET_UNIX * 1000).toISOString(),
+      status: 'allowed_warning',
+      surpassedThreshold: 0.75,
+      isUsingOverage: false,
     });
 
     // Second spawn carrying providerSessionId → expect --resume <id>.

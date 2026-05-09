@@ -10,6 +10,7 @@ import type {
   SamplingRequest,
 } from './provider.js';
 import type {
+  ProviderQuotaWindow,
   ProviderUsagePatch,
   ProviderUsageRegistry,
 } from './providerUsageRegistry.js';
@@ -108,6 +109,19 @@ interface CcSystemInit {
   session_id?: string;
   cwd?: string;
   model?: string;
+}
+
+interface CcRateLimitEvent {
+  type: 'rate_limit_event';
+  rate_limit_info?: {
+    status?: string;
+    resetsAt?: number;
+    /** Provider tag: 'five_hour' (cc session) | 'seven_day' (cc week) | … */
+    rateLimitType?: string;
+    utilization?: number;
+    surpassedThreshold?: number;
+    isUsingOverage?: boolean;
+  };
 }
 
 interface CcResult {
@@ -241,6 +255,10 @@ export class CodingAgentProvider implements LlmProvider {
             if (e.type === 'user') {
               // CLI replays its own internal tool_results back into
               // the conversation. Internal-only; drop.
+              break;
+            }
+            if (e.type === 'rate_limit_event') {
+              this.pushUsagePatch(buildRateLimitPatch(e as unknown as CcRateLimitEvent));
               break;
             }
             if (e.type === 'result') {
@@ -428,6 +446,39 @@ async function* pumpStream(
 }
 
 type CcChild = ChildProcessByStdio<null, Readable, Readable>;
+
+function buildRateLimitPatch(ev: CcRateLimitEvent): ProviderUsagePatch {
+  const info = ev.rate_limit_info;
+  if (!info) return {};
+  const utilization = typeof info.utilization === 'number' ? info.utilization : undefined;
+  const resetsAt =
+    typeof info.resetsAt === 'number'
+      ? new Date(info.resetsAt * 1000).toISOString()
+      : undefined;
+  if (utilization === undefined || resetsAt === undefined) return {};
+  const window: ProviderQuotaWindow = {
+    utilization,
+    resetsAt,
+    ...(typeof info.status === 'string' ? { status: info.status } : {}),
+    ...(typeof info.surpassedThreshold === 'number'
+      ? { surpassedThreshold: info.surpassedThreshold }
+      : {}),
+    ...(typeof info.isUsingOverage === 'boolean'
+      ? { isUsingOverage: info.isUsingOverage }
+      : {}),
+  };
+  // cc's `rateLimitType` is the discriminator. Anything we don't
+  // recognise is dropped silently — better to surface no data than
+  // mislabel a future window kind.
+  switch (info.rateLimitType) {
+    case 'five_hour':
+      return { fiveHour: window };
+    case 'seven_day':
+      return { sevenDay: window };
+    default:
+      return {};
+  }
+}
 
 function buildResultPatch(r: CcResult): ProviderUsagePatch {
   const patch: ProviderUsagePatch = {};

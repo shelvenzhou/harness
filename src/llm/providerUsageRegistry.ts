@@ -29,6 +29,28 @@ export interface ProviderTokenStats {
   cacheCreationInputTokens?: number;
 }
 
+/**
+ * Account-level windowed quota state, modelled after cc's
+ * `rate_limit_event.rate_limit_info`. The same shape covers cc's
+ * 5-hour rolling session and 7-day rolling weekly windows; the
+ * registry stores one of each.
+ *
+ * `utilization` is a fraction in [0, 1]. `resetsAt` is ISO-8601
+ * (the provider reports a unix-second timestamp; we normalise on
+ * write). `status` mirrors the provider's tag — values seen in
+ * practice include `'allowed'`, `'allowed_warning'`, and
+ * (presumably) `'blocked'` when the cap is hit; treat as opaque.
+ */
+export interface ProviderQuotaWindow {
+  utilization: number;
+  resetsAt: string;
+  status?: string;
+  /** Threshold the provider crossed to emit this update (e.g. 0.75, 0.9). */
+  surpassedThreshold?: number;
+  /** Whether the provider is consuming overage / extra usage. */
+  isUsingOverage?: boolean;
+}
+
 export interface ProviderUsageSnapshot {
   /** Stable provider id (e.g. 'cc', 'codex'). */
   provider: string;
@@ -44,6 +66,17 @@ export interface ProviderUsageSnapshot {
   lastDurationMs?: number;
   /** Model id reported by the provider on the most recent run. */
   lastModel?: string;
+  /**
+   * 5-hour rolling-session window state (cc's "current session" in
+   * `/usage`). Populated when the provider emits a window update;
+   * absent until the first run that surfaces one.
+   */
+  fiveHour?: ProviderQuotaWindow;
+  /**
+   * 7-day rolling-week window state (cc's "current week" in
+   * `/usage`).
+   */
+  sevenDay?: ProviderQuotaWindow;
   /** ISO-8601 timestamp of the most recent registry update. */
   lastUpdateAt: string;
 }
@@ -55,6 +88,8 @@ export interface ProviderUsagePatch {
   lastTurns?: number;
   lastDurationMs?: number;
   lastModel?: string;
+  fiveHour?: ProviderQuotaWindow;
+  sevenDay?: ProviderQuotaWindow;
 }
 
 export class ProviderUsageRegistry {
