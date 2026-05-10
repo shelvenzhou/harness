@@ -52,6 +52,7 @@ class FakeDiscordTransport implements DiscordTransport {
   edits: EditEntry[] = [];
   typing = 0;
   sendTextDelayMs = 0;
+  editTextDelayMs = 0;
   private nextId = 1;
   private incoming: DiscordIncomingHandler | undefined;
 
@@ -75,6 +76,9 @@ class FakeDiscordTransport implements DiscordTransport {
     return ref;
   }
   async editText(ref: DiscordMessageRef, text: string): Promise<void> {
+    if (this.editTextDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.editTextDelayMs));
+    }
     this.edits.push({ ref, text });
   }
   async startTyping(_channelId: string): Promise<void> {
@@ -92,6 +96,7 @@ async function makeAdapter(
   opts: {
     editIntervalMs?: number;
     sendTextDelayMs?: number;
+    editTextDelayMs?: number;
     channelId?: string;
     threadBinding?: Parameters<DiscordAdapter['start']>[0]['threadBinding'];
   } = {},
@@ -103,6 +108,7 @@ async function makeAdapter(
   await store.createThread({ id: tid, rootTraceparent: newRootTraceparent() });
   const transport = new FakeDiscordTransport();
   transport.sendTextDelayMs = opts.sendTextDelayMs ?? 0;
+  transport.editTextDelayMs = opts.editTextDelayMs ?? 0;
   const adapter = new DiscordAdapter({
     store,
     transport,
@@ -303,10 +309,14 @@ describe('DiscordAdapter', () => {
     expect(t1).toBeDefined();
     expect(t2).toBeDefined();
     expect(t1).not.toBe(t2);
-    expect((await store.readAll(t1!)).find((e) => e.kind === 'user_turn_start')?.payload).toMatchObject({
+    expect(
+      (await store.readAll(t1!)).find((e) => e.kind === 'user_turn_start')?.payload,
+    ).toMatchObject({
       text: 'one',
     });
-    expect((await store.readAll(t2!)).find((e) => e.kind === 'user_turn_start')?.payload).toMatchObject({
+    expect(
+      (await store.readAll(t2!)).find((e) => e.kind === 'user_turn_start')?.payload,
+    ).toMatchObject({
       text: 'two',
     });
     await adapter.stop();
@@ -373,6 +383,64 @@ describe('DiscordAdapter', () => {
     await adapter.stop();
   });
 
+  it('coalesces back-to-back stream deltas until flush', async () => {
+    const { adapter, streamBus, transport, threadId } = await makeAdapter();
+    const turnId = newTurnId();
+
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'one ' });
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'two ' });
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'three' });
+    await settle();
+
+    expect(transport.sent.filter((s) => s.kind === 'text')).toHaveLength(0);
+
+    streamBus.publish({ kind: 'sampling_flush', threadId, turnId });
+    await settle();
+
+    const texts = transport.sent.filter((s) => s.kind === 'text');
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.text).toBe('one two three');
+    await adapter.stop();
+  });
+
+  it('does not enqueue overlapping live edits while a previous edit is in flight', async () => {
+    const { adapter, streamBus, transport, threadId } = await makeAdapter({
+      editIntervalMs: 0,
+      editTextDelayMs: 20,
+    });
+    const turnId = newTurnId();
+
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'a' });
+    streamBus.publish({ kind: 'sampling_flush', threadId, turnId });
+    await settle();
+
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'b' });
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'c' });
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'd' });
+    streamBus.publish({ kind: 'sampling_flush', threadId, turnId });
+
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    expect(transport.edits.length).toBeLessThanOrEqual(3);
+    expect(transport.edits[transport.edits.length - 1]?.text).toBe('bcd');
+    await adapter.stop();
+  });
+
+  it('drains pending stream text before rendering later bus events', async () => {
+    const { adapter, bus, streamBus, transport, threadId } = await makeAdapter();
+    const turnId = newTurnId();
+
+    streamBus.publish({ kind: 'text_delta', threadId, turnId, text: 'pending reply' });
+    bus.publish(makeToolCallEvent(threadId, 'shell', { cmd: 'pwd' }));
+    await settle();
+
+    const texts = transport.sent.filter((s) => s.kind === 'text');
+    expect(texts).toHaveLength(2);
+    expect(texts[0]!.text).toBe('pending reply');
+    expect(texts[1]!.text).toBe('-# 🔧 shell `pwd`');
+    await adapter.stop();
+  });
+
   it('falls back to a fresh message when persisted reply does not match streamed text', async () => {
     const { adapter, bus, transport, threadId } = await makeAdapter();
     bus.publish(makeReplyEvent(threadId, 'unstreamed reply'));
@@ -405,7 +473,9 @@ describe('DiscordAdapter', () => {
 
   it('hides internal wait tool chatter', async () => {
     const { adapter, bus, transport, threadId } = await makeAdapter();
-    bus.publish(makeToolCallEvent(threadId, 'wait', { matcher: 'session', sessionIds: ['sess_1'] }));
+    bus.publish(
+      makeToolCallEvent(threadId, 'wait', { matcher: 'session', sessionIds: ['sess_1'] }),
+    );
     await settle();
     bus.publish(makeToolResultEvent(threadId, true, { scheduled: true, matcher: 'session' }));
     await settle();

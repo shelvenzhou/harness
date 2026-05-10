@@ -5,12 +5,7 @@ import type { ThreadId } from '@harness/core/ids.js';
 import type { HarnessEvent } from '@harness/core/events.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 
-import type {
-  Adapter,
-  AdapterStartOptions,
-  SessionRouter,
-  ThreadBinding,
-} from './adapter.js';
+import type { Adapter, AdapterStartOptions, SessionRouter, ThreadBinding } from './adapter.js';
 import {
   RealDiscordTransport,
   type DiscordEmbed,
@@ -88,7 +83,9 @@ const SLASH_COMMAND_SPECS = [
 /** Soft cap below Discord's 2000-char message limit; leaves margin for prefixes. */
 const SOFT_CAP = 1900;
 /** Throttle live edits to stay well under Discord's edit rate limit. */
-const DEFAULT_EDIT_INTERVAL_MS = 750;
+const DEFAULT_EDIT_INTERVAL_MS = 1500;
+/** Coalesce token deltas before they enter the serialized Discord output queue. */
+const STREAM_BATCH_INTERVAL_MS = 250;
 
 type StreamChannel = 'reply' | 'preamble' | 'reasoning';
 
@@ -101,6 +98,12 @@ interface LiveMessage {
   lastEditAt: number;
   /** Pending throttle timer that will flush the latest text. */
   pendingTimer: NodeJS.Timeout | undefined;
+  /** True while a Discord edit request is in flight for this message. */
+  editInFlight: boolean;
+  /** Promise for the current in-flight edit, if any. */
+  editPromise: Promise<void> | undefined;
+  /** Latest text/channel to edit after the in-flight request settles. */
+  queuedEdit: { channel: StreamChannel; text: string } | undefined;
   /** True if the message has hit SOFT_CAP and a continuation is owed. */
   full: boolean;
 }
@@ -113,6 +116,13 @@ interface DiscordThreadState {
   toolCallRefs: Map<string, { ref: DiscordMessageRef; rendered: string }>;
 }
 
+interface PendingStreamBatch {
+  segments: Array<{ channel: StreamChannel; text: string }>;
+  flush: boolean;
+  timer: NodeJS.Timeout | undefined;
+  drainQueued: boolean;
+  drainInFlight: boolean;
+}
 
 /** Title prefix used to persist Discord channel → thread mappings. */
 export const DISCORD_THREAD_TITLE_PREFIX = 'discord:';
@@ -124,7 +134,7 @@ export interface DiscordAdapterOptions {
   token?: string;
   /** Optional channel to bind to. Omit for @bot-triggered channel binding. */
   channelId?: string;
-  /** Edit-throttle interval in ms. Default 750. */
+  /** Edit-throttle interval in ms. Default 1500. */
   editIntervalMs?: number;
   /**
    * Optional dev guild id. When set, slash commands register as
@@ -157,6 +167,7 @@ export class DiscordAdapter implements Adapter {
   private readonly pendingChannelThreads = new Map<string, Promise<ThreadId>>();
   private readonly threadChannels = new Map<ThreadId, string>();
   private readonly states = new Map<ThreadId, DiscordThreadState>();
+  private readonly pendingStreamBatches = new Map<ThreadId, PendingStreamBatch>();
   private readonly shutdownPromise: Promise<void>;
   private resolveShutdown!: () => void;
 
@@ -233,6 +244,16 @@ export class DiscordAdapter implements Adapter {
   async stop(): Promise<void> {
     this.subscription?.unsubscribe();
     this.streamSubscription?.unsubscribe();
+    for (const [threadId, batch] of this.pendingStreamBatches) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+        batch.timer = undefined;
+      }
+      if (!batch.drainQueued && (batch.segments.length > 0 || batch.flush)) {
+        batch.drainQueued = true;
+        void this.enqueueOutput(() => this.drainStreamBatch(threadId));
+      }
+    }
     await this.outputTail;
     for (const state of this.states.values()) {
       if (state.live?.pendingTimer) {
@@ -520,7 +541,7 @@ export class DiscordAdapter implements Adapter {
     if (this.streamBus) {
       this.streamSubscription = this.streamBus.subscribe(
         (ev) => {
-          void this.enqueueOutput(() => this.handleStreamEvent(ev));
+          this.queueStreamEvent(ev);
         },
         binding.kind === 'single' ? { threadId: binding.threadId } : {},
       );
@@ -683,10 +704,7 @@ export class DiscordAdapter implements Adapter {
     }
   }
 
-  private async archiveOldChannelThread(
-    channelId: string,
-    oldThreadId: ThreadId,
-  ): Promise<void> {
+  private async archiveOldChannelThread(channelId: string, oldThreadId: ThreadId): Promise<void> {
     try {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       await this.store.updateThread(oldThreadId, {
@@ -749,6 +767,7 @@ export class DiscordAdapter implements Adapter {
   private async handleBusEvent(ev: HarnessEvent): Promise<void> {
     const channelId = this.threadChannels.get(ev.threadId);
     if (!channelId) return;
+    await this.drainPendingStreamBeforeBusEvent(ev.threadId);
     const state = this.stateFor(ev.threadId);
     try {
       switch (ev.kind) {
@@ -869,29 +888,140 @@ export class DiscordAdapter implements Adapter {
 
   // ─── stream rendering ──────────────────────────────────────────────────
 
-  private async handleStreamEvent(ev: StreamEvent): Promise<void> {
+  private queueStreamEvent(ev: StreamEvent): void {
     const channelId = this.threadChannels.get(ev.threadId);
     if (!channelId) return;
-    const state = this.stateFor(ev.threadId);
+
+    const batch = this.streamBatchFor(ev.threadId);
     if (ev.kind === 'sampling_flush') {
-      await this.flushLive(state);
-      state.flushed = true;
+      batch.flush = true;
+      this.scheduleStreamDrain(ev.threadId, true);
       return;
     }
-    if (state.flushed) {
+
+    if (ev.kind === 'reasoning_delta') {
+      // Discord renders persisted reasoning only; do not let partial
+      // reasoning deltas build up a serialized backlog.
+      return;
+    }
+
+    const channel: StreamChannel = ev.channel ?? 'reply';
+    const last = batch.segments[batch.segments.length - 1];
+    if (last && last.channel === channel) {
+      last.text += ev.text;
+    } else {
+      batch.segments.push({ channel, text: ev.text });
+    }
+    this.scheduleStreamDrain(ev.threadId, false);
+  }
+
+  private streamBatchFor(threadId: ThreadId): PendingStreamBatch {
+    let batch = this.pendingStreamBatches.get(threadId);
+    if (!batch) {
+      batch = {
+        segments: [],
+        flush: false,
+        timer: undefined,
+        drainQueued: false,
+        drainInFlight: false,
+      };
+      this.pendingStreamBatches.set(threadId, batch);
+    }
+    return batch;
+  }
+
+  private scheduleStreamDrain(threadId: ThreadId, immediate: boolean): void {
+    const batch = this.streamBatchFor(threadId);
+    if (batch.drainQueued || batch.drainInFlight) return;
+
+    if (immediate) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+        batch.timer = undefined;
+      }
+      batch.drainQueued = true;
+      void this.enqueueOutput(() => this.drainStreamBatch(threadId));
+      return;
+    }
+
+    if (batch.timer) return;
+    batch.timer = setTimeout(() => {
+      batch.timer = undefined;
+      if (batch.drainQueued || batch.drainInFlight) return;
+      batch.drainQueued = true;
+      void this.enqueueOutput(() => this.drainStreamBatch(threadId));
+    }, STREAM_BATCH_INTERVAL_MS);
+  }
+
+  private async drainStreamBatch(threadId: ThreadId): Promise<void> {
+    const batch = this.pendingStreamBatches.get(threadId);
+    if (!batch) return;
+
+    batch.drainQueued = false;
+    batch.drainInFlight = true;
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+      batch.timer = undefined;
+    }
+
+    try {
+      for (;;) {
+        const segments = batch.segments;
+        const flush = batch.flush;
+        batch.segments = [];
+        batch.flush = false;
+        if (segments.length === 0 && !flush) break;
+
+        const channelId = this.threadChannels.get(threadId);
+        if (channelId) {
+          const state = this.stateFor(threadId);
+          await this.handleStreamBatch(state, channelId, { segments, flush });
+        }
+
+        if (batch.segments.length === 0 && !batch.flush) break;
+      }
+    } finally {
+      batch.drainInFlight = false;
+      if (batch.segments.length > 0 || batch.flush) {
+        this.scheduleStreamDrain(threadId, batch.flush);
+      } else if (!batch.timer && !batch.drainQueued) {
+        this.pendingStreamBatches.delete(threadId);
+      }
+    }
+  }
+
+  private async drainPendingStreamBeforeBusEvent(threadId: ThreadId): Promise<void> {
+    const batch = this.pendingStreamBatches.get(threadId);
+    if (!batch) return;
+    if (batch.segments.length === 0 && !batch.flush) return;
+    if (batch.drainInFlight) return;
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+      batch.timer = undefined;
+    }
+    await this.drainStreamBatch(threadId);
+  }
+
+  private async handleStreamBatch(
+    state: DiscordThreadState,
+    channelId: string,
+    batch: { segments: Array<{ channel: StreamChannel; text: string }>; flush: boolean },
+  ): Promise<void> {
+    if (state.flushed && batch.segments.length > 0) {
       state.streamed.reply = '';
       state.streamed.preamble = '';
       state.streamed.reasoning = '';
       state.flushed = false;
     }
-    if (ev.kind === 'reasoning_delta') {
-      // Discord only renders the persisted reasoning event. Streaming
-      // reasoning deltas are often partial and are followed by the full event,
-      // so showing both creates duplicated, out-of-order thinking blocks.
-      return;
+
+    for (const segment of batch.segments) {
+      await this.appendDelta(state, channelId, segment.channel, segment.text);
     }
-    const channel: StreamChannel = ev.channel ?? 'reply';
-    await this.appendDelta(state, channelId, channel, ev.text);
+
+    if (batch.flush) {
+      await this.flushLive(state);
+      state.flushed = true;
+    }
   }
 
   private async appendDelta(
@@ -936,14 +1066,17 @@ export class DiscordAdapter implements Adapter {
     ref: DiscordMessageRef,
     text: string,
   ): void {
-      state.live = {
-        channel,
-        ref,
-        text,
-        lastEditAt: Date.now(),
-        pendingTimer: undefined,
-        full: renderedLength(channel, text) >= SOFT_CAP,
-      };
+    state.live = {
+      channel,
+      ref,
+      text,
+      lastEditAt: Date.now(),
+      pendingTimer: undefined,
+      editInFlight: false,
+      editPromise: undefined,
+      queuedEdit: undefined,
+      full: renderedLength(channel, text) >= SOFT_CAP,
+    };
   }
 
   /**
@@ -955,6 +1088,10 @@ export class DiscordAdapter implements Adapter {
   private scheduleEdit(state: DiscordThreadState): void {
     if (!state.live) return;
     if (state.live.pendingTimer) return;
+    if (state.live.editInFlight) {
+      state.live.queuedEdit = { channel: state.live.channel, text: state.live.text };
+      return;
+    }
     const elapsed = Date.now() - state.live.lastEditAt;
     const wait = Math.max(0, this.editIntervalMs - elapsed);
     state.live.pendingTimer = setTimeout(() => {
@@ -965,18 +1102,41 @@ export class DiscordAdapter implements Adapter {
   private async fireScheduledEdit(state: DiscordThreadState): Promise<void> {
     if (!state.live) return;
     state.live.pendingTimer = undefined;
+    if (state.live.editInFlight) {
+      state.live.queuedEdit = { channel: state.live.channel, text: state.live.text };
+      return;
+    }
     await this.editLiveNow(state, state.live.text);
   }
 
   private async editLiveNow(state: DiscordThreadState, text: string): Promise<void> {
-    if (!state.live) return;
-    const rendered = renderForChannel(state.live.channel, text);
+    const live = state.live;
+    if (!live) return;
+    if (live.editInFlight) {
+      live.queuedEdit = { channel: live.channel, text };
+      return;
+    }
+    live.editInFlight = true;
+    const channel = live.channel;
+    const rendered = renderForChannel(channel, text);
+    const editPromise = this.transport.editText(live.ref, rendered);
+    live.editPromise = editPromise;
     try {
-      await this.transport.editText(state.live.ref, rendered);
-      if (state.live) state.live.lastEditAt = Date.now();
+      await editPromise;
+      if (state.live === live) live.lastEditAt = Date.now();
     } catch {
       // Drop edit failures silently — the persisted reply event will
       // post a fallback message at sampling end.
+    } finally {
+      live.editInFlight = false;
+      if (live.editPromise === editPromise) live.editPromise = undefined;
+      if (state.live === live && live.queuedEdit) {
+        const next = live.queuedEdit;
+        live.queuedEdit = undefined;
+        live.channel = next.channel;
+        live.text = next.text;
+        this.scheduleEdit(state);
+      }
     }
   }
 
@@ -999,6 +1159,14 @@ export class DiscordAdapter implements Adapter {
     if (live.pendingTimer) {
       clearTimeout(live.pendingTimer);
       live.pendingTimer = undefined;
+    }
+    live.queuedEdit = undefined;
+    if (live.editPromise) {
+      try {
+        await live.editPromise;
+      } catch {
+        // editLiveNow handles failures; this await is only ordering.
+      }
     }
     let renderChannel = live.channel;
     let renderText = live.text;
