@@ -4,11 +4,12 @@ import { parseArgs } from 'node:util';
 import 'dotenv/config';
 
 import type { LlmProvider } from '@harness/llm/provider.js';
-import { OpenAIProvider } from '@harness/llm/openaiProvider.js';
+import { OpenAIProvider, type OpenAIApiMode } from '@harness/llm/openaiProvider.js';
 import { JsonlMemoryStore } from '@harness/memory/jsonlMemoryStore.js';
 import { Mem0Store } from '@harness/memory/mem0Store.js';
 import type { MemoryStore } from '@harness/memory/types.js';
-import { bootstrap } from '@harness/runtime/bootstrap.js';
+import { bootstrap, type RuntimeModelInfo } from '@harness/runtime/bootstrap.js';
+import type { ProviderFactory } from '@harness/runtime/subagentPool.js';
 import { GoogleSearchBackend } from '@harness/search/googleSearch.js';
 import { TavilySearchBackend } from '@harness/search/tavilySearch.js';
 import type { SearchBackend } from '@harness/search/types.js';
@@ -30,7 +31,9 @@ async function main(): Promise<void> {
     options: {
       provider: { type: 'string' },
       model: { type: 'string' },
+      'model-key': { type: 'string' },
       'base-url': { type: 'string' },
+      'api-mode': { type: 'string' },
       system: { type: 'string' },
       'store-root': { type: 'string' },
       adapter: { type: 'string' },
@@ -45,11 +48,18 @@ async function main(): Promise<void> {
   }
 
   const providerName = values.provider ?? process.env['HARNESS_PROVIDER'] ?? 'openai';
-  const provider = buildProvider({
+  const providerSpec = buildProvider({
     name: providerName,
     ...(typeof values.model === 'string' ? { model: values.model } : {}),
+    ...(typeof values['model-key'] === 'string'
+      ? { modelKey: values['model-key'] }
+      : {}),
     ...(typeof values['base-url'] === 'string' ? { baseURL: values['base-url'] } : {}),
+    ...(typeof values['api-mode'] === 'string' ? { apiMode: values['api-mode'] } : {}),
   });
+  const provider = providerSpec.provider;
+  const providerFactories = buildEnvProviderFactories();
+  const providerFactoryModelInfo = buildEnvProviderModelInfo();
 
   const systemPrompt =
     typeof values.system === 'string'
@@ -78,6 +88,9 @@ async function main(): Promise<void> {
     ...(searchBackend !== undefined ? { searchBackend } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
     ...(useSubagentCompactor ? { useSubagentCompactor: true } : {}),
+    ...(Object.keys(providerFactories).length > 0 ? { providerFactories } : {}),
+    ...(providerSpec.modelInfo !== undefined ? { runtimeModelInfo: providerSpec.modelInfo } : {}),
+    ...(Object.keys(providerFactoryModelInfo).length > 0 ? { providerFactoryModelInfo } : {}),
   });
 
   const adapterName =
@@ -143,35 +156,199 @@ async function main(): Promise<void> {
 interface BuildProviderArgs {
   name: string;
   model?: string;
+  modelKey?: string;
   baseURL?: string;
+  apiMode?: string;
 }
 
-function buildProvider(args: BuildProviderArgs): LlmProvider {
+function buildProvider(args: BuildProviderArgs): BuildProviderResult {
   switch (args.name) {
     case 'openai': {
-      const apiKey = process.env['OPENAI_API_KEY'];
-      if (!apiKey) {
-        throw new Error(
-          'OPENAI_API_KEY is required. Copy .env.example to .env and fill it in.',
-        );
-      }
-      const model = args.model ?? process.env['OPENAI_MODEL'];
-      const baseURL = args.baseURL ?? process.env['OPENAI_BASE_URL'];
-      const maxTokens = envNumber('OPENAI_MAX_TOKENS');
-      const temperature = envNumber('OPENAI_TEMPERATURE');
-      const reasoning = buildReasoningOptions();
-      return new OpenAIProvider({
-        apiKey,
-        ...(model !== undefined ? { model } : {}),
-        ...(baseURL !== undefined ? { baseURL } : {}),
-        ...(maxTokens !== undefined ? { defaultMaxTokens: maxTokens } : {}),
-        ...(temperature !== undefined ? { defaultTemperature: temperature } : {}),
-        ...(reasoning !== undefined ? { reasoning } : {}),
+      return buildOpenAIProvider({
+        ...(args.model !== undefined ? { model: args.model } : {}),
+        ...(args.modelKey !== undefined ? { modelKey: args.modelKey } : {}),
+        ...(args.baseURL !== undefined ? { baseURL: args.baseURL } : {}),
+        ...(args.apiMode !== undefined ? { apiMode: args.apiMode } : {}),
       });
     }
     default:
       throw new Error(`unknown provider: ${args.name}`);
   }
+}
+
+interface BuildProviderResult {
+  provider: LlmProvider;
+  modelInfo?: RuntimeModelInfo;
+}
+
+interface OpenAIProviderBuildArgs {
+  model?: string;
+  modelKey?: string;
+  baseURL?: string;
+  apiMode?: string;
+}
+
+interface EnvModelConfig {
+  provider: 'openai';
+  model: string;
+  apiMode?: OpenAIApiMode;
+  baseURL?: string;
+  apiKeyEnv?: string;
+  maxTokens?: number;
+  temperature?: number;
+  reasoning?: ReturnType<typeof buildReasoningOptions>;
+  chatMaxTokensParam?: 'max_completion_tokens' | 'max_tokens';
+}
+
+function buildOpenAIProvider(args: OpenAIProviderBuildArgs = {}): BuildProviderResult {
+  const selectedKey = args.modelKey ?? process.env['HARNESS_MAIN_MODEL'];
+  const aliasConfig = selectedKey ? readEnvModelConfigs()[selectedKey] : undefined;
+
+  // Resolve the base config: a matching alias takes precedence, otherwise
+  // start from the global OPENAI_* env (with HARNESS_MAIN_MODEL treated as
+  // a raw model id when it doesn't name an alias).
+  let config: EnvModelConfig;
+  let alias: string | undefined;
+  if (aliasConfig) {
+    config = { ...aliasConfig };
+    alias = selectedKey;
+  } else {
+    config = {
+      provider: 'openai',
+      model: selectedKey ?? process.env['OPENAI_MODEL'] ?? 'gpt-4o-mini',
+    };
+    const envApiMode = parseApiMode(process.env['OPENAI_API_MODE']);
+    const envBaseURL = process.env['OPENAI_BASE_URL'];
+    if (envApiMode !== undefined) config.apiMode = envApiMode;
+    if (envBaseURL !== undefined) config.baseURL = envBaseURL;
+  }
+
+  // CLI flags overlay the resolved config so --base-url / --api-mode /
+  // --model can tweak a single field without dropping the rest of the
+  // alias (apiKeyEnv, reasoning, etc.).
+  if (args.model !== undefined) config.model = args.model;
+  if (args.baseURL !== undefined) config.baseURL = args.baseURL;
+  const cliApiMode = parseApiMode(args.apiMode);
+  if (cliApiMode !== undefined) config.apiMode = cliApiMode;
+
+  return openAIProviderResultFromConfig(config, alias);
+}
+
+function openAIProviderFromConfig(config: EnvModelConfig): OpenAIProvider {
+  const apiKey = process.env[config.apiKeyEnv ?? 'OPENAI_API_KEY'];
+  if (!apiKey) {
+    throw new Error(
+      `${config.apiKeyEnv ?? 'OPENAI_API_KEY'} is required. Copy .env.example to .env and fill it in.`,
+    );
+  }
+  const maxTokens = config.maxTokens ?? envNumber('OPENAI_MAX_TOKENS');
+  const temperature = config.temperature ?? envNumber('OPENAI_TEMPERATURE');
+  const reasoning = config.reasoning ?? buildReasoningOptions();
+  const chatMaxTokensParam =
+    config.chatMaxTokensParam ?? parseChatMaxTokensParam(process.env['OPENAI_CHAT_MAX_TOKENS_PARAM']);
+  return new OpenAIProvider({
+    apiKey,
+    model: config.model,
+    ...(config.apiMode !== undefined ? { apiMode: config.apiMode } : {}),
+    ...(config.baseURL !== undefined ? { baseURL: config.baseURL } : {}),
+    ...(maxTokens !== undefined ? { defaultMaxTokens: maxTokens } : {}),
+    ...(temperature !== undefined ? { defaultTemperature: temperature } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(chatMaxTokensParam !== undefined ? { chatMaxTokensParam } : {}),
+  });
+}
+
+function openAIProviderResultFromConfig(
+  config: EnvModelConfig,
+  alias: string | undefined,
+): BuildProviderResult {
+  return {
+    provider: openAIProviderFromConfig(config),
+    modelInfo: modelInfoFromConfig(config, alias),
+  };
+}
+
+function buildEnvProviderFactories(): Record<string, ProviderFactory> {
+  const out: Record<string, ProviderFactory> = {};
+  for (const [key, config] of Object.entries(readEnvModelConfigs())) {
+    out[key] = () => openAIProviderFromConfig(config);
+  }
+  return out;
+}
+
+function buildEnvProviderModelInfo(): Record<string, RuntimeModelInfo> {
+  const out: Record<string, RuntimeModelInfo> = {};
+  for (const [key, config] of Object.entries(readEnvModelConfigs())) {
+    out[key] = modelInfoFromConfig(config, key);
+  }
+  return out;
+}
+
+function modelInfoFromConfig(config: EnvModelConfig, alias: string | undefined): RuntimeModelInfo {
+  return {
+    provider: config.provider,
+    model: config.model,
+    ...(alias !== undefined ? { alias } : {}),
+    ...(config.apiMode !== undefined ? { apiMode: config.apiMode } : {}),
+    ...(config.baseURL !== undefined ? { baseURL: config.baseURL } : {}),
+  };
+}
+
+function readEnvModelConfigs(): Record<string, EnvModelConfig> {
+  const out: Record<string, EnvModelConfig> = {};
+  const aliases = (process.env['HARNESS_MODEL_ALIASES'] ?? '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  for (const alias of aliases) {
+    const envKey = `HARNESS_MODEL_${envSuffix(alias)}`;
+    const raw = process.env[envKey];
+    if (!raw) continue;
+    const parts = raw.split('|').map((v) => v.trim());
+    const provider = parts[0];
+    const model = parts[1];
+    if (provider !== 'openai' || !model) continue;
+    const apiMode = parseApiMode(parts[2]);
+    const baseURL = parts[3] || undefined;
+    const apiKeyEnv = parts[4] || undefined;
+    const suffix = envSuffix(alias);
+    const reasoning = buildReasoningOptions(`OPENAI_REASONING_EFFORT_${suffix}`, `OPENAI_REASONING_SUMMARY_${suffix}`);
+    const chatMaxTokensParam = parseChatMaxTokensParam(
+      process.env[`OPENAI_CHAT_MAX_TOKENS_PARAM_${suffix}`],
+    );
+    const maxTokens = envNumber(`OPENAI_MAX_TOKENS_${suffix}`);
+    const temperature = envNumber(`OPENAI_TEMPERATURE_${suffix}`);
+    const config: EnvModelConfig = {
+      provider: 'openai',
+      model,
+    };
+    if (apiMode !== undefined) config.apiMode = apiMode;
+    if (baseURL !== undefined) config.baseURL = baseURL;
+    if (apiKeyEnv !== undefined) config.apiKeyEnv = apiKeyEnv;
+    if (maxTokens !== undefined) config.maxTokens = maxTokens;
+    if (temperature !== undefined) config.temperature = temperature;
+    if (reasoning !== undefined) config.reasoning = reasoning;
+    if (chatMaxTokensParam !== undefined) config.chatMaxTokensParam = chatMaxTokensParam;
+    out[alias] = config;
+  }
+  return out;
+}
+
+function envSuffix(alias: string): string {
+  return alias.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+}
+
+function parseApiMode(raw: string | undefined): OpenAIApiMode | undefined {
+  const v = raw?.toLowerCase();
+  if (v === 'responses' || v === 'chat_completions') return v;
+  return undefined;
+}
+
+function parseChatMaxTokensParam(
+  raw: string | undefined,
+): 'max_completion_tokens' | 'max_tokens' | undefined {
+  if (raw === 'max_completion_tokens' || raw === 'max_tokens') return raw;
+  return undefined;
 }
 
 /**
@@ -207,11 +384,14 @@ function buildDiagSinks(): DiagSink[] {
  *   OPENAI_REASONING_EFFORT   none | minimal | low | medium | high | xhigh
  *   OPENAI_REASONING_SUMMARY  auto | concise | detailed | off
  */
-function buildReasoningOptions():
+function buildReasoningOptions(
+  effortKey = 'OPENAI_REASONING_EFFORT',
+  summaryKey = 'OPENAI_REASONING_SUMMARY',
+):
   | { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null }
   | undefined {
-  const effortRaw = process.env['OPENAI_REASONING_EFFORT']?.toLowerCase();
-  const summaryRaw = process.env['OPENAI_REASONING_SUMMARY']?.toLowerCase();
+  const effortRaw = process.env[effortKey]?.toLowerCase();
+  const summaryRaw = process.env[summaryKey]?.toLowerCase();
   if (effortRaw === undefined && summaryRaw === undefined) return undefined;
   const validEfforts = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
   const out: { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null } = {};
@@ -314,12 +494,18 @@ function printUsage(): void {
       'Environment (also loaded from .env):',
       '  OPENAI_API_KEY       required',
       '  OPENAI_MODEL         default gpt-4o-mini',
-      '  OPENAI_BASE_URL      override endpoint (must implement /v1/responses)',
+      '  OPENAI_BASE_URL      override endpoint for selected OpenAI API mode',
+      '  OPENAI_API_MODE      responses (default) | chat_completions',
+      '  OPENAI_CHAT_MAX_TOKENS_PARAM  max_completion_tokens (default) | max_tokens',
       '  OPENAI_MAX_TOKENS    default 32768',
       '  OPENAI_TEMPERATURE   optional; suppressed for GPT-5/o-series models',
       '  OPENAI_REASONING_EFFORT   none|minimal|low|medium|high|xhigh (model default if unset)',
       '  OPENAI_REASONING_SUMMARY  auto|concise|detailed|off (default auto — streams thinking)',
       '  HARNESS_PROVIDER     default openai',
+      '  HARNESS_MAIN_MODEL   alias from HARNESS_MODEL_ALIASES, or raw model id',
+      '  HARNESS_MODEL_ALIASES comma-separated aliases usable by spawn.provider',
+      '  HARNESS_MODEL_<ALIAS> openai|model|responses|baseURL|apiKeyEnv',
+      '                         api mode may also be chat_completions',
       '  HARNESS_SYSTEM_PROMPT',
       '  HARNESS_STORE_ROOT   persist session events to this directory',
       '  HARNESS_DIAG         off to disable diagnostics',

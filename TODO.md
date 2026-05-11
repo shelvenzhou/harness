@@ -14,78 +14,98 @@ Full spec: [design-docs/11-self-update.md](design-docs/11-self-update.md).
 This track is now ahead of every other Phase 2 polish item — see
 the rationale in [08-roadmap.md](design-docs/08-roadmap.md).
 
-### M1 — CodingAgentProvider + per-spawn provider plumbing
+### M1 — CodingAgentProvider + per-spawn provider plumbing — 🟢 done
 
-- ⚪ Extend `SamplingDelta.end.stopReason` union with
-  `'quota_exhausted'` (payload: optional `resetAt`). Update
-  `actionParser` and `agentRunner` translation to `turn_complete.reason`.
-- ⚪ New `src/llm/codingAgentProvider.ts`:
-  - cc first (`claude -p <task> --output-format stream-json …`),
-    codex shape-compatible.
-  - parse `assistant` / `thinking` / `system_init` / terminal
-    events → `SamplingDelta`.
-  - drop cc's internal `tool_use` / `tool_result` (black-box from
-    parent's POV).
-  - SIGTERM-on-abort with grace window; mirror the group-kill in
-    `src/tools/impl/shell.ts`.
-  - capture `providerSessionId` from `system_init`; expose via getter.
-- ⚪ `SpawnRequestInfo` adds `provider?: string`, `cwd?: string`,
-  `providerSessionId?: string`, `continueThreadId?: ThreadId`.
-- ⚪ `spawn` tool schema (`src/tools/impl/spawn.ts`) gains the same
-  four fields. Description spells out cc/codex use-case + the
-  `providerSessionId` reuse rule.
-  - `provider` / `cwd` / `providerSessionId` are **fully wired** in
-    M1 — multi-turn design / iteration with cc requires the
-    sessionId to be threaded to `--resume` on every continuation
-    spawn.
-  - `continueThreadId` is **schema-only** in M1 (pool ignores it);
-    full reopen semantics land in M2.
-- ⚪ `SubagentPoolDeps.providerFactories?: Record<string, (req) => LlmProvider>`;
-  factory for cc instantiates per-spawn `CodingAgentProvider` with
-  `req.cwd`. Default global provider remains the OpenAI
-  orchestrator path.
-- ⚪ `SubtaskCompletePayload.providerSessionId?: string` populated
-  from the captured value.
-- ⚪ `bootstrap.ts` registers the cc factory under env (e.g.
-  `HARNESS_CC_BIN`, cc's own auth env). Codex factory stub behind a
-  flag.
-- ⚪ E2E: minimal session where main agent spawns cc to write a
-  fixed file in a temp sibling dir; assert `subtask_complete` +
-  file content.
+- 🟢 New `src/llm/codingAgentProvider.ts`:
+  - cc first (`claude -p <task> --output-format stream-json --verbose`),
+    codex shape-compatible (codex factory disabled by default; M6).
+  - stream-json parser handles `system/init`, `assistant`,
+    `user`, `rate_limit_event`, `result`; drops cc's internal
+    `tool_use` / `tool_result` from the parent's view.
+  - SIGTERM-on-abort with SIGKILL grace window (mirrors
+    `src/tools/impl/shell.ts`).
+  - `providerSessionId` captured from `system/init` and refreshed
+    on `result`; exposed as `lastSessionId` for the pool to read.
+- 🟢 `SpawnRequestInfo` and `spawn` tool schema gained `provider?`,
+  `cwd?`, `providerSessionId?`, `continueThreadId?`. Description
+  rewritten in capability terms (no scenario recipes).
+  - `provider` / `cwd` / `providerSessionId` fully wired.
+  - `continueThreadId` schema-only — reopen semantics deferred to M2.
+- 🟢 `SubagentPoolDeps.providerFactories`. cc factory in
+  `bootstrap.ts` builds a one-shot `CodingAgentProvider` per spawn
+  bound to `req.cwd` + `req.providerSessionId`. Caller-supplied
+  factories override built-ins.
+- 🟢 `SubtaskCompletePayload.providerSessionId` populated from
+  `provider.lastSessionId` at child-exit time.
+- 🟢 `ProviderUsageRegistry` (runtime-scoped) — bonus shipped early
+  (originally M3): cc pushes account-level snapshots into it
+  (`fiveHour` / `sevenDay` from `rate_limit_event`, plus per-run
+  tokens / cost / model / session id / turns / duration from
+  `result`). `usage` tool output gains a `providers[]` block that
+  reads from this registry, so the orchestrator can see cc / codex
+  state without a chat round-trip. In-memory only — survives the
+  current process; lost on restart.
+- 🟢 Tests: `tests/unit/llm/providerUsageRegistry.test.ts` (merge
+  semantics, multi-provider isolation) and
+  `tests/smoke/codingAgentSpawn.test.ts` (fake cc binary verifies
+  argv shape, session_id round-trip, registry capture of windowed
+  quota + per-run stats; cwd-missing surfaces
+  `provider_factory_failed`).
+- ⚪ Carried forward to M2 (was originally listed in M1):
+  `SamplingDelta.end.stopReason` `'quota_exhausted'` extension
+  + runner translation to `turn_complete.reason`. Not needed for
+  the M1 happy path; lands as part of the quota-coordination
+  story below.
 
 ### M2 — Quota coordination
 
-- ⚪ `CodingAgentProvider` recognises ratelimit / quota terminal
-  events from cc's stream-json; emits
-  `end{stopReason:'quota_exhausted', resetAt}`.
-- ⚪ Per-provider-id `QuotaState{ resetAt?, kind:'session'|'weekly' }`
-  registry (module-scoped singleton keyed by provider id).
-- ⚪ `SubagentPool.spawn` short-circuits when `QuotaState.resetAt > now`:
-  no CLI process, synthesise an immediate
-  `subtask_complete{reason:'quota_exhausted', resetAt}` to the parent.
-- ⚪ One `Scheduler` timer per `(providerId, resetAt)` (dedupe on
-  unchanged resetAt); on fire, publish
-  `external_event{source:'provider_ready', provider, resetAt}`.
+- ⚪ `CodingAgentProvider` recognises quota-exhausted terminal
+  events from cc (separate from the rate_limit_event "warning"
+  pushes already captured in M1) and emits
+  `end{stopReason:'quota_exhausted', resetAt}`. Extends
+  `SamplingDelta.end.stopReason` accordingly.
+- 🟢 Account-level windowed quota state (`fiveHour` / `sevenDay`)
+  for cc — already captured by `ProviderUsageRegistry` from
+  `rate_limit_event`. M2 reuses this rather than introducing a
+  separate `QuotaState` registry; the M2 work is the **policy
+  layer** on top (timers, fail-fast, ready event).
+- ⚪ `SubagentPool.spawn` short-circuits when the registry's
+  matching window is exhausted (`status:'blocked'` or
+  `utilization >= 1`): no CLI process, synthesise an immediate
+  `subtask_complete{reason:'quota_exhausted', resetAt}` to the
+  parent.
+- ⚪ One `Scheduler` timer per `(providerId, window, resetsAt)`
+  (dedupe on unchanged resetsAt); on fire, publish
+  `external_event{source:'provider_ready', provider, window, resetsAt}`.
 - ⚪ `continueThreadId` reopen path implemented in `SubagentPool`
   (was schema-only in M1): require thread exists, no live runner,
   append fresh `user_turn_start`, restart runner.
 - ⚪ Verify `wait` `kind` matcher + filter (`source`, `provider`)
   is sufficient to single out `provider_ready`; extend lightly if
   not.
-- ⚪ E2E with a fake cc binary that emits a quota event; parent
-  waits on `provider_ready`; parent re-spawns with
+- ⚪ E2E with a fake cc binary that emits a quota-blocked event;
+  parent waits on `provider_ready`; parent re-spawns with
   `providerSessionId` + `continueThreadId`.
 
-### M3 — Usage introspection
+### M3 — Usage introspection — 🟢 mostly absorbed into M1
 
-- ⚪ `LlmProvider.usage?(): Promise<UsageReport | 'unsupported'>`.
-- ⚪ `OpenAIProvider.usage()` → `'unsupported'`.
-- ⚪ `CodingAgentProvider.usage()` returns latest cached snapshot
-  parsed out of stream events (no extra CLI invocation).
-- ⚪ `SubtaskCompletePayload.providerUsage?: UsageReport`; pool
-  attaches at child exit.
-- ⚪ `usage` tool output gains optional `providerUsage` block (only
-  inside spawned children whose provider supports it).
+The user-visible surface of M3 already shipped early as part of
+M1 (`ProviderUsageRegistry` + `usage` tool `providers[]`). The
+remaining items are deliberately deferred — none are required
+to read account state.
+
+- ⚪ `LlmProvider.usage?()` instance method on the provider
+  interface (the registry currently bypasses this — providers
+  push state, the runtime reads). Land only if a provider needs
+  to be actively probed (e.g. one without passive emission).
+- ⚪ `SubtaskCompletePayload.providerUsage?` — per-spawn snapshot
+  attached at child exit. Distinct from the runtime-scoped
+  registry; useful for parents that want the "as-of-this-spawn"
+  numbers without a separate `usage` round-trip.
+- ⚪ Optional registry persistence to `<storeRoot>/provider-usage.json`
+  so a fresh process boot already has the last-known windows
+  (resetsAt is absolute, so restored data carries its own
+  freshness signal).
 
 ### M4 — Operator playbook (no code)
 
@@ -117,6 +137,21 @@ working demo before automating restart. No code stubs yet.
 
 - 🟢 **OpenAIProvider** — streaming + tool calls + usage reporting
   (prompt / completion / cached tokens), plus:
+  - Responses API + Chat Completions transport switch —
+    `OpenAIProviderOptions.apiMode` and `OPENAI_API_MODE` select
+    `responses` (default) or `chat_completions`; Chat mode maps the
+    same projection to `messages` / function tools and supports
+    OpenAI-compatible endpoints that lack `/v1/responses`.
+  - `.env` model alias routing — `HARNESS_MODEL_ALIASES` /
+    `HARNESS_MODEL_<ALIAS>` register OpenAI model configs as
+    `SubagentPool.providerFactories`, while `HARNESS_MAIN_MODEL`
+    selects the root agent's default alias or raw model id. A parent
+    can now `spawn({provider:"fast", ...})` to pick a specific model.
+  - runtime model prompt injection — CLI passes alias/provider/model/API
+    mode/base URL metadata into bootstrap, and bootstrap appends a
+    `[runtime model]` block to the root or alias-routed subagent system
+    prompt so agents can identify their configured model without
+    guessing. API keys are not injected.
   - `reasoning_delta` emission — probes both `reasoning_content`
     (o1/o3 + Responses API passthrough) and `reasoning` (alternate
     spelling on some compatible endpoints) on the streaming delta.

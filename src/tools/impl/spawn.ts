@@ -48,6 +48,7 @@ const SpawnArgs = z.object({
     .optional()
     .describe(
       'Override the LLM provider for this child. Omit to inherit the runtime default. ' +
+        'The CLI registers .env model aliases from HARNESS_MODEL_ALIASES here, so values like `fast` or `local` can select a specific model. ' +
         "Set to 'cc' (Claude Code) or 'codex' to run the child as that coding-agent CLI; when you do, `cwd` is required. The CLI has its " +
         'own filesystem / shell / edit tools internal to the CLI, runs in `cwd`, and returns its ' +
         "final reply as the child's `summary`. Its internal tool calls do not appear in this thread.",
@@ -88,6 +89,7 @@ export const spawnTool: Tool<typeof SpawnArgs, { childThreadId: string }> = {
     '  - background research ("look up how lib X handles Y while I keep coding")',
     '  - verification of a completed artefact ("did I actually satisfy the spec?")',
     '  - independent experiments you want to run in parallel',
+    '  - using a specific configured model alias (provider:"fast" / "local" / any HARNESS_MODEL_ALIASES key)',
     '  - delegating to a coding-agent provider (provider:"cc" / "codex"), which has its own',
     '    file / shell / edit tools and returns its final reply as the child summary',
     '',

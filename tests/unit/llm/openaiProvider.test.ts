@@ -256,3 +256,113 @@ describe('OpenAIProvider Responses-API create params', () => {
     expect(params).not.toHaveProperty('reasoning');
   });
 });
+
+describe('OpenAIProvider Chat Completions translation', () => {
+  const request = {
+    prefix: {
+      systemPrompt: 'sys',
+      tools: [
+        {
+          name: 'shell',
+          description: 'run a shell command',
+          argsSchema: { type: 'object', properties: { cmd: { type: 'string' } } },
+        },
+      ],
+    },
+    tail: [
+      { role: 'user' as const, content: [{ kind: 'text' as const, text: 'go' }] },
+      {
+        role: 'assistant' as const,
+        content: [
+          {
+            kind: 'tool_use' as const,
+            toolCallId: 'call_aaa' as ToolCallId,
+            name: 'shell',
+            args: { cmd: 'echo a' },
+          },
+        ],
+      },
+      {
+        role: 'tool_result' as const,
+        content: [
+          {
+            kind: 'tool_result' as const,
+            toolCallId: 'call_aaa' as ToolCallId,
+            ok: true,
+            output: { stdout: 'a' },
+          },
+        ],
+      },
+    ],
+  };
+
+  it('emits system/user/assistant/tool messages with Chat tool-call pairing', () => {
+    const messages = __testOnly.toChatMessages(request.prefix, request.tail);
+    expect(messages).toHaveLength(4);
+    expect(messages[0]).toMatchObject({ role: 'system', content: 'sys' });
+    expect(messages[1]).toMatchObject({ role: 'user', content: 'go' });
+    expect(messages[2]).toMatchObject({
+      role: 'assistant',
+      tool_calls: [
+        {
+          id: 'call_aaa',
+          type: 'function',
+          function: { name: 'shell', arguments: '{"cmd":"echo a"}' },
+        },
+      ],
+    });
+    expect(messages[3]).toMatchObject({
+      role: 'tool',
+      tool_call_id: 'call_aaa',
+      content: '{"stdout":"a"}',
+    });
+  });
+
+  it('translates tools to Chat Completions function-tool shape', () => {
+    const tools = __testOnly.toChatTools(request.prefix);
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        function: {
+          name: 'shell',
+          description: 'run a shell command',
+          parameters: { type: 'object', properties: { cmd: { type: 'string' } } },
+          strict: false,
+        },
+      },
+    ]);
+  });
+
+  it('builds streaming Chat params with selectable token-limit field', () => {
+    const params = __testOnly.toChatCreateParams(request, {
+      model: 'gpt-4o-mini',
+      defaultMaxTokens: 123,
+      chatMaxTokensParam: 'max_tokens',
+      defaultTemperature: 0.2,
+    });
+    expect(params).toMatchObject({
+      model: 'gpt-4o-mini',
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: 123,
+      temperature: 0.2,
+    });
+    expect(params).not.toHaveProperty('max_completion_tokens');
+  });
+
+  it('maps structured output to Chat response_format shape', () => {
+    const out = __testOnly.toChatResponseFormat({
+      type: 'json_schema',
+      name: 'Result',
+      schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+    });
+    expect(out).toEqual({
+      type: 'json_schema',
+      json_schema: {
+        name: 'Result',
+        schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+        strict: true,
+      },
+    });
+  });
+});

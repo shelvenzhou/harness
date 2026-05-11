@@ -47,6 +47,33 @@ class ScriptedProvider implements LlmProvider {
   }
 }
 
+class RecordingProvider implements LlmProvider {
+  readonly id: string;
+  readonly capabilities: LlmCapabilities = {
+    prefixCache: false,
+    cacheEdits: false,
+    nativeToolUse: true,
+    nativeReasoning: false,
+    maxContextTokens: 100_000,
+  };
+  readonly seenRequests: SamplingRequest[] = [];
+  private idx = 0;
+
+  constructor(id: string, private readonly script: SamplingDelta[][]) {
+    this.id = id;
+  }
+
+  async *sample(request: SamplingRequest, signal: AbortSignal): AsyncIterable<SamplingDelta> {
+    this.seenRequests.push(request);
+    const deltas = this.script[Math.min(this.idx++, this.script.length - 1)] ?? [];
+    for (const d of deltas) {
+      if (signal.aborted) return;
+      yield d;
+    }
+    if (!deltas.some((d) => d.kind === 'end')) yield { kind: 'end', stopReason: 'end_turn' };
+  }
+}
+
 async function settle(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
@@ -122,5 +149,74 @@ describe('smoke: spawn round-trip', () => {
     expect(subPayload.status).toBe('completed');
     // SubagentPool routes based on the child's turn_complete summary.
     expect(subPayload.summary).toBe('child done');
+  });
+
+  it('injects runtime model metadata for root and alias-routed children', async () => {
+    const parent = new RecordingProvider('parent', [
+      [
+        { kind: 'tool_call_begin', toolCallId: 'tc_spawn' as never, name: 'spawn' },
+        {
+          kind: 'tool_call_end',
+          toolCallId: 'tc_spawn' as never,
+          args: {
+            task: 'child on deepseek',
+            provider: 'deepseek',
+            budget: {},
+          },
+        },
+        { kind: 'end', stopReason: 'tool_use' },
+      ],
+      [
+        { kind: 'text_delta', text: 'ack', channel: 'reply' },
+        { kind: 'end', stopReason: 'end_turn' },
+      ],
+    ]);
+    const child = new RecordingProvider('child', [
+      [
+        { kind: 'text_delta', text: 'done', channel: 'reply' },
+        { kind: 'end', stopReason: 'end_turn' },
+      ],
+    ]);
+
+    const runtime = await bootstrap({
+      provider: parent,
+      systemPrompt: 'sys',
+      runtimeModelInfo: {
+        alias: 'main',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        apiMode: 'responses',
+      },
+      providerFactories: { deepseek: () => child },
+      providerFactoryModelInfo: {
+        deepseek: {
+          alias: 'deepseek',
+          provider: 'openai',
+          model: 'deepseek-chat',
+          apiMode: 'chat_completions',
+          baseURL: 'https://api.deepseek.com/v1',
+        },
+      },
+    });
+
+    const seed = await runtime.store.append({
+      threadId: runtime.rootThreadId,
+      kind: 'user_turn_start',
+      payload: { text: 'please fork a child' },
+    });
+    runtime.bus.publish(seed);
+
+    for (let i = 0; i < 50; i++) {
+      await settle(40);
+      const events = await runtime.store.readAll(runtime.rootThreadId);
+      if (events.some((e) => e.kind === 'subtask_complete')) break;
+    }
+
+    expect(parent.seenRequests[0]?.prefix.systemPrompt).toContain('[runtime model]');
+    expect(parent.seenRequests[0]?.prefix.systemPrompt).toContain('alias=main');
+    expect(parent.seenRequests[0]?.prefix.systemPrompt).toContain('model=gpt-5.4');
+    expect(child.seenRequests[0]?.prefix.systemPrompt).toContain('alias=deepseek');
+    expect(child.seenRequests[0]?.prefix.systemPrompt).toContain('model=deepseek-chat');
+    expect(child.seenRequests[0]?.prefix.systemPrompt).toContain('apiMode=chat_completions');
   });
 });

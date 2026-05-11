@@ -51,6 +51,19 @@ export interface BootstrapOptions {
   provider: LlmProvider;
   systemPrompt: string;
   /**
+   * Runtime-visible model identity for the root provider. When supplied,
+   * bootstrap appends a small `[runtime model]` block to the system prompt
+   * so the model can answer "what model are you?" from configuration
+   * rather than guessing from training data.
+   */
+  runtimeModelInfo?: RuntimeModelInfo;
+  /**
+   * Per-spawn provider model identity, keyed the same way as
+   * `providerFactories`. Used when a subagent selects a specific model
+   * alias via `spawn({provider:"..."})`.
+   */
+  providerFactoryModelInfo?: Record<string, RuntimeModelInfo>;
+  /**
    * If set, events are persisted to <storeRoot>/<threadId>/events.jsonl in
    * addition to the in-memory store; otherwise the store is purely
    * in-memory (fine for short-lived REPL sessions).
@@ -155,6 +168,14 @@ export interface BootstrapOptions {
   };
 }
 
+export interface RuntimeModelInfo {
+  provider: string;
+  model: string;
+  alias?: string;
+  apiMode?: string;
+  baseURL?: string;
+}
+
 export interface Runtime {
   bus: EventBus;
   streamBus: StreamBus;
@@ -210,6 +231,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
       : undefined;
 
   const providerFactories = buildProviderFactories(opts, providerUsageRegistry);
+  const rootSystemPrompt = withRuntimeModelInfo(opts.systemPrompt, opts.runtimeModelInfo);
 
   const subagents = new SubagentPool({
     bus,
@@ -217,8 +239,14 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     registry,
     executor,
     provider: opts.provider,
-    systemPromptFor: (role) =>
-      role ? `${opts.systemPrompt}\n\n[role: ${role}]` : opts.systemPrompt,
+    systemPromptFor: (role, req) => {
+      const modelInfo =
+        req.provider !== undefined
+          ? (opts.providerFactoryModelInfo?.[req.provider] ?? opts.runtimeModelInfo)
+          : opts.runtimeModelInfo;
+      const base = withRuntimeModelInfo(opts.systemPrompt, modelInfo);
+      return role ? `${base}\n\n[role: ${role}]` : base;
+    },
     memory,
     ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
     ...(opts.microCompact !== undefined ? { microCompact: opts.microCompact } : {}),
@@ -247,7 +275,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
       registry,
       executor,
       provider: opts.provider,
-      systemPrompt: opts.systemPrompt,
+      systemPrompt: rootSystemPrompt,
       memory,
       ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
       ...(opts.pinnedMemory !== undefined ? { pinnedMemory: opts.pinnedMemory } : {}),
@@ -333,6 +361,20 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
     ...(compactionHandler !== undefined ? { compactionHandler } : {}),
   };
+}
+
+function withRuntimeModelInfo(systemPrompt: string, info: RuntimeModelInfo | undefined): string {
+  if (info === undefined) return systemPrompt;
+  const lines = [
+    '[runtime model]',
+    ...(info.alias !== undefined ? [`alias=${info.alias}`] : []),
+    `provider=${info.provider}`,
+    `model=${info.model}`,
+    ...(info.apiMode !== undefined ? [`apiMode=${info.apiMode}`] : []),
+    ...(info.baseURL !== undefined ? [`baseURL=${info.baseURL}`] : []),
+    'If asked what model you are, answer from this runtime configuration instead of guessing.',
+  ];
+  return `${systemPrompt}\n\n${lines.join('\n')}`;
 }
 
 /**

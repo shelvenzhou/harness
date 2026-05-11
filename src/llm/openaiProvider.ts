@@ -1,6 +1,13 @@
 import OpenAI from 'openai';
 import type { Stream } from 'openai/core/streaming.js';
 import type {
+  ChatCompletionChunk,
+  ChatCompletionCreateParamsStreaming,
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  ChatCompletionTool,
+} from 'openai/resources/chat/completions/completions.js';
+import type {
   EasyInputMessage,
   FunctionTool,
   ResponseCreateParamsStreaming,
@@ -26,14 +33,12 @@ import type {
 } from './provider.js';
 
 /**
- * OpenAI Responses-API provider.
+ * OpenAI provider.
  *
- * The Chat Completions API doesn't surface reasoning text on the
- * stream — for o1/o3/gpt-5 you only see the final answer plus a
- * reasoning_tokens count. The Responses API streams `response
- * .reasoning_text.delta` (and the older `response.reasoning_summary
- * _text.delta`) in addition to `response.output_text.delta`, so
- * thinking is actually visible.
+ * Defaults to the Responses API because it can surface reasoning
+ * summaries and encrypted reasoning carry-forward state. Set
+ * `apiMode:'chat_completions'` for OpenAI-compatible endpoints that
+ * only implement `/v1/chat/completions`.
  *
  * Translation overview:
  *   StablePrefix.systemPrompt      → `instructions`
@@ -46,15 +51,17 @@ import type {
  *                                     `function_call_output` item
  *   stream events                  → SamplingDelta
  *
- * Non-OpenAI endpoints that don't implement Responses API will fail
- * here. That's the trade-off the caller asked for: thinking text
- * everywhere, at the cost of cross-vendor portability.
+ * In Chat Completions mode the same harness projection maps to
+ * `messages` + `tools`; native reasoning deltas/provider_state are not
+ * available on that transport.
  */
 
 export interface OpenAIProviderOptions {
   apiKey: string;
   model?: string;
   baseURL?: string;
+  apiMode?: OpenAIApiMode;
+  chatMaxTokensParam?: 'max_completion_tokens' | 'max_tokens';
   defaultMaxTokens?: number;
   defaultTemperature?: number;
   /**
@@ -75,21 +82,19 @@ export interface OpenAIProviderOptions {
   };
 }
 
+export type OpenAIApiMode = 'responses' | 'chat_completions';
+
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_MAX_RETRIES = 2;
 
 export class OpenAIProvider implements LlmProvider {
   readonly id = 'openai';
-  readonly capabilities: LlmCapabilities = {
-    prefixCache: false, // Server-side automatic caching; no client knob.
-    cacheEdits: false,
-    nativeToolUse: true,
-    nativeReasoning: true,
-    maxContextTokens: 128_000,
-  };
+  readonly capabilities: LlmCapabilities;
 
   private readonly client: OpenAI;
   private readonly model: string;
+  private readonly apiMode: OpenAIApiMode;
+  private readonly chatMaxTokensParam: 'max_completion_tokens' | 'max_tokens';
   private readonly defaultMaxTokens: number;
   private readonly defaultTemperature: number | undefined;
   private readonly reasoning: Reasoning | undefined;
@@ -102,6 +107,17 @@ export class OpenAIProvider implements LlmProvider {
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     });
     this.model = opts.model ?? DEFAULT_MODEL;
+    this.apiMode = opts.apiMode ?? 'responses';
+    this.chatMaxTokensParam = opts.chatMaxTokensParam ?? 'max_completion_tokens';
+    this.capabilities = {
+      prefixCache: false, // Server-side automatic caching; no client knob.
+      cacheEdits: false,
+      nativeToolUse: true,
+      // Chat Completions stream does not surface reasoning deltas or
+      // encrypted reasoning state, so the capability is transport-scoped.
+      nativeReasoning: this.apiMode === 'responses',
+      maxContextTokens: 128_000,
+    };
     this.defaultMaxTokens = opts.defaultMaxTokens ?? 32768;
     this.defaultTemperature = opts.defaultTemperature;
     if (opts.reasoning) {
@@ -115,6 +131,17 @@ export class OpenAIProvider implements LlmProvider {
   }
 
   async *sample(
+    request: SamplingRequest,
+    signal: AbortSignal,
+  ): AsyncIterable<SamplingDelta> {
+    if (this.apiMode === 'chat_completions') {
+      yield* this.sampleChatCompletions(request, signal);
+      return;
+    }
+    yield* this.sampleResponses(request, signal);
+  }
+
+  private async *sampleResponses(
     request: SamplingRequest,
     signal: AbortSignal,
   ): AsyncIterable<SamplingDelta> {
@@ -144,7 +171,6 @@ export class OpenAIProvider implements LlmProvider {
     let promptTokens = 0;
     let cachedPromptTokens = 0;
     let completionTokens = 0;
-    let usageEmitted = false;
 
     try {
       for await (const event of stream) {
@@ -247,7 +273,7 @@ export class OpenAIProvider implements LlmProvider {
     }
     pending.clear();
 
-    if (!usageEmitted && (promptTokens || completionTokens)) {
+    if (promptTokens || completionTokens) {
       yield {
         kind: 'usage',
         tokens: {
@@ -256,8 +282,123 @@ export class OpenAIProvider implements LlmProvider {
           completionTokens,
         },
       };
-      usageEmitted = true;
     }
+    yield { kind: 'end', stopReason: stopReason ?? 'end_turn' };
+  }
+
+  private async *sampleChatCompletions(
+    request: SamplingRequest,
+    signal: AbortSignal,
+  ): AsyncIterable<SamplingDelta> {
+    const params = toChatCreateParams(request, {
+      model: this.model,
+      defaultMaxTokens: this.defaultMaxTokens,
+      chatMaxTokensParam: this.chatMaxTokensParam,
+      ...(this.defaultTemperature !== undefined
+        ? { defaultTemperature: this.defaultTemperature }
+        : {}),
+      ...(this.reasoning !== undefined ? { reasoning: this.reasoning } : {}),
+    });
+
+    const stream = (await this.client.chat.completions.create(params, {
+      signal,
+    })) as unknown as Stream<ChatCompletionChunk>;
+
+    interface PendingChatToolCall {
+      id?: ToolCallId;
+      name?: string;
+      args: string;
+      began: boolean;
+    }
+    const pending = new Map<number, PendingChatToolCall>();
+    let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' | undefined;
+    let promptTokens = 0;
+    let cachedPromptTokens = 0;
+    let completionTokens = 0;
+
+    const ensureBegun = function* (
+      index: number,
+      tc: PendingChatToolCall,
+    ): Generator<SamplingDelta> {
+      if (tc.began) return;
+      const id = (tc.id ?? `call_${index}`) as ToolCallId;
+      const name = tc.name ?? 'unknown';
+      tc.id = id;
+      tc.name = name;
+      tc.began = true;
+      yield { kind: 'tool_call_begin', toolCallId: id, name };
+      if (tc.args.length > 0) {
+        yield { kind: 'tool_call_arg_delta', toolCallId: id, argsPartial: tc.args };
+      }
+    };
+
+    try {
+      for await (const chunk of stream) {
+        if (signal.aborted) return;
+        const u = chunk.usage;
+        if (u) {
+          promptTokens = u.prompt_tokens ?? 0;
+          cachedPromptTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+          completionTokens = u.completion_tokens ?? 0;
+        }
+
+        for (const choice of chunk.choices) {
+          const delta = choice.delta;
+          if (delta.content) {
+            yield { kind: 'text_delta', text: delta.content };
+          }
+          for (const toolDelta of delta.tool_calls ?? []) {
+            const index = toolDelta.index;
+            const tc = pending.get(index) ?? { args: '', began: false };
+            if (toolDelta.id) tc.id = toolDelta.id as ToolCallId;
+            if (toolDelta.function?.name) tc.name = toolDelta.function.name;
+            const argDelta = toolDelta.function?.arguments ?? '';
+            if (!tc.began && tc.id && tc.name) {
+              yield* ensureBegun(index, tc);
+            }
+            if (argDelta) {
+              if (tc.began && tc.id) {
+                yield {
+                  kind: 'tool_call_arg_delta',
+                  toolCallId: tc.id,
+                  argsPartial: argDelta,
+                };
+              }
+              tc.args += argDelta;
+            }
+            pending.set(index, tc);
+          }
+          if (choice.finish_reason) {
+            stopReason = chatFinishReasonToStopReason(choice.finish_reason);
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as { name?: string }).name === 'AbortError') return;
+      throw err;
+    }
+
+    for (const [index, tc] of pending) {
+      yield* ensureBegun(index, tc);
+      yield {
+        kind: 'tool_call_end',
+        toolCallId: tc.id ?? (`call_${index}` as ToolCallId),
+        args: tryParseJson(tc.args),
+      };
+    }
+    pending.clear();
+
+    if (promptTokens || completionTokens) {
+      yield {
+        kind: 'usage',
+        tokens: {
+          promptTokens,
+          cachedPromptTokens,
+          completionTokens,
+        },
+      };
+    }
+
     yield { kind: 'end', stopReason: stopReason ?? 'end_turn' };
   }
 }
@@ -391,6 +532,98 @@ function toResponsesTools(prefix: StablePrefix): FunctionTool[] {
   }));
 }
 
+function toChatMessages(prefix: StablePrefix, tail: ProjectedItem[]): ChatCompletionMessageParam[] {
+  const messages: ChatCompletionMessageParam[] = [
+    { role: 'system', content: prefix.systemPrompt },
+  ];
+  for (const item of tail) {
+    if (item.role === 'user') {
+      messages.push({ role: 'user', content: contentToText(item.content) });
+      continue;
+    }
+    if (item.role === 'tool_result') {
+      for (const c of item.content) {
+        if (c.kind === 'tool_result') {
+          messages.push({
+            role: 'tool',
+            tool_call_id: c.toolCallId,
+            content: JSON.stringify(
+              c.ok ? (c.output ?? null) : { error: c.error ?? 'error' },
+            ),
+          });
+        } else if (c.kind === 'elided' && c.toolCallId) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: c.toolCallId,
+            content: JSON.stringify({
+              elided: true,
+              handle: c.handle,
+              kind: c.originKind,
+              summary: c.summary,
+              hint: 'call restore(handle) to rehydrate full content',
+            }),
+          });
+        } else if (c.kind === 'elided') {
+          messages.push({
+            role: 'user',
+            content: `[elided handle=${c.handle} kind=${c.originKind}] ${c.summary ?? ''}`,
+          });
+        }
+      }
+      continue;
+    }
+
+    const textChunks: string[] = [];
+    const toolCalls: ChatCompletionMessageToolCall[] = [];
+    for (const c of item.content) {
+      switch (c.kind) {
+        case 'text':
+          textChunks.push(c.text);
+          break;
+        case 'tool_use':
+          toolCalls.push({
+            id: c.toolCallId,
+            type: 'function',
+            function: {
+              name: c.name,
+              arguments: JSON.stringify(c.args ?? {}),
+            },
+          });
+          break;
+        case 'elided':
+          textChunks.push(`[elided handle=${c.handle} ${c.originKind}] ${c.summary ?? ''}`);
+          break;
+        case 'provider_state':
+        case 'tool_result':
+          break;
+      }
+    }
+    if (textChunks.length > 0 || toolCalls.length > 0) {
+      messages.push({
+        role: 'assistant',
+        content: textChunks.length > 0 ? textChunks.join('') : null,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      });
+    }
+  }
+  return messages;
+}
+
+function toChatTools(prefix: StablePrefix): ChatCompletionTool[] {
+  return prefix.tools.map((t) => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: (t.argsSchema as Record<string, unknown>) ?? {
+        type: 'object',
+        properties: {},
+      },
+      strict: false,
+    },
+  }));
+}
+
 function contentToText(content: ProjectedContent[]): string {
   return content
     .map((c) => {
@@ -466,6 +699,71 @@ function toResponsesCreateParams(
   };
 }
 
+function toChatCreateParams(
+  request: SamplingRequest,
+  defaults: {
+    model: string;
+    defaultMaxTokens: number;
+    chatMaxTokensParam: 'max_completion_tokens' | 'max_tokens';
+    defaultTemperature?: number;
+    reasoning?: Reasoning;
+  },
+): ChatCompletionCreateParamsStreaming {
+  const model = request.model ?? defaults.model;
+  const tools = toChatTools(request.prefix);
+  const temperature = supportsTemperature(model)
+    ? (request.temperature ?? defaults.defaultTemperature)
+    : undefined;
+  const reasoning = reasoningForModel(model, defaults.reasoning);
+  const maxTokensKey = defaults.chatMaxTokensParam;
+  return {
+    model,
+    messages: toChatMessages(request.prefix, request.tail),
+    ...(tools.length > 0 ? { tools } : {}),
+    stream: true,
+    stream_options: { include_usage: true },
+    store: false,
+    [maxTokensKey]: request.maxTokens ?? defaults.defaultMaxTokens,
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(reasoning?.effort !== undefined ? { reasoning_effort: reasoning.effort } : {}),
+    ...(request.responseFormat
+      ? { response_format: toChatResponseFormat(request.responseFormat) }
+      : {}),
+  } as unknown as ChatCompletionCreateParamsStreaming;
+}
+
+function toChatResponseFormat(spec: ResponseFormatSpec): Record<string, unknown> {
+  if (spec.type === 'json_object') {
+    return { type: 'json_object' };
+  }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: spec.name,
+      schema: spec.schema,
+      strict: spec.strict ?? true,
+      ...(spec.description !== undefined ? { description: spec.description } : {}),
+    },
+  };
+}
+
+function chatFinishReasonToStopReason(
+  reason: ChatCompletionChunk.Choice['finish_reason'],
+): 'end_turn' | 'max_tokens' | 'tool_use' | 'error' {
+  switch (reason) {
+    case 'stop':
+      return 'end_turn';
+    case 'length':
+      return 'max_tokens';
+    case 'tool_calls':
+    case 'function_call':
+      return 'tool_use';
+    case 'content_filter':
+    default:
+      return 'error';
+  }
+}
+
 function supportsTemperature(model: string): boolean {
   const id = model.toLowerCase();
   if (id.startsWith('gpt-5')) return false;
@@ -506,6 +804,11 @@ export const __testOnly = {
   toResponsesTools,
   toResponsesTextFormat,
   toResponsesCreateParams,
+  toChatMessages,
+  toChatTools,
+  toChatResponseFormat,
+  toChatCreateParams,
+  chatFinishReasonToStopReason,
   supportsTemperature,
   supportsReasoning,
   isEncryptedReasoningItem,

@@ -20,8 +20,9 @@ with a typed interface. Current state:
 - ✅ Event bus, session store (memory + JSONL), action / event protocol types
 - ✅ `ActiveTurn` state machine + two-phase mailbox (`CurrentTurn` /
   `NextTurn`) matching Codex's model
-- ✅ LLM provider interface; OpenAI Responses API provider (real streaming +
-  tool calls), works against endpoints that implement `/v1/responses` via `OPENAI_BASE_URL`
+- ✅ LLM provider interface; OpenAI provider supports Responses API and Chat
+  Completions streaming + tool calls, with `.env` model aliases for
+  per-subagent model routing
 - ✅ Real `shell` (process-group kill, byte cap, handle elision) and
   `web_fetch` (undici); `read`/`write`(overwrite) real; `memory` real
   with three backends (in-memory / JSONL / mem0); `web_search` real via
@@ -41,7 +42,7 @@ with a typed interface. Current state:
   interrupt propagation
 - ✅ Terminal adapter + CLI; three-layer diagnostics (prompt dumps,
   JSONL trace, stderr summary)
-- ✅ 193 unit/smoke tests green; live e2e (OpenAI + mem0) skipped
+- ✅ 247 unit/smoke tests green; live e2e (OpenAI + mem0) skipped
   behind `HARNESS_E2E=1`
 
 **Phase 2** (next) focuses on the remaining primitive depth: `write(patch)`
@@ -115,18 +116,49 @@ Configuration is read from `.env` (see [.env.example](.env.example)):
 |----------------------|-------------------------------------------------------|
 | `OPENAI_API_KEY`     | required                                              |
 | `OPENAI_MODEL`       | default `gpt-4o-mini`                                 |
-| `OPENAI_BASE_URL`    | override endpoint; must implement OpenAI's Responses API |
+| `OPENAI_BASE_URL`    | override endpoint; Responses or Chat Completions depending on `OPENAI_API_MODE` |
+| `OPENAI_API_MODE`    | `responses` (default) or `chat_completions`           |
+| `OPENAI_CHAT_MAX_TOKENS_PARAM` | `max_completion_tokens` (default) or `max_tokens` for older compatible endpoints |
 | `OPENAI_MAX_TOKENS`  | default `32768`; includes visible output and reasoning tokens |
 | `OPENAI_TEMPERATURE` | optional; suppressed for GPT-5 / o-series models that reject it |
 | `OPENAI_REASONING_EFFORT` | optional Responses API reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `OPENAI_REASONING_SUMMARY`| optional visible reasoning summary stream: `auto`, `concise`, `detailed`, `off`; default `auto` |
+| `HARNESS_MAIN_MODEL` | model alias for the root agent, or a raw OpenAI model id |
+| `HARNESS_MODEL_ALIASES` | comma-separated aliases registered for `spawn({provider:"alias"})` |
+| `HARNESS_MODEL_<ALIAS>` | `openai\|model\|apiMode\|baseURL\|apiKeyEnv`; empty fields inherit global `OPENAI_*` |
 | `HARNESS_STORE_ROOT` | persist session events to this directory              |
 | `HARNESS_MEMORY_FILE`| JSONL memory log path (cross-session memory; off if unset) |
 | `MEM0_API_KEY`       | enable mem0 backend (cloud or self-hosted) — overrides `HARNESS_MEMORY_FILE` |
 | `MEM0_BASE_URL`      | self-hosted mem0 server (omit for cloud)              |
 | `MEM0_USER_ID`       | fallback userId for mem0 (default `harness`)          |
 
-CLI flags override env: `pnpm dev -- --model gpt-4o --base-url https://…`.
+CLI flags override env: `pnpm dev -- --model gpt-4o --api-mode chat_completions --base-url https://…`.
+
+Multiple model aliases can be configured in `.env` and used by subagents:
+
+```dotenv
+HARNESS_MAIN_MODEL=main
+HARNESS_MODEL_ALIASES=main,fast,local
+HARNESS_MODEL_MAIN=openai|gpt-5.4|responses||
+HARNESS_MODEL_FAST=openai|gpt-4o-mini|chat_completions||
+HARNESS_MODEL_LOCAL=openai|qwen2.5-coder|chat_completions|http://localhost:11434/v1|OPENAI_LOCAL_API_KEY
+OPENAI_LOCAL_API_KEY=ollama
+```
+
+The root agent uses `HARNESS_MAIN_MODEL`. A subagent can use a specific alias
+with `spawn({provider:"fast", task:"...", ...})`; omitting `provider` keeps the
+runtime default provider.
+
+Per-alias tuning knobs are read from `<KEY>_<ALIAS>` (alias uppercased,
+non-alphanumerics → `_`); each falls back to the global `OPENAI_*` value
+when unset. Available suffixes: `OPENAI_MAX_TOKENS_<ALIAS>`,
+`OPENAI_TEMPERATURE_<ALIAS>`, `OPENAI_REASONING_EFFORT_<ALIAS>`,
+`OPENAI_REASONING_SUMMARY_<ALIAS>`, `OPENAI_CHAT_MAX_TOKENS_PARAM_<ALIAS>`.
+
+The CLI also injects a small `[runtime model]` block into each agent's system
+prompt. It includes the alias, provider, model id, API mode, and base URL, but
+never the API key. This lets the agent answer "what model are you?" from the
+actual runtime configuration instead of guessing.
 
 E2E tests that hit the real API are skipped unless you set `HARNESS_E2E=1`:
 
@@ -217,7 +249,7 @@ src/
   bus/           — EventBus + typed channels
   store/         — SessionStore (append-only event log) + projections
   runtime/       — AgentRunner, ActiveTurn, subagent pool, scheduler
-  llm/           — provider interface + OpenAI Responses API provider
+  llm/           — provider interface + OpenAI Responses / Chat Completions provider
   tools/         — minimal tool set + executor + registry
   context/       — projection, compactor, handle registry
   adapters/      — terminal, Discord, future TG/HTTP surfaces

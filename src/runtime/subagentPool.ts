@@ -89,7 +89,7 @@ export interface SubagentPoolDeps {
    * default provider is reachable (current behaviour).
    */
   providerFactories?: Record<string, ProviderFactory>;
-  systemPromptFor: (role: string | undefined) => string;
+  systemPromptFor: (role: string | undefined, req: SpawnRequestInfo) => string;
   /** Children share the parent's memory backend. */
   memory?: MemoryStore;
   /** Children share the parent's web search backend. */
@@ -225,7 +225,7 @@ export class SubagentPool {
       payload: { text: req.task },
     });
 
-    const systemPrompt = withBudgetGuidance(this.deps.systemPromptFor(req.role), req.budget);
+    const systemPrompt = withBudgetGuidance(this.deps.systemPromptFor(req.role, req), req.budget);
     const runner = new AgentRunner({
       threadId: childThreadId,
       bus: this.deps.bus,
