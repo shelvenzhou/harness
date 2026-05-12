@@ -17,7 +17,13 @@ export interface ParsedSampling {
   /** Concatenated reasoning text (if any). Kept separate from reply actions. */
   reasoningText: string;
   providerState: Array<{ providerId: string; items: unknown[] }>;
-  stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error';
+  stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' | 'quota_exhausted';
+  /**
+   * Forwarded from a terminating `end{stopReason:'quota_exhausted', resetAt}`
+   * delta. The runner threads this into `turn_complete.resetAt` so
+   * `SubagentPool` can surface it on the parent's `subtask_complete`.
+   */
+  resetAt?: string;
   usage?: { promptTokens: number; cachedPromptTokens: number; completionTokens: number };
   ttftMs?: number;
 }
@@ -44,6 +50,7 @@ export async function parseSampling(
   const toolCallsInFlight = new Map<ToolCallId, { name: string; args?: unknown }>();
   const actions: Action[] = [];
   let stopReason: ParsedSampling['stopReason'];
+  let resetAt: string | undefined;
   let usage: ParsedSampling['usage'];
   const startedAt = Date.now();
   let firstByteAt: number | undefined;
@@ -129,6 +136,7 @@ export async function parseSampling(
         break;
       case 'end':
         stopReason = delta.stopReason;
+        if (delta.resetAt !== undefined) resetAt = delta.resetAt;
         break;
     }
   }
@@ -152,6 +160,7 @@ export async function parseSampling(
     reasoningText: reasoningBuf,
     providerState,
     ...(stopReason !== undefined ? { stopReason } : {}),
+    ...(resetAt !== undefined ? { resetAt } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(firstByteAt !== undefined ? { ttftMs: firstByteAt - startedAt } : {}),
   };

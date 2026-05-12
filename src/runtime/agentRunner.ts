@@ -543,6 +543,19 @@ export class AgentRunner {
       return;
     }
 
+    if (parsed.stopReason === 'quota_exhausted') {
+      // Transient termination: the parent should `wait` for the
+      // matching `external_event{source:'provider_ready', …}` and
+      // re-spawn. resetAt is forwarded so it lands on the parent's
+      // `subtask_complete` and can drive the wait.
+      await this.completeTurn(
+        'errored',
+        lastReply?.text,
+        'quota_exhausted',
+        parsed.resetAt,
+      );
+      return;
+    }
     if (parsed.actions.length === 0) {
       const summary =
         parsed.stopReason === 'tool_use'
@@ -1119,6 +1132,7 @@ export class AgentRunner {
     status: 'completed' | 'errored' | 'interrupted',
     summary?: string,
     reason?: string,
+    resetAt?: string,
   ): Promise<void> {
     this.activeTurn?.toCompleted(summary);
     // Cancel any timers scheduled by waits in this turn so they don't
@@ -1131,6 +1145,7 @@ export class AgentRunner {
         status,
         ...(summary !== undefined ? { summary } : {}),
         ...(reason !== undefined ? { reason } : {}),
+        ...(resetAt !== undefined ? { resetAt } : {}),
       },
       ...(this.activeTurn?.turnId !== undefined ? { turnId: this.activeTurn.turnId } : {}),
     });

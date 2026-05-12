@@ -218,6 +218,15 @@ export class CodingAgentProvider implements LlmProvider {
     let finalText: string | undefined;
     let endEmitted = false;
     let stderrBuf = '';
+    /**
+     * Latest "blocked" rate-limit event captured during this run.
+     * Tracked separately from `pushUsagePatch` because it drives a
+     * different decision: if the run subsequently errors, we want
+     * to emit `quota_exhausted` instead of plain `error` so the
+     * pool can surface `resetAt` and schedule a `provider_ready`
+     * wake.
+     */
+    let blockedWindowResetAt: string | undefined;
 
     child.stderr.on('data', (chunk: Buffer) => {
       // Keep last 4KB only — stderr can be chatty.
@@ -258,7 +267,12 @@ export class CodingAgentProvider implements LlmProvider {
               break;
             }
             if (e.type === 'rate_limit_event') {
-              this.pushUsagePatch(buildRateLimitPatch(e as unknown as CcRateLimitEvent));
+              const rl = e as unknown as CcRateLimitEvent;
+              this.pushUsagePatch(buildRateLimitPatch(rl));
+              const blocked = isBlockedQuotaEvent(rl);
+              if (blocked !== undefined) {
+                blockedWindowResetAt = blocked.resetAt;
+              }
               break;
             }
             if (e.type === 'result') {
@@ -274,7 +288,15 @@ export class CodingAgentProvider implements LlmProvider {
                 if (finalText !== undefined) {
                   yield { kind: 'text_delta', text: finalText, channel: 'reply' };
                 }
-                yield { kind: 'end', stopReason: 'error' };
+                if (blockedWindowResetAt !== undefined) {
+                  yield {
+                    kind: 'end',
+                    stopReason: 'quota_exhausted',
+                    resetAt: blockedWindowResetAt,
+                  };
+                } else {
+                  yield { kind: 'end', stopReason: 'error' };
+                }
                 endEmitted = true;
               } else {
                 if (finalText !== undefined) {
@@ -446,6 +468,36 @@ async function* pumpStream(
 }
 
 type CcChild = ChildProcessByStdio<null, Readable, Readable>;
+
+/**
+ * Decide whether a `rate_limit_event` represents a *blocked* quota
+ * state — the window is closed, the next CLI call is going to fail
+ * (or already is). Returns the resetAt ISO string to drive the
+ * parent's `wait(provider_ready)` retry, or `undefined` if the
+ * event is a non-terminal warning / informational push.
+ *
+ * Triggers (any one):
+ *   - explicit `status: 'blocked'` (or related sentinels)
+ *   - `utilization >= 1.0` (the window is full)
+ *
+ * cc has not been observed to send `'blocked'` literally; the
+ * statuses we have seen are `'allowed'` / `'allowed_warning'`. The
+ * implementation accepts a small set of likely strings so we don't
+ * miss future variants — if cc emits something we don't recognise,
+ * the run still terminates with plain `error` and the operator can
+ * tell from the message.
+ */
+function isBlockedQuotaEvent(ev: CcRateLimitEvent): { resetAt: string } | undefined {
+  const info = ev.rate_limit_info;
+  if (!info) return undefined;
+  const blockedStatuses = new Set(['blocked', 'rate_limited', 'limit_reached', 'exceeded']);
+  const statusBlocked =
+    typeof info.status === 'string' && blockedStatuses.has(info.status);
+  const utilBlocked = typeof info.utilization === 'number' && info.utilization >= 1.0;
+  if (!statusBlocked && !utilBlocked) return undefined;
+  if (typeof info.resetsAt !== 'number') return undefined;
+  return { resetAt: new Date(info.resetsAt * 1000).toISOString() };
+}
 
 function buildRateLimitPatch(ev: CcRateLimitEvent): ProviderUsagePatch {
   const info = ev.rate_limit_info;
