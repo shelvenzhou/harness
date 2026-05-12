@@ -150,6 +150,18 @@ export interface BootstrapOptions {
    */
   providerFactories?: Record<string, ProviderFactory>;
   /**
+   * Per-role system-prompt suffix lookup. When a spawn carries
+   * `role: 'designer'` and `rolePrompts.designer` is set, the child's
+   * system prompt becomes `<root prompt>\n\n<role text>` instead of
+   * the fallback `[role: designer]` tag.
+   *
+   * Loaded by the CLI from `prompts/role-<role>.md` (and arbitrary
+   * other callers can pass their own map); the runtime stays a
+   * string interface and never touches disk. Keys without a match
+   * fall back to the legacy `[role: <role>]` stub.
+   */
+  rolePrompts?: Record<string, string>;
+  /**
    * Coding-agent factories (cc, codex). When `true` (the default for
    * the corresponding key), the bootstrap registers a factory that
    * builds a `CodingAgentProvider` per spawn against the requested
@@ -245,7 +257,12 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
           ? (opts.providerFactoryModelInfo?.[req.provider] ?? opts.runtimeModelInfo)
           : opts.runtimeModelInfo;
       const base = withRuntimeModelInfo(opts.systemPrompt, modelInfo);
-      return role ? `${base}\n\n[role: ${role}]` : base;
+      if (!role) return base;
+      const roleText = opts.rolePrompts?.[role];
+      if (roleText !== undefined && roleText.trim().length > 0) {
+        return `${base}\n\n${roleText}`;
+      }
+      return `${base}\n\n[role: ${role}]`;
     },
     memory,
     ...(opts.searchBackend !== undefined ? { searchBackend: opts.searchBackend } : {}),
