@@ -99,6 +99,7 @@ export async function resume(opts: ResumeOptions): Promise<Runtime> {
     ...(opts.subagentTokenBudget !== undefined
       ? { tokenBudget: opts.subagentTokenBudget }
       : {}),
+    providerUsageRegistry,
   });
 
   const rootRunners = new Map<ThreadId, AgentRunner>();

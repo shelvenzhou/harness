@@ -179,6 +179,15 @@ export interface SubtaskCompletePayload {
    * conversation without re-paying context tokens.
    */
   providerSessionId?: string;
+  /**
+   * Wall-clock ISO-8601 when the underlying transient failure
+   * clears. Set together with `reason: 'quota_exhausted'` (or any
+   * future transient reason). Parents pair this with `wait` on an
+   * `external_event{source:'provider_ready', …}` carrying the same
+   * resetAt — the pool fires that event automatically when the
+   * window elapses.
+   */
+  resetAt?: string;
 }
 export type SubtaskCompleteEvent = EventBase<'subtask_complete', SubtaskCompletePayload>;
 
@@ -216,6 +225,15 @@ export interface TurnCompletePayload {
   status: 'completed' | 'interrupted' | 'errored';
   summary?: string;
   reason?: string;
+  /**
+   * Wall-clock ISO-8601 timestamp at which a transient terminal
+   * condition is expected to clear. Today the only writer is
+   * `reason: 'quota_exhausted'` (e.g. cc's 5-hour or 7-day window
+   * reset). The pool propagates this to the parent's
+   * `subtask_complete` so the parent can `wait` until the window
+   * reopens. Absent for non-transient terminations.
+   */
+  resetAt?: string;
 }
 export type TurnCompleteEvent = EventBase<'turn_complete', TurnCompletePayload>;
 
@@ -228,7 +246,7 @@ export interface SamplingCompletePayload {
   completionTokens: number;
   wallMs: number;
   ttftMs?: number;
-  stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error';
+  stopReason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' | 'quota_exhausted';
   projection: {
     projectedItems: number;
     elidedCount: number;

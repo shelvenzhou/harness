@@ -118,7 +118,16 @@ export type SamplingDelta =
   | { kind: 'tool_call_end'; toolCallId: ToolCallId; args: unknown }
   | { kind: 'provider_state'; providerId: string; items: unknown[] }
   | { kind: 'usage'; tokens: TokenUsage }
-  | { kind: 'end'; stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' };
+  | {
+      kind: 'end';
+      stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'error' | 'quota_exhausted';
+      /**
+       * For `'quota_exhausted'`: wall-clock ISO-8601 timestamp at
+       * which the provider's window reopens. Forwarded through the
+       * runner / pool into `subtask_complete.resetAt`.
+       */
+      resetAt?: string;
+    };
 
 export interface LlmProvider {
   readonly id: string;
