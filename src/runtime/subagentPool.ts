@@ -1,14 +1,19 @@
 import type { EventBus } from '@harness/bus/eventBus.js';
 import type { SessionStore } from '@harness/store/sessionStore.js';
 import type { LlmProvider } from '@harness/llm/provider.js';
+import type {
+  ProviderQuotaWindow,
+  ProviderUsageRegistry,
+} from '@harness/llm/providerUsageRegistry.js';
 import type { MemoryStore } from '@harness/memory/types.js';
 import type { SearchBackend } from '@harness/search/types.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
-import { newEventId, newThreadId } from '@harness/core/ids.js';
+import { newEventId, newThreadId, newTurnId } from '@harness/core/ids.js';
 import type { ThreadId, TurnId } from '@harness/core/ids.js';
 import type {
+  ExternalEventPayload,
   HarnessEvent,
   InterruptPayload,
   SubtaskCompletePayload,
@@ -118,6 +123,15 @@ export interface SubagentPoolDeps {
   maxDepth?: number;
   maxSiblingsPerParent?: number;
   maxConcurrentTotal?: number;
+  /**
+   * Optional account-level usage registry shared with provider
+   * factories. When set, `spawn` consults it to fail fast on
+   * `quota_exhausted` for providers whose window is currently
+   * blocked, and reports `provider_ready` external events when
+   * windows reopen. Absent in tests / SDK use that does not
+   * involve coding-agent providers.
+   */
+  providerUsageRegistry?: ProviderUsageRegistry;
 }
 
 /** Per-child budget. `maxTokens` is the cumulative prompt+completion
@@ -158,6 +172,13 @@ interface ChildRecord {
 export class SubagentPool {
   private children = new Map<ThreadId, ChildRecord>();
   private subscribed = false;
+  /**
+   * Live `provider_ready` timers, keyed `<providerId>:<resetAt ISO>`.
+   * The pool schedules at most one timer per `(provider, resetAt)`
+   * tuple — any number of subagents observing the same reset wall
+   * piggyback on it. The map is pruned when a timer fires.
+   */
+  private quotaReadyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private readonly deps: SubagentPoolDeps) {}
 
@@ -210,20 +231,74 @@ export class SubagentPool {
     // doesn't leave a half-created thread behind.
     const childProvider = this.resolveProvider(req);
 
-    const childThreadId = req.childThreadId ?? newThreadId();
-    const traceparent = req.parentTraceparent ?? newRootTraceparent();
-    await this.deps.store.createThread({
-      id: childThreadId,
-      rootTraceparent: traceparent,
-      parentThreadId: req.parentThreadId,
-      ...(req.role !== undefined ? { title: req.role } : {}),
-    });
+    // Quota fail-fast: if the registry says the requested provider's
+    // window is currently exhausted, don't even start the CLI. We
+    // synthesise an immediate `subtask_complete{reason:'quota_exhausted',
+    // resetAt}` and (re)arm the provider_ready timer. The parent can
+    // `wait` on the external event and re-spawn once the window
+    // reopens. Thread creation still happens so the spawn_request
+    // event has a real childThreadId to point at — keeps audit
+    // logs consistent with non-fail-fast spawns.
+    const blockedWindow =
+      req.provider !== undefined
+        ? this.findBlockedWindow(req.provider)
+        : undefined;
+
+    // continueThreadId: reopen an existing child thread (must exist,
+    // must not have a live runner) instead of creating a new one.
+    // M2's reuse path for "same implementer iterating against
+    // reviewer feedback / resuming after quota". Pre-flight check
+    // ahead of any side effect so a mismatch surfaces as
+    // SpawnRefused, not partial state.
+    let childThreadId: ThreadId;
+    if (req.continueThreadId !== undefined) {
+      const existing = await this.deps.store.getThread(req.continueThreadId);
+      if (existing === undefined) {
+        throw new SpawnRefused(
+          'continueThreadId_unknown',
+          `spawn rejected: continueThreadId ${req.continueThreadId} not found`,
+        );
+      }
+      if (this.children.has(req.continueThreadId)) {
+        throw new SpawnRefused(
+          'continueThreadId_live',
+          `spawn rejected: continueThreadId ${req.continueThreadId} already has a live runner`,
+        );
+      }
+      childThreadId = req.continueThreadId;
+    } else {
+      childThreadId = req.childThreadId ?? newThreadId();
+      const traceparent = req.parentTraceparent ?? newRootTraceparent();
+      await this.deps.store.createThread({
+        id: childThreadId,
+        rootTraceparent: traceparent,
+        parentThreadId: req.parentThreadId,
+        ...(req.role !== undefined ? { title: req.role } : {}),
+      });
+    }
 
     const seed = await this.deps.store.append({
       threadId: childThreadId,
       kind: 'user_turn_start',
       payload: { text: req.task },
     });
+
+    if (blockedWindow !== undefined) {
+      // Synthesise the terminal event the parent expects, schedule
+      // the provider_ready wake, and return without starting a
+      // runner. We still publish the seed so the child thread's
+      // log mirrors the same shape as a real run.
+      this.deps.bus.publish(seed);
+      this.armQuotaReadyTimer(blockedWindow.provider, blockedWindow.resetAt);
+      await this.publishSyntheticSubtaskComplete({
+        parentThreadId: req.parentThreadId,
+        parentTurnId: req.parentTurnId,
+        childThreadId,
+        provider: blockedWindow.provider,
+        resetAt: blockedWindow.resetAt,
+      });
+      return childThreadId;
+    }
 
     const systemPrompt = withBudgetGuidance(this.deps.systemPromptFor(req.role, req), req.budget);
     const runner = new AgentRunner({
@@ -427,13 +502,111 @@ export class SubagentPool {
     }
   }
 
+  /**
+   * Return the earliest "still-blocked" window for `providerId`, or
+   * undefined if none. A window is blocked when `status` matches a
+   * blocked sentinel OR `utilization >= 1.0`. `resetsAt > now`
+   * gates: a past resetAt has already rolled over and the next
+   * spawn should run normally (it'll get a fresh snapshot back).
+   */
+  private findBlockedWindow(
+    providerId: string,
+  ): { provider: string; resetAt: string } | undefined {
+    const snap = this.deps.providerUsageRegistry?.get(providerId);
+    if (!snap) return undefined;
+    const now = Date.now();
+    const candidates: ProviderQuotaWindow[] = [];
+    if (snap.fiveHour) candidates.push(snap.fiveHour);
+    if (snap.sevenDay) candidates.push(snap.sevenDay);
+    let earliest: { resetAt: string; ms: number } | undefined;
+    for (const w of candidates) {
+      if (!isWindowBlocked(w)) continue;
+      const resetMs = Date.parse(w.resetsAt);
+      if (!Number.isFinite(resetMs) || resetMs <= now) continue;
+      if (earliest === undefined || resetMs < earliest.ms) {
+        earliest = { resetAt: w.resetsAt, ms: resetMs };
+      }
+    }
+    return earliest ? { provider: providerId, resetAt: earliest.resetAt } : undefined;
+  }
+
+  /**
+   * Ensure exactly one `provider_ready` timer is armed for
+   * `(provider, resetAt)`. Multiple callers (the fail-fast path
+   * inside `spawn`, the real-child quota path inside
+   * `onTurnComplete`) may try to arm it for the same tuple — the
+   * map dedupes.
+   */
+  private armQuotaReadyTimer(provider: string, resetAt: string): void {
+    const key = `${provider}:${resetAt}`;
+    if (this.quotaReadyTimers.has(key)) return;
+    const resetMs = Date.parse(resetAt);
+    if (!Number.isFinite(resetMs)) return;
+    const delayMs = Math.max(0, resetMs - Date.now());
+    const timer = setTimeout(() => {
+      this.quotaReadyTimers.delete(key);
+      const ev: HarnessEvent = {
+        id: newEventId(),
+        // External events live on the parent's bus space; we use
+        // the system thread id so they're observable without a
+        // specific destination thread. Adapters / wait matchers
+        // filter on source + data.
+        threadId: 'system' as ThreadId,
+        kind: 'external_event',
+        payload: {
+          source: 'provider_ready',
+          data: { provider, resetAt },
+        } satisfies ExternalEventPayload,
+        createdAt: new Date().toISOString(),
+      } as HarnessEvent;
+      this.deps.bus.publish(ev);
+    }, delayMs);
+    // Don't keep the event loop alive solely for this timer — a
+    // process exit before reset is a clean shutdown, and the next
+    // boot will re-evaluate the registry snapshot.
+    if (typeof timer === 'object' && typeof (timer as { unref?: () => void }).unref === 'function') {
+      (timer as { unref: () => void }).unref();
+    }
+    this.quotaReadyTimers.set(key, timer);
+  }
+
+  private async publishSyntheticSubtaskComplete(args: {
+    parentThreadId: ThreadId;
+    parentTurnId: TurnId;
+    childThreadId: ThreadId;
+    provider: string;
+    resetAt: string;
+  }): Promise<void> {
+    const ev: HarnessEvent = {
+      id: newEventId(),
+      threadId: args.parentThreadId,
+      turnId: args.parentTurnId,
+      kind: 'subtask_complete',
+      payload: {
+        childThreadId: args.childThreadId,
+        status: 'errored',
+        reason: 'quota_exhausted',
+        resetAt: args.resetAt,
+        summary: `provider '${args.provider}' quota exhausted; wait until ${args.resetAt}`,
+      } satisfies SubtaskCompletePayload,
+      createdAt: new Date().toISOString(),
+    } as HarnessEvent;
+    await this.deps.store.append(ev);
+    this.deps.bus.publish(ev);
+  }
+
   private async onTurnComplete(event: HarnessEvent): Promise<void> {
     const record = this.children.get(event.threadId);
     if (!record) return; // not one of our children
     this.children.delete(event.threadId);
     if (record.wallTimer) clearTimeout(record.wallTimer);
 
-    const p = event.payload as { status: string; summary?: string; reason?: string };
+    const p = event.payload as {
+      status: string;
+      summary?: string;
+      reason?: string;
+      resetAt?: string;
+    };
     let status: SubtaskCompletePayload['status'];
     if (record.budgetExceeded) {
       status = 'budget_exceeded';
@@ -458,6 +631,15 @@ export class SubagentPool {
     // dropped.
     const providerSessionId = readProviderSessionId(record.provider);
 
+    // Real-child quota exhaustion: when the runner reported the
+    // turn ended on `quota_exhausted`, propagate the reason + the
+    // captured resetAt to the parent, and arm a `provider_ready`
+    // wake on the resetAt (deduped across concurrent children that
+    // share the wall).
+    if (p.reason === 'quota_exhausted' && p.resetAt !== undefined) {
+      this.armQuotaReadyTimer(record.provider.id, p.resetAt);
+    }
+
     const evOut: HarnessEvent = {
       id: newEventId(),
       threadId: record.parentThreadId,
@@ -468,6 +650,7 @@ export class SubagentPool {
         status,
         ...(summary !== undefined ? { summary } : {}),
         ...(providerSessionId !== undefined ? { providerSessionId } : {}),
+        ...(p.resetAt !== undefined ? { resetAt: p.resetAt } : {}),
         ...(record.budgetExceeded
           ? {
               reason: `budget:${record.exceededReason}`,
@@ -492,6 +675,14 @@ export class SubagentPool {
   get childCount(): number {
     return this.children.size;
   }
+}
+
+const BLOCKED_STATUSES = new Set(['blocked', 'rate_limited', 'limit_reached', 'exceeded']);
+
+function isWindowBlocked(w: ProviderQuotaWindow): boolean {
+  if (typeof w.status === 'string' && BLOCKED_STATUSES.has(w.status)) return true;
+  if (typeof w.utilization === 'number' && w.utilization >= 1.0) return true;
+  return false;
 }
 
 function readProviderSessionId(provider: LlmProvider): string | undefined {
