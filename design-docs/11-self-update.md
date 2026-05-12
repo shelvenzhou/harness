@@ -452,27 +452,45 @@ issue one `spawn(provider:'cc', cwd:'…', task:'…')` and observe a
   prompted to spawn a cc child to write "hello" to a temp file in
   a sibling dir, then verifies the file.
 
-### M2 — quota coordination
+### M2 — quota coordination — 🟢 shipped
 
 Goal: cc subagents that hit a session limit pause cleanly, the
 parent waits once, and on `provider_ready` it re-dispatches the
 queued work.
 
-- `CodingAgentProvider` recognises ratelimit / quota terminal
-  events from cc's stream-json, emits
-  `end{stopReason:'quota_exhausted', resetAt}`, updates a per-id
-  `QuotaState`.
-- `SubagentPool.spawn` short-circuits when `QuotaState.resetAt > now`
-  for the requested provider id — no CLI process, immediate
-  synthesised `subtask_complete{reason:'quota_exhausted', resetAt}`.
-- One scheduled timer per `(providerId, resetAt)`; on fire, publish
-  `external_event{source:'provider_ready', provider, resetAt}`.
-- `continueThreadId` reopen path implemented in `SubagentPool`
-  (was schema-only in M1).
-- `wait` tool already supports `kind` filtering; verify
-  `external_event` filtering is sufficient or extend lightly.
-- E2E: simulate cc quota exhaustion (fake binary), parent waits on
-  `provider_ready`, then resumes.
+What actually landed (see `tests/smoke/quotaCoordination.test.ts`
+for the contract in code):
+
+- `SamplingDelta.end.stopReason` carries `'quota_exhausted'` plus
+  an optional `resetAt`; the runner threads it through
+  `turn_complete.resetAt` → `subtask_complete.resetAt`.
+- `CodingAgentProvider` flips to `quota_exhausted` on its
+  terminal `end` when an in-run `rate_limit_event` matched a
+  blocked sentinel (`status: 'blocked' | 'rate_limited' |
+  'limit_reached' | 'exceeded'` or `utilization >= 1.0`) and the
+  CLI subsequently errored out. The resetAt is the one cc
+  itself reported.
+- The pool reads the **existing** `ProviderUsageRegistry` rather
+  than introducing a separate `QuotaState` registry; the
+  `fiveHour` / `sevenDay` snapshots captured in M1 are the
+  source of truth.
+- `SubagentPool.spawn` consults the registry: if any window for
+  the requested provider is blocked and not yet reset, the pool
+  synthesises an immediate
+  `subtask_complete{reason:'quota_exhausted', resetAt}` to the
+  parent. The synthetic path still writes the child thread +
+  `user_turn_start` seed for audit-log parity.
+- One `provider_ready` timer per `(providerId, resetAt)`, deduped
+  by a key map inside the pool. On fire, the pool publishes
+  `external_event{source:'provider_ready', data:{provider, resetAt}}`
+  on the bus. Timer is `unref`'d so a clean shutdown isn't held
+  open. The parent agent waits on `kind: 'external_event'` and
+  filters by `source` + `provider` in its own logic.
+- `continueThreadId` reopen implemented: pool verifies the
+  target thread exists and has no live runner
+  (`SpawnRefused('continueThreadId_unknown' | 'continueThreadId_live')`),
+  then appends a fresh `user_turn_start` and attaches a new
+  runner to the existing thread.
 
 ### M3 — usage introspection
 

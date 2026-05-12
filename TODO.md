@@ -57,35 +57,47 @@ the rationale in [08-roadmap.md](design-docs/08-roadmap.md).
   the M1 happy path; lands as part of the quota-coordination
   story below.
 
-### M2 — Quota coordination
+### M2 — Quota coordination — 🟢 done
 
-- ⚪ `CodingAgentProvider` recognises quota-exhausted terminal
-  events from cc (separate from the rate_limit_event "warning"
-  pushes already captured in M1) and emits
-  `end{stopReason:'quota_exhausted', resetAt}`. Extends
-  `SamplingDelta.end.stopReason` accordingly.
-- 🟢 Account-level windowed quota state (`fiveHour` / `sevenDay`)
-  for cc — already captured by `ProviderUsageRegistry` from
-  `rate_limit_event`. M2 reuses this rather than introducing a
-  separate `QuotaState` registry; the M2 work is the **policy
-  layer** on top (timers, fail-fast, ready event).
-- ⚪ `SubagentPool.spawn` short-circuits when the registry's
-  matching window is exhausted (`status:'blocked'` or
-  `utilization >= 1`): no CLI process, synthesise an immediate
+- 🟢 `SamplingDelta.end.stopReason` union extended with
+  `'quota_exhausted'`; the delta carries an optional `resetAt`
+  that the runner threads through `turn_complete.resetAt` →
+  `subtask_complete.resetAt`.
+- 🟢 `CodingAgentProvider` watches incoming `rate_limit_event`s
+  for blocked sentinels (`status: 'blocked' | 'rate_limited' | …`
+  or `utilization >= 1.0`); when the run errors out after one,
+  the terminal delta is `quota_exhausted` instead of plain
+  `error`, with the resetAt captured from the rate_limit event.
+- 🟢 Account-level `fiveHour` / `sevenDay` windows in
+  `ProviderUsageRegistry` (landed early in M1) act as the policy
+  input; no separate `QuotaState` registry needed.
+- 🟢 `SubagentPool.spawn` consults the registry: if a window for
+  the requested provider is blocked and its `resetsAt > now`, the
+  pool synthesises an immediate
   `subtask_complete{reason:'quota_exhausted', resetAt}` to the
-  parent.
-- ⚪ One `Scheduler` timer per `(providerId, window, resetsAt)`
-  (dedupe on unchanged resetsAt); on fire, publish
-  `external_event{source:'provider_ready', provider, window, resetsAt}`.
-- ⚪ `continueThreadId` reopen path implemented in `SubagentPool`
-  (was schema-only in M1): require thread exists, no live runner,
-  append fresh `user_turn_start`, restart runner.
-- ⚪ Verify `wait` `kind` matcher + filter (`source`, `provider`)
-  is sufficient to single out `provider_ready`; extend lightly if
-  not.
-- ⚪ E2E with a fake cc binary that emits a quota-blocked event;
-  parent waits on `provider_ready`; parent re-spawns with
-  `providerSessionId` + `continueThreadId`.
+  parent without launching a CLI process. The synthetic path
+  still creates the child thread + appends the
+  `user_turn_start` seed, so audit logs match the non-fail-fast
+  shape.
+- 🟢 One `provider_ready` timer per `(providerId, resetAt)` —
+  dedup'd by a key map inside the pool. On fire, the pool
+  publishes
+  `external_event{source:'provider_ready', data:{provider, resetAt}}`
+  on the bus. Timer is `unref`'d so it never holds the event
+  loop open past a clean shutdown.
+- 🟢 `continueThreadId` reopen implemented: when set, the pool
+  verifies the thread exists in the store, refuses if a live
+  runner is already attached (`SpawnRefused('continueThreadId_live')`)
+  or the thread is unknown (`continueThreadId_unknown`), then
+  appends a fresh `user_turn_start` to the existing thread and
+  starts a new runner there.
+- 🟢 `wait`'s existing `kind` matcher already handles
+  `external_event`; agents filter by `source:'provider_ready'`
+  inline rather than via a dedicated matcher.
+- 🟢 Tests: `tests/smoke/quotaCoordination.test.ts` covers all
+  four cases — real-cc quota_exhausted round-trip, fail-fast on
+  second spawn, provider_ready timer fires, `continueThreadId`
+  reopens an existing child thread.
 
 ### M3 — Usage introspection — 🟢 mostly absorbed into M1
 
