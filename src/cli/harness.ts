@@ -22,6 +22,8 @@ import {
   type DiagSink,
 } from '@harness/diag/index.js';
 
+import { loadPrompts } from './prompts.js';
+
 /**
  * `harness` CLI. Reads .env for OpenAI credentials; CLI flags override.
  */
@@ -61,10 +63,13 @@ async function main(): Promise<void> {
   const providerFactories = buildEnvProviderFactories();
   const providerFactoryModelInfo = buildEnvProviderModelInfo();
 
+  const prompts = loadPrompts();
   const systemPrompt =
     typeof values.system === 'string'
       ? values.system
-      : (process.env['HARNESS_SYSTEM_PROMPT'] ?? 'You are a helpful agent. Respond concisely.');
+      : (process.env['HARNESS_SYSTEM_PROMPT'] ??
+          prompts.main ??
+          'You are a helpful agent. Respond concisely.');
 
   const storeRoot =
     typeof values['store-root'] === 'string'
@@ -91,7 +96,20 @@ async function main(): Promise<void> {
     ...(Object.keys(providerFactories).length > 0 ? { providerFactories } : {}),
     ...(providerSpec.modelInfo !== undefined ? { runtimeModelInfo: providerSpec.modelInfo } : {}),
     ...(Object.keys(providerFactoryModelInfo).length > 0 ? { providerFactoryModelInfo } : {}),
+    ...(prompts.pinned.length > 0 ? { pinnedMemory: prompts.pinned } : {}),
+    ...(Object.keys(prompts.byRole).length > 0 ? { rolePrompts: prompts.byRole } : {}),
   });
+
+  if (prompts.dir !== undefined) {
+    const summary: string[] = [];
+    if (prompts.main !== undefined) summary.push('main');
+    if (prompts.pinned.length > 0) summary.push(`${prompts.pinned.length} playbook(s)`);
+    const roleCount = Object.keys(prompts.byRole).length;
+    if (roleCount > 0) summary.push(`${roleCount} role(s)`);
+    if (summary.length > 0) {
+      process.stdout.write(`harness prompts: ${summary.join(', ')} from ${prompts.dir}\n`);
+    }
+  }
 
   const adapterName =
     typeof values.adapter === 'string'
