@@ -503,20 +503,34 @@ left this window" without running CLI commands by hand.
 - `usage` tool output extended with optional `providerUsage` block
   for spawned children.
 
-### M4 — operator playbook (no code changes)
+### M4 — operator playbook — 🟡 partial (playbook authored; E2E demo pending)
 
-Goal: a real "add a Telegram adapter" demo end-to-end, driven only
-by operator messages on Discord (or terminal in dev).
+Pivoted from "pin `memory:playbook:self-update`" to "ship `.md`
+files in `harness/prompts/` and have the CLI inject them as
+`pinnedMemory`". Reasons (git-reviewable, diff-friendly,
+self-edit-natural via cc's `write`) live in the
+`feat/m4-prompts-from-disk` discussion.
 
-- Author and pin `memory:playbook:self-update` containing:
-  - decision tree for designer / implementer / reviewer (R2b
-    matrix)
-  - the R3 step-1 acceptance checklist
-  - quota / weekly-limit handling (R2a)
-  - PR opening flow (R4)
-- Demo: operator says "add a Telegram adapter"; the main agent
-  fans out designer → implementer → reviewer; PR appears on
-  GitHub; tests green.
+What landed (under `harness/prompts/`):
+
+- `main.md` — root orchestrator system prompt (replaces the inline
+  default).
+- `playbook-self-update.md` — worktree-only constraint, never
+  push to main, designer / implementer / reviewer sequencing,
+  R3-step-1 acceptance checklist, failure → surface to operator.
+  Loaded as a pinned-memory entry every turn.
+- `playbook-spawn.md` — inline-vs-spawn decision rules,
+  coding-agent delegation, `providerSessionId` carry-over.
+- `role-designer.md` / `role-implementer.md` / `role-reviewer.md`
+  — capability-focused suffixes appended to spawned-child system
+  prompts when the matching `role` is set.
+
+Still pending:
+
+- Real E2E demo. Operator says "add a Telegram adapter"; main
+  agent fans out designer → implementer → reviewer; PR appears
+  on GitHub; tests green. This is the user-driven manual test
+  gate now that M1 / M2 / M5 have shipped.
 
 ### M5 — supervisor + restart handshake — 🟢 shipped (single-instance variant)
 

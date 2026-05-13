@@ -119,17 +119,29 @@ to read account state.
   (resetsAt is absolute, so restored data carries its own
   freshness signal).
 
-### M4 — Operator playbook (no code)
+### M4 — Operator playbook — 🟡 partial (playbook authored; E2E demo pending)
 
-- ⚪ Author and pin `memory:playbook:self-update` covering:
-  - role decision tree (designer / implementer / reviewer; R2b
-    matrix in 11-self-update.md)
-  - R3 step-1 acceptance checklist (tests + e2e + diff review +
-    docs sync)
-  - quota / weekly-limit handling (R2a)
-  - PR opening flow (R4)
+The playbook landed via the `prompts/` loader (see the
+prompts-from-disk track) rather than as a `memory:set` entry —
+`.md` in the repo is git-reviewable and self-edit friendly, see
+discussion in 11-self-update.md. Content lives in
+`harness/prompts/`:
+
+- 🟢 `playbook-self-update.md` covers worktree-only constraint,
+  no-push-to-main, designer / implementer / reviewer
+  sequencing, R3-step-1 acceptance checklist, failure → surface
+  to operator. Picked up automatically as a pinned-memory entry.
+- 🟢 `playbook-spawn.md` covers inline-vs-spawn decision rules,
+  coding-agent delegation, `providerSessionId` carry-over.
+- 🟢 `role-{designer,implementer,reviewer}.md` add capability-
+  focused role suffixes to spawned children.
+- 🟢 `main.md` replaces the inline `'You are a helpful agent.'`
+  default with the harness orchestrator identity + tool reach-for
+  hints.
 - ⚪ End-to-end demo: operator says "add a Telegram adapter";
-  observe full flow → PR on GitHub, tests green.
+  observe full flow → PR on GitHub, tests green. **This is the
+  user-driven manual test gate now that M1 / M2 / M5 are
+  shipped.**
 
 ### M5 — supervisor + restart handshake — 🟢 shipped (single-instance variant)
 
