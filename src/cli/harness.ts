@@ -22,6 +22,18 @@ import {
   type DiagSink,
 } from '@harness/diag/index.js';
 
+import {
+  consumeHandoff,
+  deletePidFile,
+  deleteReadyFile,
+  gitHeadRef,
+  gitHeadSha,
+  writeReadyFile,
+  type HandoffContent,
+} from '@harness/runtime/lifecycle.js';
+import { newEventId } from '@harness/core/ids.js';
+import type { HarnessEvent, RestartEventPayload } from '@harness/core/events.js';
+
 import { loadPrompts } from './prompts.js';
 
 /**
@@ -166,9 +178,81 @@ async function main(): Promise<void> {
     },
   });
 
+  // Lifecycle handshake with the supervisor (M5). Skipped when there
+  // is no `storeRoot` — the lifecycle helpers all live under
+  // `<storeRoot>/.lifecycle/` so an in-memory store has nowhere to
+  // put them. The supervisor refuses to run without a store root, so
+  // this is symmetric.
+  if (storeRoot !== undefined) {
+    const handoff = consumeHandoff(storeRoot);
+    const toSha = await gitHeadSha(process.cwd());
+    const ref = await gitHeadRef(process.cwd());
+    await publishRestartEvent({
+      runtime,
+      ...(handoff !== undefined ? { handoff } : {}),
+      ...(toSha !== undefined ? { toSha } : {}),
+      ...(ref !== undefined ? { ref } : {}),
+    });
+    writeReadyFile(storeRoot, {
+      pid: process.pid,
+      ...(toSha !== undefined ? { sha: toSha } : {}),
+      ...(ref !== undefined ? { ref } : {}),
+      startedAt: new Date().toISOString(),
+    });
+    installShutdownHooks(storeRoot);
+  }
+
   process.stdout.write(
     `harness started. provider=${provider.id} adapter=${adapter.id} thread=${runtime.rootThreadId}.\n`,
   );
+}
+
+async function publishRestartEvent(args: {
+  runtime: Awaited<ReturnType<typeof bootstrap>>;
+  handoff?: HandoffContent;
+  toSha?: string;
+  ref?: string;
+}): Promise<void> {
+  // Pick the to-sha / ref to record. Handoff wins when present (the
+  // supervisor knows what it deployed); otherwise fall back to the
+  // freshly-resolved git state.
+  const toSha = args.handoff?.toSha ?? args.toSha;
+  const ref = args.handoff?.ref ?? args.ref;
+  if (toSha === undefined) return; // not a git checkout — skip rendering
+  const payload: RestartEventPayload = {
+    toSha,
+    outcome: args.handoff?.outcome ?? 'manual',
+    startedAt: new Date().toISOString(),
+    ...(args.handoff?.fromSha !== undefined ? { fromSha: args.handoff.fromSha } : {}),
+    ...(ref !== undefined ? { ref } : {}),
+    ...(args.handoff?.message !== undefined ? { message: args.handoff.message } : {}),
+  };
+  const ev: HarnessEvent = {
+    id: newEventId(),
+    threadId: args.runtime.rootThreadId,
+    kind: 'restart_event',
+    payload,
+    createdAt: new Date().toISOString(),
+  } as HarnessEvent;
+  await args.runtime.store.append(ev);
+  args.runtime.bus.publish(ev);
+}
+
+function installShutdownHooks(storeRoot: string): void {
+  // Best-effort cleanup. The supervisor uses absence of the ready
+  // file as the "old harness has exited cleanly" signal; deleting
+  // it on SIGTERM is the contract.
+  let shuttingDown = false;
+  const onSignal = (sig: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    deleteReadyFile(storeRoot);
+    deletePidFile(storeRoot);
+    // Re-raise so the default exit semantics still apply.
+    process.kill(process.pid, sig);
+  };
+  process.once('SIGTERM', () => onSignal('SIGTERM'));
+  process.once('SIGINT', () => onSignal('SIGINT'));
 }
 
 interface BuildProviderArgs {
