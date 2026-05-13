@@ -534,6 +534,7 @@ export class DiscordAdapter implements Adapter {
           'turn_complete',
           'compaction_event',
           'interrupt',
+          'restart_event',
         ],
       },
     );
@@ -875,6 +876,25 @@ export class DiscordAdapter implements Adapter {
           await this.flushLive(state);
           const reason = ev.payload.reason ? ` — ${ev.payload.reason}` : '';
           await this.transport.sendText(channelId, `-# ⏸️ interrupt${reason}`);
+          break;
+        }
+        case 'restart_event': {
+          await this.flushLive(state);
+          const p = ev.payload;
+          const to = shortSha(p.toSha);
+          const from = p.fromSha ? `${shortSha(p.fromSha)} → ` : '';
+          const refTag = p.ref ? ` (${p.ref})` : '';
+          const outcomeTag =
+            p.outcome === 'success'
+              ? ''
+              : p.outcome === 'rolled_back'
+                ? ' — rolled back'
+                : ' — manual';
+          const msg = p.message ? ` · ${p.message}` : '';
+          await this.transport.sendText(
+            channelId,
+            `-# 🔄 back on ${from}${to}${refTag}${outcomeTag}${msg}`,
+          );
           break;
         }
         default:
@@ -1402,4 +1422,8 @@ function formatAgeShort(ms: number): string {
 function truncateTo(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max - 1)}…`;
+}
+
+function shortSha(sha: string): string {
+  return sha.length > 7 ? sha.slice(0, 7) : sha;
 }
