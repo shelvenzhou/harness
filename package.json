@@ -20,7 +20,8 @@
     "test:watch": "vitest",
     "test:unit": "vitest run tests/unit",
     "test:smoke": "vitest run tests/smoke",
-    "test:e2e": "HARNESS_E2E=1 vitest run tests/e2e"
+    "test:e2e": "HARNESS_E2E=1 vitest run tests/e2e",
+    "supervisor": "node scripts/supervisor.cjs"
   },
   "dependencies": {
     "discord.js": "^14.16.0",

@@ -518,10 +518,64 @@ by operator messages on Discord (or terminal in dev).
   fans out designer → implementer → reviewer; PR appears on
   GitHub; tests green.
 
-### M5 — R3 supervisor (blue/green restart)
+### M5 — supervisor + restart handshake — 🟢 shipped (single-instance variant)
 
-Pre-existing R3 spec in this doc. Lands after M4 because we want
-the demo loop running before we automate restart.
+R3's three layered safeguards live across two surfaces: the
+**operator playbook** (pre-deploy review checklist, M4) handles
+safeguard #1; the **external supervisor** handles #2 (build
+verifier) and a single-instance form of #3 (no blue/green yet —
+see "Out of scope" below).
+
+Concrete shape (matches `tests/unit/runtime/lifecycle.test.ts`):
+
+- `restart_event` event kind: emitted on every harness boot,
+  carrying `fromSha` (when the supervisor handed one off) →
+  `toSha` (current HEAD) plus `ref`, `outcome`, `message`,
+  `startedAt`. Discord renders `-# 🔄 back on <from> → <to> (ref) …`;
+  terminal renders a dim `[restart …]` line.
+- `<storeRoot>/.lifecycle/` is the handshake channel between
+  harness and supervisor:
+  - `ready.json` — written by the harness once its adapter is
+    connected. Contains `{ pid, sha, ref, startedAt }`. Deleted
+    on clean shutdown. The supervisor watches for this file to
+    confirm the new build came up.
+  - `handoff.json` — written by the supervisor *before* exec'ing
+    the new harness. Read + deleted on boot by the new process
+    so the `restart_event` it publishes carries the
+    `fromSha`/`outcome` the supervisor intended.
+  - `pid` — the supervisor's bookkeeping of its current harness
+    child's PID.
+  All writes are atomic (tmp + rename).
+- `scripts/supervisor.cjs` is dependency-free Node, runs
+  **outside** the harness process. Three subcommands:
+  - `start [<ref>]`
+  - `deploy <ref>` — fetch → checkout ref → `pnpm install`
+    `--frozen-lockfile` → `pnpm build` → `pnpm test` **on the
+    new ref**. Failure path: revert checkout, leave old running,
+    exit non-zero. Success path: SIGTERM old harness (SIGKILL
+    after `HARNESS_SHUTDOWN_TIMEOUT_MS`), write handoff, spawn
+    new harness, wait for `ready.json` with the expected sha
+    within `HARNESS_READY_TIMEOUT_MS`.
+  - `status` — pid + ready introspection.
+
+The anti-brick contract: **a broken build cannot kill the old
+harness**, because build / install / test all run before the
+SIGTERM. The cost is a brief drop window during cutover (Discord
+gateway disconnect + reconnect) — acceptable for the
+single-operator deployment target.
+
+Out of scope for this M5 (tracked in `TODO.md` and a future
+follow-up):
+
+- True blue/green where two harness instances coexist briefly.
+  Discord allows only one connection per bot token; achieving
+  this requires either a staging bot token or an HTTP adapter.
+- Automatic rollback to a prior-known-good sha on ready-file
+  timeout. Today the operator gets a clear error and intervenes.
+- A `/deploy` slash command. The main agent can already invoke
+  the supervisor via `shell`, but a non-detached invocation dies
+  with the parent — proper integration needs `nohup` / `setsid`
+  detachment.
 
 ### M6 — codex parity
 

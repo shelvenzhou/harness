@@ -281,7 +281,15 @@ export class TerminalAdapter implements Adapter {
     if (!this.bus || !this.threadId) return;
     this.subscription = this.bus.subscribe((ev) => this.onBusEvent(ev), {
       threadId: this.threadId,
-      kinds: ['reply', 'preamble', 'reasoning', 'turn_complete', 'compaction_event', 'interrupt'],
+      kinds: [
+        'reply',
+        'preamble',
+        'reasoning',
+        'turn_complete',
+        'compaction_event',
+        'interrupt',
+        'restart_event',
+      ],
     });
     if (this.streamBus) {
       this.streamSubscription = this.streamBus.subscribe(
@@ -484,6 +492,29 @@ export class TerminalAdapter implements Adapter {
         const p = ev.payload as { reason?: string };
         const reason = p.reason ? ` (${p.reason})` : '';
         this.output.write(`\x1b[2m[interrupt${reason}]\x1b[0m\n`);
+        break;
+      }
+      case 'restart_event': {
+        const p = ev.payload as {
+          fromSha?: string;
+          toSha: string;
+          ref?: string;
+          outcome: 'success' | 'rolled_back' | 'manual';
+          message?: string;
+        };
+        const to = p.toSha.slice(0, 7);
+        const from = p.fromSha ? `${p.fromSha.slice(0, 7)} → ` : '';
+        const refTag = p.ref ? ` (${p.ref})` : '';
+        const outcomeTag =
+          p.outcome === 'success'
+            ? ''
+            : p.outcome === 'rolled_back'
+              ? ' — rolled back'
+              : ' — manual';
+        const msg = p.message ? ` · ${p.message}` : '';
+        this.output.write(
+          `\x1b[2m[restart ${from}${to}${refTag}${outcomeTag}${msg}]\x1b[0m\n`,
+        );
         break;
       }
       default:

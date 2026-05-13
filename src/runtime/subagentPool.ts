@@ -10,7 +10,7 @@ import type { SearchBackend } from '@harness/search/types.js';
 import type { ToolRegistry } from '@harness/tools/registry.js';
 import type { ToolExecutor } from '@harness/tools/executor.js';
 import { newRootTraceparent } from '@harness/core/traceparent.js';
-import { newEventId, newThreadId, newTurnId } from '@harness/core/ids.js';
+import { newEventId, newThreadId } from '@harness/core/ids.js';
 import type { ThreadId, TurnId } from '@harness/core/ids.js';
 import type {
   ExternalEventPayload,

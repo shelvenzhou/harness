@@ -31,7 +31,8 @@ export type EventKind =
   | 'turn_complete'
   | 'sampling_complete'
   | 'compaction_event'
-  | 'rollback_marker';
+  | 'rollback_marker'
+  | 'restart_event';
 
 export interface ElidedMeta {
   handle: HandleRef;
@@ -287,6 +288,30 @@ export interface RollbackMarkerPayload {
 }
 export type RollbackMarkerEvent = EventBase<'rollback_marker', RollbackMarkerPayload>;
 
+/**
+ * The supervisor restarted the harness onto a new build. The new
+ * process publishes this on boot so adapters can render a
+ * "back on <sha>" badge on the next message and the operator can
+ * trace which build is currently answering.
+ *
+ *   fromSha     — git sha the *previous* process was running (when
+ *                 known; absent if the supervisor didn't pass it
+ *                 forward, e.g. first boot after a manual start).
+ *   toSha       — git sha the *current* process is running.
+ *   ref         — symbolic ref / branch name when known.
+ *   outcome     — supervisor's classification of the cutover.
+ *   message     — operator-facing one-liner (e.g. error reason).
+ */
+export interface RestartEventPayload {
+  fromSha?: string;
+  toSha: string;
+  ref?: string;
+  outcome: 'success' | 'rolled_back' | 'manual';
+  message?: string;
+  startedAt: string;
+}
+export type RestartEventEvent = EventBase<'restart_event', RestartEventPayload>;
+
 // ─── union + narrowing helpers ─────────────────────────────────────────────
 
 export type HarnessEvent =
@@ -310,7 +335,8 @@ export type HarnessEvent =
   | TurnCompleteEvent
   | SamplingCompleteEvent
   | CompactionEventEvent
-  | RollbackMarkerEvent;
+  | RollbackMarkerEvent
+  | RestartEventEvent;
 
 export type EventOfKind<K extends EventKind> = Extract<HarnessEvent, { kind: K }>;
 
@@ -339,6 +365,7 @@ export const DATA_PLANE_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
   'sampling_complete',
   'compaction_event',
   'rollback_marker',
+  'restart_event',
 ]);
 
 export function isControlPlane(e: HarnessEvent): boolean {
