@@ -93,7 +93,7 @@ function projectEvent(
         });
       }
       if (p.text) {
-        content.push({ kind: 'text', text: `[reasoning] ${p.text}` });
+        content.push({ kind: 'reasoning', text: p.text });
       }
       if (content.length === 0) return null;
       return {
@@ -276,7 +276,7 @@ export function estimateTokens(items: ProjectedItem[]): number {
   let bytes = 0;
   for (const item of items) {
     for (const c of item.content) {
-      if (c.kind === 'text') bytes += c.text.length;
+      if (c.kind === 'text' || c.kind === 'reasoning') bytes += c.text.length;
       else bytes += JSON.stringify(c).length;
     }
   }

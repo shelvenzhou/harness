@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { ProjectedItem, StablePrefix } from '@harness/llm/provider.js';
 import type { ToolCallId } from '@harness/core/ids.js';
-import { __testOnly } from '@harness/llm/openaiProvider.js';
+import { OpenAIProvider, __testOnly } from '@harness/llm/openaiProvider.js';
 
 describe('OpenAIProvider Responses-API input translation', () => {
   it('emits a function_call input item per tool_use and pairs results by call_id', () => {
@@ -318,6 +318,46 @@ describe('OpenAIProvider Chat Completions translation', () => {
     });
   });
 
+  it('echoes DeepSeek reasoning_content on merged assistant history messages', () => {
+    const messages = __testOnly.toChatMessages(
+      { systemPrompt: 'sys', tools: [] },
+      [
+        { role: 'user', content: [{ kind: 'text', text: 'question' }] },
+        { role: 'assistant', content: [{ kind: 'reasoning', text: 'thinking' }] },
+        { role: 'assistant', content: [{ kind: 'text', text: 'answer' }] },
+      ],
+      { reasoningContent: true },
+    );
+
+    expect(messages).toHaveLength(3);
+    expect(messages[2]).toMatchObject({
+      role: 'assistant',
+      content: 'answer',
+      reasoning_content: 'thinking',
+    });
+  });
+
+  it('keeps reasoning as plain assistant text for non-DeepSeek Chat models', () => {
+    const messages = __testOnly.toChatMessages(
+      { systemPrompt: 'sys', tools: [] },
+      [
+        { role: 'assistant', content: [{ kind: 'reasoning', text: 'thinking' }] },
+        { role: 'assistant', content: [{ kind: 'text', text: 'answer' }] },
+      ],
+    );
+
+    expect(messages).toHaveLength(3);
+    expect(messages[1]).toMatchObject({
+      role: 'assistant',
+      content: '[reasoning] thinking',
+    });
+    expect(messages[1]).not.toHaveProperty('reasoning_content');
+    expect(messages[2]).toMatchObject({
+      role: 'assistant',
+      content: 'answer',
+    });
+  });
+
   it('translates tools to Chat Completions function-tool shape', () => {
     const tools = __testOnly.toChatTools(request.prefix);
     expect(tools).toEqual([
@@ -350,6 +390,49 @@ describe('OpenAIProvider Chat Completions translation', () => {
     expect(params).not.toHaveProperty('max_completion_tokens');
   });
 
+  it('enables reasoning_content history serialization for DeepSeek Chat params', () => {
+    const params = __testOnly.toChatCreateParams(
+      {
+        prefix: { systemPrompt: 'sys', tools: [] },
+        tail: [
+          { role: 'assistant', content: [{ kind: 'reasoning', text: 'hidden' }] },
+          { role: 'assistant', content: [{ kind: 'text', text: 'shown' }] },
+        ],
+      },
+      {
+        model: 'deepseek-v4-pro',
+        defaultMaxTokens: 123,
+        chatMaxTokensParam: 'max_tokens',
+      },
+    ) as unknown as { messages: Array<Record<string, unknown>> };
+
+    expect(params.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: 'shown',
+      reasoning_content: 'hidden',
+    });
+  });
+
+  it('keeps reasoning_content present for DeepSeek assistant messages after pruning', () => {
+    const params = __testOnly.toChatCreateParams(
+      {
+        prefix: { systemPrompt: 'sys', tools: [] },
+        tail: [{ role: 'assistant', content: [{ kind: 'text', text: 'shown' }] }],
+      },
+      {
+        model: 'deepseek-v4-pro',
+        defaultMaxTokens: 123,
+        chatMaxTokensParam: 'max_tokens',
+      },
+    ) as unknown as { messages: Array<Record<string, unknown>> };
+
+    expect(params.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: 'shown',
+      reasoning_content: '',
+    });
+  });
+
   it('maps structured output to Chat response_format shape', () => {
     const out = __testOnly.toChatResponseFormat({
       type: 'json_schema',
@@ -364,5 +447,47 @@ describe('OpenAIProvider Chat Completions translation', () => {
         strict: true,
       },
     });
+  });
+});
+
+describe('OpenAIProvider Chat Completions streaming', () => {
+  it('emits DeepSeek delta.reasoning_content as reasoning deltas', async () => {
+    const provider = new OpenAIProvider({
+      apiKey: 'test',
+      model: 'deepseek-v4-pro',
+      apiMode: 'chat_completions',
+    });
+    const create = async function* () {
+      yield {
+        choices: [
+          {
+            delta: { reasoning_content: 'think ', content: 'answer' },
+            finish_reason: null,
+          },
+        ],
+      };
+      yield {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+      };
+    };
+    (
+      provider as unknown as {
+        client: { chat: { completions: { create: () => AsyncIterable<unknown> } } };
+      }
+    ).client.chat.completions.create = create;
+
+    const deltas = [];
+    for await (const delta of provider.sample(
+      {
+        prefix: { systemPrompt: 'sys', tools: [] },
+        tail: [{ role: 'user', content: [{ kind: 'text', text: 'go' }] }],
+      },
+      new AbortController().signal,
+    )) {
+      deltas.push(delta);
+    }
+
+    expect(deltas).toContainEqual({ kind: 'reasoning_delta', text: 'think ' });
+    expect(deltas).toContainEqual({ kind: 'text_delta', text: 'answer' });
   });
 });

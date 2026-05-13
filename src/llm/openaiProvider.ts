@@ -52,8 +52,10 @@ import type {
  *   stream events                  → SamplingDelta
  *
  * In Chat Completions mode the same harness projection maps to
- * `messages` + `tools`; native reasoning deltas/provider_state are not
- * available on that transport.
+ * `messages` + `tools`. Some OpenAI-compatible endpoints (notably
+ * DeepSeek thinking models) also stream and require echoed
+ * `reasoning_content`; opaque Responses provider_state remains
+ * Responses-only.
  */
 
 export interface OpenAIProviderOptions {
@@ -113,9 +115,9 @@ export class OpenAIProvider implements LlmProvider {
       prefixCache: false, // Server-side automatic caching; no client knob.
       cacheEdits: false,
       nativeToolUse: true,
-      // Chat Completions stream does not surface reasoning deltas or
-      // encrypted reasoning state, so the capability is transport-scoped.
-      nativeReasoning: this.apiMode === 'responses',
+      // Responses exposes OpenAI reasoning deltas/state. DeepSeek chat
+      // models expose reasoning_content on Chat Completions chunks.
+      nativeReasoning: this.apiMode === 'responses' || supportsChatReasoningContent(this.model),
       maxContextTokens: 128_000,
     };
     this.defaultMaxTokens = opts.defaultMaxTokens ?? 32768;
@@ -344,6 +346,10 @@ export class OpenAIProvider implements LlmProvider {
 
         for (const choice of chunk.choices) {
           const delta = choice.delta;
+          const reasoningContent = chatDeltaReasoningContent(delta);
+          if (reasoningContent) {
+            yield { kind: 'reasoning_delta', text: reasoningContent };
+          }
           if (delta.content) {
             yield { kind: 'text_delta', text: delta.content };
           }
@@ -471,6 +477,9 @@ function toResponsesInput(tail: ProjectedItem[]): ResponseInput {
         case 'text':
           textChunks.push(c.text);
           break;
+        case 'reasoning':
+          textChunks.push(`[reasoning] ${c.text}`);
+          break;
         case 'tool_use':
           if (textChunks.length > 0) {
             items.push(easyMessage('assistant', textChunks.join('')));
@@ -532,16 +541,66 @@ function toResponsesTools(prefix: StablePrefix): FunctionTool[] {
   }));
 }
 
-function toChatMessages(prefix: StablePrefix, tail: ProjectedItem[]): ChatCompletionMessageParam[] {
+interface ChatMessageOptions {
+  reasoningContent?: boolean;
+}
+
+interface PendingChatAssistantMessage {
+  textChunks: string[];
+  reasoningChunks: string[];
+  toolCalls: ChatCompletionMessageToolCall[];
+}
+
+type ChatAssistantMessageWithReasoning = ChatCompletionMessageParam & {
+  role: 'assistant';
+  reasoning_content?: string;
+};
+
+function toChatMessages(
+  prefix: StablePrefix,
+  tail: ProjectedItem[],
+  opts: ChatMessageOptions = {},
+): ChatCompletionMessageParam[] {
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: prefix.systemPrompt },
   ];
+  let pendingAssistant: PendingChatAssistantMessage | undefined;
+
+  const assistant = (): PendingChatAssistantMessage => {
+    pendingAssistant ??= { textChunks: [], reasoningChunks: [], toolCalls: [] };
+    return pendingAssistant;
+  };
+
+  const flushAssistant = (): void => {
+    if (!pendingAssistant) return;
+    const text = pendingAssistant.textChunks.join('');
+    const reasoning = pendingAssistant.reasoningChunks.join('');
+    const toolCalls = pendingAssistant.toolCalls;
+    if (!text && !reasoning && toolCalls.length === 0) {
+      pendingAssistant = undefined;
+      return;
+    }
+    const content = opts.reasoningContent
+      ? (text.length > 0 ? text : null)
+      : [reasoning ? `[reasoning] ${reasoning}` : '', text].filter(Boolean).join('');
+    const message: ChatAssistantMessageWithReasoning = {
+      role: 'assistant',
+      content,
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      ...(opts.reasoningContent ? { reasoning_content: reasoning } : {}),
+    };
+    messages.push(message);
+    pendingAssistant = undefined;
+  };
+
   for (const item of tail) {
     if (item.role === 'user') {
+      flushAssistant();
       messages.push({ role: 'user', content: contentToText(item.content) });
       continue;
     }
     if (item.role === 'tool_result') {
+      flushAssistant();
       for (const c of item.content) {
         if (c.kind === 'tool_result') {
           messages.push({
@@ -573,15 +632,16 @@ function toChatMessages(prefix: StablePrefix, tail: ProjectedItem[]): ChatComple
       continue;
     }
 
-    const textChunks: string[] = [];
-    const toolCalls: ChatCompletionMessageToolCall[] = [];
     for (const c of item.content) {
       switch (c.kind) {
         case 'text':
-          textChunks.push(c.text);
+          assistant().textChunks.push(c.text);
+          break;
+        case 'reasoning':
+          assistant().reasoningChunks.push(c.text);
           break;
         case 'tool_use':
-          toolCalls.push({
+          assistant().toolCalls.push({
             id: c.toolCallId,
             type: 'function',
             function: {
@@ -591,21 +651,18 @@ function toChatMessages(prefix: StablePrefix, tail: ProjectedItem[]): ChatComple
           });
           break;
         case 'elided':
-          textChunks.push(`[elided handle=${c.handle} ${c.originKind}] ${c.summary ?? ''}`);
+          assistant().textChunks.push(
+            `[elided handle=${c.handle} ${c.originKind}] ${c.summary ?? ''}`,
+          );
           break;
         case 'provider_state':
         case 'tool_result':
           break;
       }
     }
-    if (textChunks.length > 0 || toolCalls.length > 0) {
-      messages.push({
-        role: 'assistant',
-        content: textChunks.length > 0 ? textChunks.join('') : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
-    }
+    if (!opts.reasoningContent) flushAssistant();
   }
+  flushAssistant();
   return messages;
 }
 
@@ -628,6 +685,7 @@ function contentToText(content: ProjectedContent[]): string {
   return content
     .map((c) => {
       if (c.kind === 'text') return c.text;
+      if (c.kind === 'reasoning') return `[reasoning] ${c.text}`;
       if (c.kind === 'elided') return `[elided ${c.originKind}] ${c.summary ?? ''}`;
       return '';
     })
@@ -718,7 +776,9 @@ function toChatCreateParams(
   const maxTokensKey = defaults.chatMaxTokensParam;
   return {
     model,
-    messages: toChatMessages(request.prefix, request.tail),
+    messages: toChatMessages(request.prefix, request.tail, {
+      reasoningContent: supportsChatReasoningContent(model),
+    }),
     ...(tools.length > 0 ? { tools } : {}),
     stream: true,
     stream_options: { include_usage: true },
@@ -782,6 +842,15 @@ function supportsReasoning(model: string): boolean {
   return id.startsWith('gpt-5') || /^o\d/.test(id);
 }
 
+function supportsChatReasoningContent(model: string): boolean {
+  return model.toLowerCase().includes('deepseek');
+}
+
+function chatDeltaReasoningContent(delta: unknown): string | undefined {
+  const reasoningContent = (delta as { reasoning_content?: unknown }).reasoning_content;
+  return typeof reasoningContent === 'string' ? reasoningContent : undefined;
+}
+
 function isEncryptedReasoningItem(item: unknown): item is ResponseReasoningItem {
   return (
     typeof item === 'object' &&
@@ -811,5 +880,7 @@ export const __testOnly = {
   chatFinishReasonToStopReason,
   supportsTemperature,
   supportsReasoning,
+  supportsChatReasoningContent,
+  chatDeltaReasoningContent,
   isEncryptedReasoningItem,
 };

@@ -166,6 +166,13 @@ E2E tests that hit the real API are skipped unless you set `HARNESS_E2E=1`:
 HARNESS_E2E=1 pnpm test:e2e
 ```
 
+The live multi-model e2e reads `HARNESS_MODEL_ALIASES` and runs each configured
+OpenAI-compatible model with an available API key. To narrow a run:
+
+```bash
+HARNESS_E2E=1 HARNESS_E2E_MODEL_ALIASES=main,deepseek pnpm exec vitest run tests/e2e/multiModelLive.test.ts
+```
+
 Offline smoke coverage uses inline scripted providers in the test files; the
 runtime no longer ships a built-in mock provider.
 

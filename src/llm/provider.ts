@@ -55,6 +55,7 @@ export interface ProjectedItem {
 
 export type ProjectedContent =
   | { kind: 'text'; text: string }
+  | { kind: 'reasoning'; text: string }
   | { kind: 'tool_use'; toolCallId: ToolCallId; name: string; args: unknown }
   | { kind: 'tool_result'; toolCallId: ToolCallId; ok: boolean; output?: unknown; error?: string }
   | { kind: 'provider_state'; providerId: string; items: unknown[] }
