@@ -131,10 +131,63 @@ to read account state.
 - ⚪ End-to-end demo: operator says "add a Telegram adapter";
   observe full flow → PR on GitHub, tests green.
 
-### M5 — R3 supervisor (blue/green restart)
+### M5 — supervisor + restart handshake — 🟢 shipped (single-instance variant)
 
-Tracked in 11-self-update.md §R3. Lands after M4 so we have a
-working demo before automating restart. No code stubs yet.
+The first version ships **single-instance restart with anti-brick
+verification**, not full blue/green. Discord allows only one bot
+connection per token, so true blue/green would need either a
+staging bot or an HTTP adapter. We get the safety guarantee that
+matters — never kill the old harness on a broken build — without
+that complexity.
+
+What landed:
+
+- 🟢 `restart_event` event kind in `src/core/events.ts` with
+  `fromSha` / `toSha` / `ref` / `outcome` / `message` / `startedAt`.
+- 🟢 `src/runtime/lifecycle.ts` lifecycle helpers — read/write
+  `<storeRoot>/.lifecycle/{ready.json, handoff.json, pid}` with
+  atomic writes (tmp + rename). All file I/O is dependency-free
+  so the same module can be imported from inside the harness and
+  from `scripts/supervisor.cjs`.
+- 🟢 CLI integration: after `adapter.start()` the harness reads +
+  consumes the supervisor's handoff, publishes a
+  `restart_event` to the root thread, writes its own
+  `ready.json`, and installs `SIGTERM` / `SIGINT` cleanup hooks
+  that delete the ready / pid files before re-raising.
+- 🟢 Discord adapter renders `-# 🔄 back on <from> → <to> (ref) …`
+  on the next line in the bound channel. Terminal adapter prints
+  a dim `[restart …]` line. Both subscribe to `restart_event`.
+- 🟢 `scripts/supervisor.cjs` — pure-Node external script.
+  Three subcommands:
+  - `start [<ref>]` — checkout (if ref), clear stale lifecycle
+    files, spawn harness, write pidfile, forward SIGINT/SIGTERM.
+  - `deploy <ref>` — fetch, checkout ref, `pnpm install
+    --frozen-lockfile && pnpm build && pnpm test` ON THE NEW REF
+    FIRST. On failure: revert checkout, leave old harness
+    running, exit non-zero. On success: SIGTERM old (SIGKILL
+    grace), write handoff, spawn new, wait for ready.json from
+    the new pid, exit.
+  - `status` — pretty-print pid + ready info.
+  Configurable via `HARNESS_REPO_ROOT`, `HARNESS_START_CMD`,
+  `HARNESS_BUILD_CMD`, `HARNESS_TEST_CMD`, `HARNESS_SKIP_TESTS`,
+  `HARNESS_READY_TIMEOUT_MS`, `HARNESS_SHUTDOWN_TIMEOUT_MS`.
+- 🟢 Unit tests: `tests/unit/runtime/lifecycle.test.ts` covers
+  ready / handoff / pid round-trips, missing-file safety, and
+  atomic-write correctness.
+
+Out of scope (still ⚪ for a future M5+):
+
+- ⚪ True blue/green with a staging adapter session (the new
+  harness comes up while the old still answers, then traffic
+  cuts over). Needs either a second Discord bot token or an HTTP
+  adapter where parallel instances coexist.
+- ⚪ Automatic rollback to the prior-known-good sha on
+  ready-file timeout. Today the supervisor surfaces the failure
+  and the operator intervenes.
+- ⚪ A `/deploy` slash command in adapters — the main agent
+  invokes the supervisor via `shell` today, which is sufficient
+  but doesn't survive the parent dying mid-deploy. Detached
+  invocation (`nohup` / `setsid`) is the obvious next step.
 
 ### M6 — codex parity
 
