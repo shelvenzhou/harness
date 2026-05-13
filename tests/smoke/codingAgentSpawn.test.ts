@@ -95,7 +95,9 @@ function spawnScript(args: {
   toolCallId: string;
   task: string;
   cwd: string;
+  provider?: 'cc' | 'codex';
   providerSessionId?: string;
+  permissionMode?: 'default' | 'bypass';
 }): SamplingDelta[][] {
   return [
     [
@@ -107,10 +109,13 @@ function spawnScript(args: {
           task: args.task,
           role: 'designer',
           budget: {},
-          provider: 'cc',
+          provider: args.provider ?? 'cc',
           cwd: args.cwd,
           ...(args.providerSessionId !== undefined
             ? { providerSessionId: args.providerSessionId }
+            : {}),
+          ...(args.permissionMode !== undefined
+            ? { permissionMode: args.permissionMode }
             : {}),
         },
       },
@@ -167,6 +172,9 @@ describe.skipIf(process.platform === 'win32')('smoke: spawn(provider:"cc")', () 
     expect(argv).toContain('stream-json');
     expect(argv).toContain('--verbose');
     expect(argv).not.toContain('--resume');
+    // permissionMode unset → cc default permission system stays intact.
+    expect(argv).not.toContain('--permission-mode');
+    expect(argv).not.toContain('--add-dir');
 
     // Registry populated for the parent's `usage` tool to read.
     const snap = runtime.providerUsageRegistry.get('cc');
@@ -222,6 +230,93 @@ describe.skipIf(process.platform === 'win32')('smoke: spawn(provider:"cc")', () 
     const resumeIdx = argv2.indexOf('--resume');
     expect(resumeIdx).toBeGreaterThanOrEqual(0);
     expect(argv2[resumeIdx + 1]).toBe(SESSION);
+  }, 30_000);
+
+  it('translates permissionMode:"bypass" to --permission-mode bypassPermissions + --add-dir', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'harness-cc-'));
+    const worktree = join(tmp, 'wt');
+    mkdirSync(worktree);
+    const launcher = setupFakeCc(tmp, 'sess_perm', 'ok');
+
+    const runtime = await bootstrap({
+      provider: new ScriptedProvider(
+        spawnScript({
+          toolCallId: 'tc_perm',
+          task: 'do edits',
+          cwd: worktree,
+          permissionMode: 'bypass',
+        }),
+      ),
+      systemPrompt: 'sys',
+      codingAgents: { cc: { binaryPath: launcher } },
+    });
+    const seed = await runtime.store.append({
+      threadId: runtime.rootThreadId,
+      kind: 'user_turn_start',
+      payload: { text: 'go' },
+    });
+    runtime.bus.publish(seed);
+    await waitForSubtask(runtime);
+
+    const argv = JSON.parse(readFileSync(join(tmp, 'last-argv.json'), 'utf8')) as string[];
+    const permIdx = argv.indexOf('--permission-mode');
+    expect(permIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[permIdx + 1]).toBe('bypassPermissions');
+    const addDirIdx = argv.indexOf('--add-dir');
+    expect(addDirIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[addDirIdx + 1]).toBe(worktree);
+
+    // spawn_request event records the requested mode for audit.
+    const events = await runtime.store.readAll(runtime.rootThreadId);
+    const spawnReq = events.find((e) => e.kind === 'spawn_request');
+    if (!spawnReq) throw new Error('spawn_request event missing');
+    expect(
+      (spawnReq.payload as { permissionMode?: string }).permissionMode,
+    ).toBe('bypass');
+  }, 30_000);
+
+  it('translates permissionMode:"bypass" for provider:"codex"', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'harness-codex-'));
+    const worktree = join(tmp, 'wt');
+    mkdirSync(worktree);
+    const launcher = setupFakeCc(tmp, 'sess_codex_perm', 'ok');
+
+    const runtime = await bootstrap({
+      provider: new ScriptedProvider(
+        spawnScript({
+          toolCallId: 'tc_codex_perm',
+          task: 'do edits',
+          cwd: worktree,
+          provider: 'codex',
+          permissionMode: 'bypass',
+        }),
+      ),
+      systemPrompt: 'sys',
+      codingAgents: { codex: { binaryPath: launcher } },
+    });
+    const seed = await runtime.store.append({
+      threadId: runtime.rootThreadId,
+      kind: 'user_turn_start',
+      payload: { text: 'go' },
+    });
+    runtime.bus.publish(seed);
+    await waitForSubtask(runtime);
+
+    const argv = JSON.parse(readFileSync(join(tmp, 'last-argv.json'), 'utf8')) as string[];
+    expect(argv.slice(0, 2)).toEqual(['exec', '--json']);
+    expect(argv).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(argv).not.toContain('--permission-mode');
+    expect(argv).not.toContain('bypassPermissions');
+
+    const events = await runtime.store.readAll(runtime.rootThreadId);
+    const spawnReq = events.find((e) => e.kind === 'spawn_request');
+    if (!spawnReq) throw new Error('spawn_request event missing');
+    expect(
+      (spawnReq.payload as { provider?: string; permissionMode?: string }).provider,
+    ).toBe('codex');
+    expect(
+      (spawnReq.payload as { permissionMode?: string }).permissionMode,
+    ).toBe('bypass');
   }, 30_000);
 
   it('rejects spawn(provider:"cc") with no cwd via SpawnRefused', async () => {

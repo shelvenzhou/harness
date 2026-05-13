@@ -50,6 +50,15 @@ import type {
 
 export type CodingAgentKind = 'cc' | 'codex';
 
+/**
+ * Per-spawn trust level. `'default'` keeps the CLI's normal permission
+ * prompts and write sandbox — safe for arbitrary cwds. `'bypass'`
+ * skips them: cc gets `--permission-mode bypassPermissions` and codex
+ * gets `--dangerously-bypass-approvals-and-sandbox`. Use only when the
+ * orchestrator created the cwd itself (a sibling worktree it owns).
+ */
+export type CodingAgentPermissionMode = 'default' | 'bypass';
+
 export interface CodingAgentProviderOptions {
   kind: CodingAgentKind;
   /** Working directory for the child process (typically a sibling git worktree). */
@@ -66,6 +75,11 @@ export interface CodingAgentProviderOptions {
    * the next `system/init` event.
    */
   providerSessionId?: string;
+  /**
+   * Trust level for the CLI's own permission system. See
+   * `CodingAgentPermissionMode`. Default = `'default'`.
+   */
+  permissionMode?: CodingAgentPermissionMode;
   /** Extra environment variables to merge with `process.env`. */
   env?: Record<string, string>;
   /** Extra positional / flag arguments appended to the CLI command. */
@@ -357,6 +371,17 @@ export class CodingAgentProvider implements LlmProvider {
       if (this.opts.model !== undefined) {
         args.push('--model', this.opts.model);
       }
+      if (this.opts.permissionMode === 'bypass') {
+        // Headless cc invocations cannot answer per-write permission
+        // prompts; bypassPermissions short-circuits both the prompt
+        // and the in-CLI write sandbox. --add-dir explicitly puts cwd
+        // on the allowlist for the bash-sandbox check (some cc
+        // versions evaluate it against the launching shell's cwd, not
+        // the spawned process's, so passing the cwd directly is
+        // belt-and-suspenders).
+        args.push('--permission-mode', 'bypassPermissions');
+        args.push('--add-dir', this.opts.cwd);
+      }
       // Append the harness role / orchestrator hint as a system-prompt
       // suffix so cc keeps its own default system prompt intact.
       const sys = request.prefix.systemPrompt.trim();
@@ -368,14 +393,18 @@ export class CodingAgentProvider implements LlmProvider {
       }
       return args;
     }
-    // codex: same shape, different flags. Real codex parity lands in M6
-    // — this branch keeps the type honest until then.
+    // codex: same shape, different flags. Full event/usage parity lands
+    // later; invocation permissions are wired now so headless coding
+    // spawns can actually modify owned worktrees.
     const args: string[] = ['exec', '--json', prompt];
     if (this.opts.providerSessionId !== undefined) {
       args.push('--session', this.opts.providerSessionId);
     }
     if (this.opts.model !== undefined) {
       args.push('--model', this.opts.model);
+    }
+    if (this.opts.permissionMode === 'bypass') {
+      args.push('--dangerously-bypass-approvals-and-sandbox');
     }
     if (this.opts.extraArgs && this.opts.extraArgs.length > 0) {
       args.push(...this.opts.extraArgs);

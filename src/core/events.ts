@@ -156,6 +156,14 @@ export interface SpawnRequestPayload {
    * one. Schema-only in M1 — full reopen semantics land in M2.
    */
   continueThreadId?: ThreadId;
+  /**
+   * Per-spawn trust level for coding-agent backends.
+   * `'default'` (omitted) preserves the CLI's prompts + write sandbox.
+   * `'bypass'` skips them — the orchestrator declares the cwd is its
+   * own (a sibling worktree it created) and the operator authorized
+   * the work. Ignored for non-coding-agent providers.
+   */
+  permissionMode?: 'default' | 'bypass';
 }
 export type SpawnRequestEvent = EventBase<'spawn_request', SpawnRequestPayload>;
 

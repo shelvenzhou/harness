@@ -442,6 +442,9 @@ function buildProviderFactories(
         ...(req.providerSessionId !== undefined
           ? { providerSessionId: req.providerSessionId }
           : {}),
+        ...(req.permissionMode !== undefined
+          ? { permissionMode: req.permissionMode }
+          : {}),
         usageRegistry,
       });
     };

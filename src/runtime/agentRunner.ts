@@ -173,6 +173,11 @@ export interface SpawnRequestInfo {
   providerSessionId?: string;
   /** Schema-only in M1; reopen semantics land in M2. */
   continueThreadId?: ThreadId;
+  /**
+   * Per-spawn trust level for coding-agent backends; see
+   * `SpawnRequestPayload.permissionMode`. Default `'default'`.
+   */
+  permissionMode?: 'default' | 'bypass';
 }
 
 export class AgentRunner {
@@ -893,6 +898,7 @@ export class AgentRunner {
       cwd?: string;
       providerSessionId?: string;
       continueThreadId?: ThreadId;
+      permissionMode?: 'default' | 'bypass';
     };
     const childThreadId = newThreadId();
     const turnId = this.activeTurn?.turnId ?? newTurnId();
@@ -911,6 +917,9 @@ export class AgentRunner {
           : {}),
         ...(args.continueThreadId !== undefined
           ? { continueThreadId: args.continueThreadId }
+          : {}),
+        ...(args.permissionMode !== undefined
+          ? { permissionMode: args.permissionMode }
           : {}),
       },
       turnId,
@@ -933,6 +942,9 @@ export class AgentRunner {
             : {}),
           ...(args.continueThreadId !== undefined
             ? { continueThreadId: args.continueThreadId }
+            : {}),
+          ...(args.permissionMode !== undefined
+            ? { permissionMode: args.permissionMode }
             : {}),
         });
         if (spawnedChildThreadId !== childThreadId) {

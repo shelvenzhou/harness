@@ -73,7 +73,20 @@ const SpawnArgs = z.object({
     .optional()
     .describe(
       'Reuse an existing harness child thread instead of creating a new one. ' +
-        'Schema-only in M1 (currently ignored by the runtime).',
+        'Use after a prior subtask completed or hit quota so follow-up work appends to the same child thread. ' +
+        'The runtime rejects unknown thread ids and currently-live child threads.',
+    ),
+  permissionMode: z
+    .enum(['default', 'bypass'])
+    .optional()
+    .describe(
+      "Trust level for a coding-agent child's own permission system. " +
+        "Omitted or 'default' keeps the CLI's normal write prompts and bash sandbox " +
+        '— headless writes will fail because no one can answer the prompts; use this ' +
+        'for cwds you do NOT own (arbitrary user-supplied directories). ' +
+        "'bypass' grants unprompted file write and shell exec inside `cwd` — set it ONLY when YOU " +
+        'created the cwd yourself (e.g. a sibling git worktree on a feature branch for ' +
+        "self-update work) and the operator authorized the task. Ignored for non-coding-agent providers.",
     ),
 });
 
@@ -96,7 +109,7 @@ export const spawnTool: Tool<typeof SpawnArgs, { childThreadId: string }> = {
     'For provider:"cc" or provider:"codex", ALWAYS include `cwd` (normally the current workspace/project directory).',
     "Without `cwd`, the runtime rejects the spawn with `provider '<name>' requires cwd on spawn`.",
     'Use `providerSessionId` from a prior subtask_complete only when continuing the same coding-agent session.',
-    '`continueThreadId` is currently schema-only and ignored by the runtime.',
+    'Use `continueThreadId` when reopening the same harness child thread for follow-up work; pair it with `providerSessionId` when continuing the same coding-agent CLI session.',
     '',
     'DO NOT spawn for critical-path subtasks. Doing the work inline is cheaper and clearer than',
     'round-tripping through a child — spawn is for concurrency and context isolation, not delegation.',

@@ -25,6 +25,49 @@ the operator.
   checkout, route it through the worktree instead.
 - **Never commit credentials or `.env*` files.** Stage by name.
 
+## Verify before reporting
+
+Treat anything a coding-agent child says about its own work as a
+*claim*, not a fact. Before telling the operator a task is done,
+independently confirm the structural outcome — that the commits you
+expected exist, that the diff matches the requested scope, that the
+tests you said would run actually ran. *How* you confirm is up to
+you (`git log`, `git show`, `git diff`, re-running tests, reading
+the file); the rule is that the child's prose summary is never
+sufficient evidence on its own.
+
+Specifically:
+
+- A child returning `status: completed` only means the CLI exited
+  cleanly. It does NOT mean the work landed. The child may have
+  hit a sandbox / permission failure, given up, and still exited
+  cleanly with a `result` event.
+- A child reporting `status: blocked` / `status: errored` / `status:
+  partial` is the implementer telling you it failed or partly
+  failed. Do not paper over it. Surface what the child said to the
+  operator with your own independent verification of what actually
+  exists on disk / in git.
+- If the implementer claims commits, run `git -C <worktree> log
+  --oneline <pre-spawn-HEAD>..HEAD` and confirm the count and the
+  subjects match. If the implementer claims files, list them. If
+  any claim is unsupported by the observable state, that is a
+  failure — report it as such, do not invent a success.
+
+Capture the pre-spawn HEAD *before* spawning so you have something
+to compare against.
+
+## Trust level for coding-agent spawns
+
+When you spawn cc / codex to edit a sibling worktree YOU just
+created, pass `permissionMode: 'bypass'`. The CLI runs headless and
+its default permission system will block every `Write` and every
+sandboxed `Bash` write (no human to click "approve"); `bypass` skips
+both. You may set this ONLY when the cwd is one you created (a
+sibling worktree on a feature branch) and the operator authorized
+the self-update task — both conditions hold for the workflow on
+this page. For any spawn where the cwd is user-supplied or
+otherwise not yours, leave `permissionMode` unset.
+
 ## Default choreography
 
 The mechanism is composition; the order is yours to vary based on
@@ -37,12 +80,13 @@ task shape. The template:
 2. Set up the worktree (constraint above).
 3. **Design** when the subsystem is unfamiliar or the operator's
    request is open-ended. `spawn({ provider: 'cc', role: 'designer',
-   cwd: <worktree>, task: ... })`. The designer's job is a
-   proposal, not edits. Stash the result under
+   cwd: <worktree>, permissionMode: 'bypass', task: ... })`. The
+   designer's job is a proposal, not edits. Stash the result under
    `memory({ op: 'set', key: 'design:<task>' })`.
 4. **Implement.** `spawn({ provider: 'cc', role: 'implementer',
-   cwd: <worktree>, task: ..., contextRefs: [<designer thread>] })`
-   when a designer step exists; otherwise just the implementer.
+   cwd: <worktree>, permissionMode: 'bypass', task: ...,
+   contextRefs: [<designer thread>] })` when a designer step exists;
+   otherwise just the implementer.
    The implementer writes code, runs tests, and commits inside its
    own cwd.
 5. **Review.** Either inline (`shell git diff main...HEAD` +

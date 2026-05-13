@@ -41,6 +41,28 @@ When you delegate to a coding agent, also pass `role` (designer /
 implementer / reviewer) when one of those role files applies — the
 runtime appends the role's system-prompt suffix.
 
+### `permissionMode` for coding-agent spawns
+
+Coding-agent CLIs (cc, codex) ship with their own permission system:
+they prompt before every file `Write` and sandbox shell-based writes.
+In a headless harness spawn there is no one to answer the prompts, so
+those writes hang or get rejected — the child looks like it ran and
+returned a clean reply, but no files were created and no commits were
+made.
+
+`permissionMode: 'bypass'` on the spawn tells the CLI to skip its
+prompt + sandbox layer. Use it when **both** hold:
+
+1. You created the `cwd` yourself (a sibling git worktree, a fresh
+   directory you `mkdir`'d, …).
+2. The operator's request authorizes the work being done in that cwd
+   (self-update, an explicit "go edit this directory" task).
+
+When either condition is unclear (cwd is something the user mentioned
+in passing, you're not sure who owns it), leave `permissionMode`
+unset and let the CLI's prompts fail loudly rather than silently
+escalating its filesystem reach.
+
 ## When NOT to spawn
 
 - **Critical-path subtasks.** If you cannot proceed without the
