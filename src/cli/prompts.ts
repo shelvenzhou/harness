@@ -8,11 +8,11 @@ import { join, resolve } from 'node:path';
  * of plain-Markdown files, each picked up by filename. The runtime
  * never sees this directory — the CLI reads the files and hands
  * strings to `bootstrap` via the existing options. Files are the
- * source of truth (in git, diffable, reviewable in PRs); pinned
- * memory / system-prompt strings are the runtime's view.
+ * source of truth (in git, diffable, reviewable in PRs); system
+ * prompt text and role suffixes are the runtime's view.
  *
  *   main.md                  → root agent system prompt
- *   playbook-<name>.md       → one entry in pinnedMemory
+ *   playbook-<name>.md       → one stable system-prompt playbook entry
  *   role-<name>.md           → suffix for spawn({ role: <name>, … })
  *
  * Anything else in the directory is ignored. A missing directory is
@@ -25,11 +25,12 @@ export interface LoadedPrompts {
   /** Contents of `main.md` if present. */
   main?: string;
   /**
-   * Contents of every `playbook-*.md` in alphabetic order, each
-   * already trimmed. Suitable for direct injection into
-   * `bootstrap.pinnedMemory`.
+   * Every `playbook-*.md` in alphabetic order, each already trimmed.
+   * These are static instruction text, so callers should append them
+   * to the stable system prompt rather than treating them as pinned
+   * conversational memory.
    */
-  pinned: string[];
+  playbooks: Array<{ name: string; content: string }>;
   /**
    * `role -> contents` for every `role-<name>.md`. Keys are the part
    * after `role-` (lowercased verbatim — no normalisation), e.g.
@@ -51,9 +52,29 @@ export interface LoadPromptsOptions {
 export function loadPrompts(opts: LoadPromptsOptions = {}): LoadedPrompts {
   const resolved = resolvePromptsDir(opts.dir);
   if (resolved === undefined) {
-    return { pinned: [], byRole: {} };
+    return { playbooks: [], byRole: {} };
   }
   return readPromptsDir(resolved);
+}
+
+export function composeSystemPrompt(base: string, playbooks: LoadedPrompts['playbooks']): string {
+  if (playbooks.length === 0) return base;
+  const renderedPlaybooks = playbooks
+    .map(
+      ({ name, content }) =>
+        `<harness_playbook name="${escapeAttr(name)}">\n${content}\n</harness_playbook>`,
+    )
+    .join('\n\n');
+  return [
+    base.trimEnd(),
+    '# Harness Playbooks',
+    'The following durable playbooks are instruction-level workflow policy. They are static prompt context, not user memory. When a playbook applies, follow it over generic guidance unless a direct user instruction conflicts.',
+    renderedPlaybooks,
+  ].join('\n\n');
+}
+
+function escapeAttr(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
 }
 
 function resolvePromptsDir(explicit?: string): string | undefined {
@@ -71,7 +92,7 @@ function resolvePromptsDir(explicit?: string): string | undefined {
 }
 
 function readPromptsDir(dir: string): LoadedPrompts {
-  const out: LoadedPrompts = { dir, pinned: [], byRole: {} };
+  const out: LoadedPrompts = { dir, playbooks: [], byRole: {} };
   const entries = readdirSync(dir).sort();
   const playbooks: Array<{ name: string; content: string }> = [];
   for (const name of entries) {
@@ -101,6 +122,6 @@ function readPromptsDir(dir: string): LoadedPrompts {
     }
     // Other .md files ignored — README.md etc. is allowed.
   }
-  out.pinned = playbooks.map((p) => p.content);
+  out.playbooks = playbooks;
   return out;
 }

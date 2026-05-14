@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { loadPrompts } from '@harness/cli/prompts.js';
+import { composeSystemPrompt, loadPrompts } from '@harness/cli/prompts.js';
 
 describe('loadPrompts', () => {
   let prevEnv: string | undefined;
@@ -25,7 +25,7 @@ describe('loadPrompts', () => {
     // We deliberately don't assert dir === undefined: process.cwd() may
     // contain a real `prompts/` (the harness's own). What we ARE
     // contracting: nothing crashes, and the structure is well-formed.
-    expect(r.pinned).toEqual(expect.any(Array));
+    expect(r.playbooks).toEqual(expect.any(Array));
     expect(r.byRole).toEqual(expect.any(Object));
   });
 
@@ -44,7 +44,10 @@ describe('loadPrompts', () => {
     expect(r.dir).toBe(dir);
     expect(r.main).toBe('# main\nbody');
     // Playbooks are emitted in alphabetic order of filename.
-    expect(r.pinned).toEqual(['self-update body', 'spawn body']);
+    expect(r.playbooks).toEqual([
+      { name: 'playbook-self-update.md', content: 'self-update body' },
+      { name: 'playbook-spawn.md', content: 'spawn body' },
+    ]);
     expect(r.byRole).toEqual({
       designer: 'designer body',
       reviewer: 'reviewer body',
@@ -74,7 +77,19 @@ describe('loadPrompts', () => {
 
     const r = loadPrompts({ dir });
     expect(r.main).toBeUndefined();
-    expect(r.pinned).toEqual([]);
+    expect(r.playbooks).toEqual([]);
     expect(r.byRole).toEqual({});
+  });
+
+  it('composes playbooks into stable system prompt text', () => {
+    const prompt = composeSystemPrompt('base', [
+      { name: 'playbook-self-update.md', content: 'self-update body' },
+    ]);
+
+    expect(prompt).toContain('base');
+    expect(prompt).toContain('# Harness Playbooks');
+    expect(prompt).toContain('<harness_playbook name="playbook-self-update.md">');
+    expect(prompt).toContain('self-update body');
+    expect(prompt).toContain('</harness_playbook>');
   });
 });

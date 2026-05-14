@@ -16,11 +16,7 @@ import type { SearchBackend } from '@harness/search/types.js';
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
 import { DiscordAdapter } from '@harness/adapters/discord.js';
 import type { Adapter, ThreadBinding } from '@harness/adapters/adapter.js';
-import {
-  JsonlDiagSink,
-  StderrDiagSink,
-  type DiagSink,
-} from '@harness/diag/index.js';
+import { JsonlDiagSink, StderrDiagSink, type DiagSink } from '@harness/diag/index.js';
 
 import {
   consumeHandoff,
@@ -34,7 +30,7 @@ import {
 import { newEventId } from '@harness/core/ids.js';
 import type { HarnessEvent, RestartEventPayload } from '@harness/core/events.js';
 
-import { loadPrompts } from './prompts.js';
+import { composeSystemPrompt, loadPrompts } from './prompts.js';
 
 /**
  * `harness` CLI. Reads .env for OpenAI credentials; CLI flags override.
@@ -65,9 +61,7 @@ async function main(): Promise<void> {
   const providerSpec = buildProvider({
     name: providerName,
     ...(typeof values.model === 'string' ? { model: values.model } : {}),
-    ...(typeof values['model-key'] === 'string'
-      ? { modelKey: values['model-key'] }
-      : {}),
+    ...(typeof values['model-key'] === 'string' ? { modelKey: values['model-key'] } : {}),
     ...(typeof values['base-url'] === 'string' ? { baseURL: values['base-url'] } : {}),
     ...(typeof values['api-mode'] === 'string' ? { apiMode: values['api-mode'] } : {}),
   });
@@ -76,12 +70,13 @@ async function main(): Promise<void> {
   const providerFactoryModelInfo = buildEnvProviderModelInfo();
 
   const prompts = loadPrompts();
-  const systemPrompt =
+  const baseSystemPrompt =
     typeof values.system === 'string'
       ? values.system
       : (process.env['HARNESS_SYSTEM_PROMPT'] ??
-          prompts.main ??
-          'You are a helpful agent. Respond concisely.');
+        prompts.main ??
+        'You are a helpful agent. Respond concisely.');
+  const systemPrompt = composeSystemPrompt(baseSystemPrompt, prompts.playbooks);
 
   const storeRoot =
     typeof values['store-root'] === 'string'
@@ -110,14 +105,13 @@ async function main(): Promise<void> {
     ...(Object.keys(providerFactories).length > 0 ? { providerFactories } : {}),
     ...(providerSpec.modelInfo !== undefined ? { runtimeModelInfo: providerSpec.modelInfo } : {}),
     ...(Object.keys(providerFactoryModelInfo).length > 0 ? { providerFactoryModelInfo } : {}),
-    ...(prompts.pinned.length > 0 ? { pinnedMemory: prompts.pinned } : {}),
     ...(Object.keys(prompts.byRole).length > 0 ? { rolePrompts: prompts.byRole } : {}),
   });
 
   if (prompts.dir !== undefined) {
     const summary: string[] = [];
     if (prompts.main !== undefined) summary.push('main');
-    if (prompts.pinned.length > 0) summary.push(`${prompts.pinned.length} playbook(s)`);
+    if (prompts.playbooks.length > 0) summary.push(`${prompts.playbooks.length} playbook(s)`);
     const roleCount = Object.keys(prompts.byRole).length;
     if (roleCount > 0) summary.push(`${roleCount} role(s)`);
     if (summary.length > 0) {
@@ -152,9 +146,7 @@ async function main(): Promise<void> {
         kind: 'per-channel',
         resolve: async (externalChannelId) => {
           const title = `discord:${externalChannelId}`;
-          const existing = (await runtime.store.listThreads()).find(
-            (t) => t.title === title,
-          );
+          const existing = (await runtime.store.listThreads()).find((t) => t.title === title);
           if (existing) {
             await runtime.adoptRootThread(existing.id);
             return existing.id;
@@ -349,7 +341,8 @@ function openAIProviderFromConfig(config: EnvModelConfig): OpenAIProvider {
   const temperature = config.temperature ?? envNumber('OPENAI_TEMPERATURE');
   const reasoning = config.reasoning ?? buildReasoningOptions();
   const chatMaxTokensParam =
-    config.chatMaxTokensParam ?? parseChatMaxTokensParam(process.env['OPENAI_CHAT_MAX_TOKENS_PARAM']);
+    config.chatMaxTokensParam ??
+    parseChatMaxTokensParam(process.env['OPENAI_CHAT_MAX_TOKENS_PARAM']);
   return new OpenAIProvider({
     apiKey,
     model: config.model,
@@ -416,7 +409,10 @@ function readEnvModelConfigs(): Record<string, EnvModelConfig> {
     const baseURL = parts[3] || undefined;
     const apiKeyEnv = parts[4] || undefined;
     const suffix = envSuffix(alias);
-    const reasoning = buildReasoningOptions(`OPENAI_REASONING_EFFORT_${suffix}`, `OPENAI_REASONING_SUMMARY_${suffix}`);
+    const reasoning = buildReasoningOptions(
+      `OPENAI_REASONING_EFFORT_${suffix}`,
+      `OPENAI_REASONING_SUMMARY_${suffix}`,
+    );
     const chatMaxTokensParam = parseChatMaxTokensParam(
       process.env[`OPENAI_CHAT_MAX_TOKENS_PARAM_${suffix}`],
     );
@@ -492,13 +488,19 @@ function buildReasoningOptions(
   effortKey = 'OPENAI_REASONING_EFFORT',
   summaryKey = 'OPENAI_REASONING_SUMMARY',
 ):
-  | { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null }
+  | {
+      effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+      summary?: 'auto' | 'concise' | 'detailed' | null;
+    }
   | undefined {
   const effortRaw = process.env[effortKey]?.toLowerCase();
   const summaryRaw = process.env[summaryKey]?.toLowerCase();
   if (effortRaw === undefined && summaryRaw === undefined) return undefined;
   const validEfforts = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-  const out: { effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'; summary?: 'auto' | 'concise' | 'detailed' | null } = {};
+  const out: {
+    effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+    summary?: 'auto' | 'concise' | 'detailed' | null;
+  } = {};
   if (effortRaw && validEfforts.has(effortRaw)) {
     out.effort = effortRaw as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   }
@@ -543,7 +545,9 @@ function buildCodingAgentsConfig(): { cc?: boolean; codex?: boolean } | undefine
   };
 }
 
-function buildCompactionTrigger(): { thresholdTokens: number; cooldownSamples?: number } | undefined {
+function buildCompactionTrigger():
+  | { thresholdTokens: number; cooldownSamples?: number }
+  | undefined {
   const threshold = envNumber('HARNESS_COMPACTION_THRESHOLD_TOKENS');
   if (threshold === undefined) return undefined;
   const cooldown = envNumber('HARNESS_COMPACTION_COOLDOWN_SAMPLES');
@@ -648,7 +652,7 @@ function printUsage(): void {
       '  HARNESS_MEMORY_FILE  path to JSONL memory log (cross-session memory; off if unset)',
       '  MEM0_API_KEY         enable mem0 backend (overrides HARNESS_MEMORY_FILE if both set)',
       '  MEM0_BASE_URL        self-hosted mem0 server (omit for cloud)',
-      '  MEM0_USER_ID         fallback userId for mem0 (default \'harness\')',
+      "  MEM0_USER_ID         fallback userId for mem0 (default 'harness')",
       '  HARNESS_COMPACTION_THRESHOLD_TOKENS  enable cold-path compaction at this token mark',
       '  HARNESS_COMPACTION_COOLDOWN_SAMPLES  samplings to skip after firing (default 5)',
       '  HARNESS_COMPACTOR=subagent           use provider-backed compactor (else StaticCompactor)',

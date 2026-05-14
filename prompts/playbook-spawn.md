@@ -1,106 +1,80 @@
-# Playbook: when to spawn
+# Playbook: Spawn Strategy
 
-A reference for choosing between doing the work inline, spawning a
-subagent on the default provider, and delegating to a coding-agent
-provider. The `spawn` tool description carries the capability
-contract; this playbook adds the decision rules around it.
+## Trigger
 
-## Default: do it inline
+Use this playbook whenever you decide whether to do work inline, spawn a
+default-provider subagent, or delegate to a coding-agent provider such as `cc`
+or `codex`.
 
-Reach for `spawn` only when one of the reasons below applies.
-Inline is cheaper (no thread setup, no context split, no
-subtask_complete round-trip) and almost always clearer.
+## Default
 
-## Reasons to spawn (default provider)
+Do the work inline unless a spawn gives clear value. Inline work is cheaper,
+keeps state local, and avoids a `subtask_complete` round trip.
 
-- **Context isolation.** The subtask would pollute your prompt with
-  output you do not want to keep paying attention to (large file
-  reads, exhaustive searches, comparing many candidates). Spawn it,
-  let the child summarise.
-- **Independent parallelism.** Two or more steps can run at the
-  same time without sharing intermediate state ("compare libraries
-  A and B"). Spawn each as a child.
-- **Adversarial review.** You want a second opinion on something
-  you produced, without it being biased by your reasoning. Spawn a
-  `role: 'reviewer'` child with `contextRefs` pointing at the
-  artefact's thread slice — not at your own deliberation.
-- **Verification.** "Did the implementation actually satisfy the
-  spec?" runs cleaner as a separate child whose entire job is the
-  check.
-- **Quality review after implementation.** When code has already
-  landed and the remaining question is "is this implementation good
-  and scoped?", spawn a `role: 'reviewer'` child or review inline.
-  For complex/shared/runtime/security/provider changes, prefer the
-  independent reviewer so its verdict is not anchored on the
-  implementer's explanation.
+## Spawn A Default-Provider Child When
 
-## Reasons to delegate to a coding agent (`provider: 'cc'` / `'codex'`)
+- **Context isolation**: the subtask will produce noisy reads, broad searches,
+  or comparison output that should be summarized before returning to the parent.
+- **Independent parallelism**: two or more subtasks can run without sharing
+  intermediate state.
+- **Adversarial review**: you want an independent critique of an artifact,
+  implementation, or plan.
+- **Verification**: the remaining question is whether finished work satisfies
+  the request.
 
-- The work involves editing source files, running commands, and
-  iterating in a tight loop. cc / codex own that loop internally
-  and surface only the final result. You do not need to micromanage
-  individual `read` / `write` / test runs.
-- The work is contained inside a single working directory you can
-  point `cwd` at.
+Pass a role when a role prompt fits the task. Pass context references instead
+of restating long parent history.
 
-When you delegate to a coding agent, also pass `role` (designer /
-implementer / reviewer) when one of those role files applies — the
-runtime appends the role's system-prompt suffix.
+## Delegate To A Coding-Agent Provider When
 
-### `permissionMode` for coding-agent spawns
+- The task involves editing files, running commands, and iterating.
+- The work is contained in a specific `cwd`.
+- The child can own a bounded implementation or review loop and report a final
+  summary.
 
-Coding-agent CLIs (cc, codex) ship with their own permission system:
-they prompt before every file `Write` and sandbox shell-based writes.
-In a headless harness spawn there is no one to answer the prompts, so
-those writes hang or get rejected — the child looks like it ran and
-returned a clean reply, but no files were created and no commits were
-made.
+For `provider: 'cc'` or `provider: 'codex'`, include `cwd`. Give the child an
+outcome-level task, any role, relevant context refs, and the acceptance checks.
+The child runs its own CLI tools; its internal tool calls are not visible in the
+parent thread.
 
-`permissionMode: 'bypass'` on the spawn tells the CLI to skip its
-prompt + sandbox layer. Use it when **both** hold:
+## Permission Mode
 
-1. You created the `cwd` yourself (a sibling git worktree, a fresh
-   directory you `mkdir`'d, …).
-2. The operator's request authorizes the work being done in that cwd
-   (self-update, an explicit "go edit this directory" task).
+Coding-agent CLIs have their own prompt and sandbox systems. In a headless
+harness spawn, nobody can approve interactive write prompts.
 
-When either condition is unclear (cwd is something the user mentioned
-in passing, you're not sure who owns it), leave `permissionMode`
-unset and let the CLI's prompts fail loudly rather than silently
-escalating its filesystem reach.
+Use `permissionMode: 'bypass'` only when both are true:
 
-## When NOT to spawn
+1. You created the `cwd` yourself, such as a sibling git worktree.
+2. The operator authorized the work in that `cwd`.
 
-- **Critical-path subtasks.** If you cannot proceed without the
-  child's answer and the child is doing one straightforward thing,
-  inline is cheaper than the spawn round-trip.
-- **Tiny lookups.** "What does function X return?" → `read` /
-  `shell grep`, not a spawn.
-- **State-sharing demands.** Spawned children get their own thread.
-  If the subtask needs to mutate state you are mid-way through
-  building, do it inline.
+Otherwise leave `permissionMode` unset and let the provider fail loudly rather
+than silently widening filesystem access.
 
-## Carrying `providerSessionId`
+## Do Not Spawn For
 
-When the next coding-agent spawn is a continuation of the previous
-one — same feature, same diff, same train of thought — carry the
-`providerSessionId` from the prior `subtask_complete`. cc resumes
-its internal session via `--resume`, saving the full context
-re-read. When the next spawn is independent, omit it for a clean
-slate.
+- A tiny lookup that can be answered by one read or shell search.
+- A critical-path question when you cannot do meaningful parent work while the
+  child runs.
+- A task that must mutate state the parent is actively editing.
+- Delegating responsibility without a bounded task, owner, and stopping
+  condition.
+
+## Continuation
+
+Carry `providerSessionId` only when the next coding-agent spawn continues the
+same feature, same diff, or same review iteration. Omit it for independent work.
+Use `continueThreadId` when you want a follow-up to append to the same harness
+child thread.
 
 ## Budgets
 
-A budget on `spawn` is a hard cap, not a soft hint. Pick values
-that match the task scope:
+Budgets are hard caps. Choose caps that match the task:
 
-- Tiny verifier / lookup → `maxTurns: 1-2`, `maxToolCalls: 5`,
-  `maxWallMs: 30s`.
-- Designer producing a written proposal → `maxTurns: 8`,
-  `maxWallMs: 5min`. Coding agents may need more wall clock.
-- Implementer doing edits + tests → `maxWallMs: 30-60min`,
-  `maxTokens: 200_000`. Trust the agent's own internal loop;
-  the cap is the safety net.
+- Tiny lookup or verifier: `maxTurns: 1-2`, `maxToolCalls: 5`, `maxWallMs:
+  30000`.
+- Designer proposal: `maxTurns: 8`, `maxWallMs: 300000`.
+- Implementer or coding-agent edit loop: `maxWallMs: 1800000-3600000`, with a
+  token cap sized to the expected diff and tests.
 
-If you have no idea what to set, set conservative caps and watch
-`usage` in subsequent turns to recalibrate.
+If the right budget is unclear, start conservative and use `usage` or the child
+summary to recalibrate.

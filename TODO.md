@@ -124,7 +124,8 @@ to read account state.
 The playbook landed via the `prompts/` loader (see the
 prompts-from-disk track) rather than as a `memory:set` entry —
 `.md` in the repo is git-reviewable and self-edit friendly, see
-discussion in 11-self-update.md. Content lives in
+discussion in 11-self-update.md. Playbooks are currently injected
+eagerly into the stable system prompt. Content lives in
 `harness/prompts/`:
 
 - 🟢 `playbook-self-update.md` covers worktree-only constraint,
@@ -134,7 +135,7 @@ discussion in 11-self-update.md. Content lives in
   review gate: non-trivial source changes require inline review or
   an independent reviewer spawn, with reviewer spawn preferred for
   runtime/shared/provider/security/prompt changes. Picked up
-  automatically as a pinned-memory entry.
+  automatically as stable instruction context.
 - 🟢 `playbook-spawn.md` covers inline-vs-spawn decision rules,
   coding-agent delegation, `providerSessionId` carry-over.
 - 🟢 `role-{designer,implementer,reviewer}.md` add capability-
@@ -142,6 +143,12 @@ discussion in 11-self-update.md. Content lives in
 - 🟢 `main.md` replaces the inline `'You are a helpful agent.'`
   default with the harness orchestrator identity + tool reach-for
   hints.
+- ⚪ Progressive playbook loading: stop injecting every `playbook-*.md`
+  into the initial stable prompt. Keep a small playbook index in the
+  prefix, then load the full matching playbook on demand when the
+  operator request or agent intent triggers it. Preserve cache
+  friendliness by keeping the index stable and placing loaded playbook
+  bodies behind explicit cache breakpoints / context tags.
 - ⚪ End-to-end demo: operator says "add a Telegram adapter";
   observe full flow → PR on GitHub, tests green. **This is the
   user-driven manual test gate now that M1 / M2 / M5 are
