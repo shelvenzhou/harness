@@ -42,6 +42,12 @@ export function renderPromptText(request: SamplingRequest): string {
             `[tool_result ok=${c.ok}] ${c.error ?? ''} ${JSON.stringify(c.output ?? null)}`,
           );
           break;
+        case 'reasoning':
+          lines.push(`[reasoning] ${c.text}`);
+          break;
+        case 'provider_state':
+          lines.push(`[provider_state ${c.providerId}] ${JSON.stringify(c.items)}`);
+          break;
         case 'elided':
           lines.push(`[elided handle=${c.handle} ${c.originKind}] ${c.summary ?? ''}`);
           break;

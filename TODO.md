@@ -130,7 +130,11 @@ discussion in 11-self-update.md. Content lives in
 - 🟢 `playbook-self-update.md` covers worktree-only constraint,
   no-push-to-main, designer / implementer / reviewer
   sequencing, R3-step-1 acceptance checklist, failure → surface
-  to operator. Picked up automatically as a pinned-memory entry.
+  to operator, and the "tests are necessary but not sufficient"
+  review gate: non-trivial source changes require inline review or
+  an independent reviewer spawn, with reviewer spawn preferred for
+  runtime/shared/provider/security/prompt changes. Picked up
+  automatically as a pinned-memory entry.
 - 🟢 `playbook-spawn.md` covers inline-vs-spawn decision rules,
   coding-agent delegation, `providerSessionId` carry-over.
 - 🟢 `role-{designer,implementer,reviewer}.md` add capability-
@@ -201,12 +205,60 @@ Out of scope (still ⚪ for a future M5+):
   but doesn't survive the parent dying mid-deploy. Detached
   invocation (`nohup` / `setsid`) is the obvious next step.
 
-### M6 — codex parity
+### M6 — codex parity — 🟢 stream parsing landed; documentation pending
 
-- ⚪ Re-target `CodingAgentProvider` to codex (`codex exec --json`
-  or current equivalent flag).
-- ⚪ Document any contract divergence in 11-self-update.md R2
-  implementation contract section.
+- 🟢 `CodingAgentProvider` now branches on `this.opts.kind`:
+  - cc path unchanged (cc NDJSON: `system/init`, `assistant`, `user`,
+    `rate_limit_event`, `result`).
+  - codex path translates the empirically-observed
+    codex-cli 0.128 `exec --json` shape into the same
+    `SamplingDelta` vocabulary the runner understands:
+    - `thread.started.thread_id` → captured as `lastSessionId` so
+      `subtask_complete.providerSessionId` carries codex's session id
+      for `--session <id>` resume.
+    - `turn.started` → dropped; `item.started` / non-message
+      `item.completed` (`file_change`, `tool_call`, `tool_output`,
+      `reasoning`, …) → persisted as harness `reasoning` trace so
+      child `events.jsonl` / diag output retains codex's internal
+      execution transcript without surfacing it as the final reply.
+    - `item.completed{item.type:'agent_message', text}` → buffered;
+      the LAST one wins (so intermediate "I will do X" plan messages
+      are superseded by the final summary, matching cc's
+      "only `result.result` is surfaced as reply").
+    - `turn.completed.usage` → emit a `SamplingDelta{kind:'usage'}`
+      with the token counters (`input_tokens` → `promptTokens`,
+      `cached_input_tokens` → `cachedPromptTokens`, `output_tokens`
+      → `completionTokens`) and push the same into
+      `ProviderUsageRegistry.lastTokens`. Then emit `end{end_turn}`.
+  - Permission flag was already in place from earlier:
+    `permissionMode:'bypass'` → `--dangerously-bypass-approvals-and-sandbox`
+    (codex's equivalent of cc's `--permission-mode bypassPermissions`).
+  - Codex prompt construction now inlines `request.prefix.systemPrompt`
+    above the task text so role prompts / runtime model info / subagent
+    budget guidance reach the actual `codex exec` invocation (cc uses
+    `--append-system-prompt` for the same contract).
+  - Smoke coverage: `tests/smoke/codingAgentSpawn.test.ts` adds a
+    `fake-codex` binary that emits the empirically-observed event
+    sequence (thread.started → turn.started → intermediate
+    agent_message → file_change item → final agent_message →
+    turn.completed) and asserts that the final agent_message wins as
+    the reply, thread_id round-trips into `providerSessionId`, and
+    `usage` flows into the registry. It also asserts codex argv gets
+    the system prompt and internal file_change items land in child
+    reasoning trace.
+- ⚪ Document the codex event vocabulary + the cc-vs-codex divergence
+  in `design-docs/11-self-update.md` R2 (implementation contract
+  section). The information lives in `codingAgentProvider.ts` doc
+  comments + this TODO entry today; doc cross-link is the only thing
+  remaining for M6.
+- ⚪ Codex stdin handling — codex CLI prints
+  `Reading additional input from stdin...` on stderr after
+  `turn.completed`, then idles. Today the harness's `stdio:['ignore', …]`
+  feeds /dev/null which eventually gets EOF (~100s in practice),
+  and the pump's `finally` SIGTERMs the child on `end{end_turn}`,
+  so this is not currently visible to users — but a follow-up could
+  pass `--non-interactive` or close stdin explicitly to make the
+  child exit fast.
 
 ---
 

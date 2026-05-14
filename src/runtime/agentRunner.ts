@@ -183,6 +183,13 @@ export interface SpawnRequestInfo {
 export class AgentRunner {
   private readonly opts: AgentRunnerOptions;
   private activeTurn?: ActiveTurn;
+  /**
+   * Holds a ref on the event loop while a turn is active. Without it,
+   * a turn suspended on `wait` can be torn down prematurely when no
+   * other ref-holder exists — e.g. piped stdin has hit EOF and every
+   * `wait` timer is `unref`'d. Cleared at `completeTurn`.
+   */
+  private keepAliveTimer: ReturnType<typeof setInterval> | undefined;
   private handles = new HandleRegistry();
   private tickInFlight = false;
   /**
@@ -348,6 +355,16 @@ export class AgentRunner {
       ) {
         await this.runSamplingStep();
       }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (this.activeTurn && !this.activeTurn.isTerminal()) {
+        await this.completeTurn('errored', `runner_exception: ${message}`);
+      } else {
+        this.stopKeepAlive();
+      }
+      // Surface tick errors so tests / dev notice; the runner stays up.
+      // eslint-disable-next-line no-console
+      console.error('[runner] tick error', err);
     } finally {
       this.tickInFlight = false;
       // Drain any seeds that arrived while we were busy. Each seed gets a
@@ -368,9 +385,24 @@ export class AgentRunner {
     this.tokenBudget.resetTurn();
     this.turnInterrupted = false;
     this.interruptReason = undefined;
+    this.startKeepAlive();
     void payload; // payload already persisted as the seed event.
     void seedEventId;
     await this.runSamplingStep();
+  }
+
+  private startKeepAlive(): void {
+    if (this.keepAliveTimer !== undefined) return;
+    // No-op interval; sole purpose is to ref the event loop so a turn
+    // suspended on `wait` survives stdin EOF and unref'd timers. The
+    // 10s cadence is arbitrary — we never read the callback.
+    this.keepAliveTimer = setInterval(() => {}, 10_000);
+  }
+
+  private stopKeepAlive(): void {
+    if (this.keepAliveTimer === undefined) return;
+    clearInterval(this.keepAliveTimer);
+    this.keepAliveTimer = undefined;
   }
 
   private async runSamplingStep(): Promise<void> {
@@ -1151,6 +1183,7 @@ export class AgentRunner {
     // fire into a dead turn (would publish stray timer_fired events
     // that re-arm a tick with no awaiting_event to wake).
     this.cancelPendingTimers();
+    this.stopKeepAlive();
     await this.appendEvent({
       kind: 'turn_complete',
       payload: {

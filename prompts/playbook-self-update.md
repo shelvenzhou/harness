@@ -89,9 +89,17 @@ task shape. The template:
    otherwise just the implementer.
    The implementer writes code, runs tests, and commits inside its
    own cwd.
-5. **Review.** Either inline (`shell git diff main...HEAD` +
-   targeted `read`) or as a separate `spawn({ role: 'reviewer' })`.
-   The reviewer applies the acceptance checklist below.
+5. **Review.** Tests are necessary but not sufficient. For any
+   non-trivial source change, perform a quality review before you
+   report success: either inline (`shell git diff main...HEAD` +
+   targeted `read`) or as a separate reviewer spawn. Prefer the
+   separate spawn when the change touches runtime control flow,
+   provider/tool contracts, concurrency, persistence, security,
+   prompts/playbooks, or more than a couple of files:
+   `spawn({ provider: 'cc' | 'codex', role: 'reviewer',
+   cwd: <worktree>, permissionMode: 'bypass', task: ... })`.
+   The reviewer applies the acceptance checklist below and should
+   inspect the implementation quality, not just command output.
 6. **Iterate** if review fails. Re-spawn the implementer with
    `providerSessionId` carried over from the previous spawn so cc
    resumes its internal context instead of re-reading everything.
@@ -110,6 +118,10 @@ These are the items the main agent (or reviewer subagent) must
 verify, and the PR body must record their state. Anything skipped is
 explicitly called out, not silently omitted.
 
+- Implementation reviewed by the main agent or a reviewer subagent.
+  Record which path you used. For complex/shared/runtime changes,
+  default to an independent reviewer spawn unless the operator asked
+  you not to spawn.
 - `pnpm test` green (unit + smoke).
 - `pnpm test:e2e` green when credentials exist; explicitly note
   skipped suites and which credentials were absent.

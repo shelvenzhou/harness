@@ -1,5 +1,5 @@
 import { PassThrough } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { TerminalAdapter } from '@harness/adapters/terminal.js';
 import { EventBus } from '@harness/bus/eventBus.js';
@@ -37,7 +37,7 @@ async function makeAdapter() {
     streamBus,
     threadBinding: { kind: 'single', threadId: tid },
   });
-  return { adapter, bus, streamBus, threadId: tid, turnId, captured };
+  return { adapter, bus, streamBus, threadId: tid, turnId, input, captured };
 }
 
 function makeReplyEvent(threadId: ReturnType<typeof newThreadId>, text: string): HarnessEvent {
@@ -149,5 +149,37 @@ describe('TerminalAdapter streaming', () => {
     await new Promise((r) => setImmediate(r));
     expect(captured.join('')).toContain('─');
     await adapter.stop();
+  });
+
+  it('does not prompt after piped stdin closes while final events still render', async () => {
+    const { adapter, bus, threadId, input, captured } = await makeAdapter();
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // Mirrors `pnpm dev < prompt.txt`: stdin reaches EOF before the
+      // async runner publishes its final reply / turn_complete.
+      input.end();
+      await new Promise((r) => setImmediate(r));
+
+      bus.publish(makeReplyEvent(threadId, 'final after eof'));
+      bus.publish({
+        id: newEventId(),
+        threadId,
+        kind: 'turn_complete',
+        createdAt: new Date().toISOString(),
+        payload: { status: 'completed' },
+      } as HarnessEvent);
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      const out = captured.join('');
+      expect(out).toContain('final after eof');
+      expect(spy).not.toHaveBeenCalledWith(
+        expect.stringContaining('[eventbus] subscriber error'),
+        expect.anything(),
+      );
+    } finally {
+      spy.mockRestore();
+      await adapter.stop();
+    }
   });
 });

@@ -27,6 +27,12 @@ subtask_complete round-trip) and almost always clearer.
 - **Verification.** "Did the implementation actually satisfy the
   spec?" runs cleaner as a separate child whose entire job is the
   check.
+- **Quality review after implementation.** When code has already
+  landed and the remaining question is "is this implementation good
+  and scoped?", spawn a `role: 'reviewer'` child or review inline.
+  For complex/shared/runtime/security/provider changes, prefer the
+  independent reviewer so its verdict is not anchored on the
+  implementer's explanation.
 
 ## Reasons to delegate to a coding agent (`provider: 'cc'` / `'codex'`)
 

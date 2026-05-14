@@ -132,6 +132,15 @@ export interface SubagentPoolDeps {
    * involve coding-agent providers.
    */
   providerUsageRegistry?: ProviderUsageRegistry;
+  /**
+   * Forwarded to every child `AgentRunner` so subagent threads also
+   * dump their `SamplingRequest`s into the configured diag sinks.
+   * Without this plumbing, `<storeRoot>/<childThreadId>/prompts/`
+   * stays empty even when the root runner is dumping prompts —
+   * losing visibility into what was actually sent to coding-agent
+   * CLIs (cc / codex) on every internal turn.
+   */
+  onPromptBuilt?: ConstructorParameters<typeof AgentRunner>[0]['onPromptBuilt'];
 }
 
 /** Per-child budget. `maxTokens` is the cumulative prompt+completion
@@ -317,6 +326,9 @@ export class SubagentPool {
       ...(this.deps.tokenBudget !== undefined ? { tokenBudget: this.deps.tokenBudget } : {}),
       ...(req.contextRefs !== undefined && req.contextRefs.length > 0
         ? { contextRefs: req.contextRefs }
+        : {}),
+      ...(this.deps.onPromptBuilt !== undefined
+        ? { onPromptBuilt: this.deps.onPromptBuilt }
         : {}),
       runtimeBudgetSnapshot: () => this.runtimeBudgetSnapshotFor(childThreadId),
       onSpawn: (inner) => this.spawn(inner),

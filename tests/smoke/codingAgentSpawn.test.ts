@@ -78,6 +78,38 @@ function setupFakeCc(workdir: string, sessionId: string, replyText: string): str
   return launcher;
 }
 
+/**
+ * Fake codex binary that emits the empirically-observed `exec --json`
+ * event sequence: thread.started → turn.started → optional internal
+ * items (file_change, reasoning) → final agent_message → turn.completed.
+ * Exercises the codex branch added in CodingAgentProvider's pump.
+ */
+function setupFakeCodex(workdir: string, threadId: string, replyText: string): string {
+  const argvLog = join(workdir, 'last-argv.json');
+  const script = join(workdir, 'fake-codex.cjs');
+  writeFileSync(
+    script,
+    [
+      `const fs = require('fs');`,
+      `fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));`,
+      `process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: ${JSON.stringify(threadId)} }) + '\\n');`,
+      `process.stdout.write(JSON.stringify({ type: 'turn.started' }) + '\\n');`,
+      // Intermediate agent_message — should be superseded by the later one.
+      `process.stdout.write(JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'I will do the task.' } }) + '\\n');`,
+      // Internal file_change item — must be traced, but not surfaced as reply.
+      `process.stdout.write(JSON.stringify({ type: 'item.started', item: { id: 'item_1', type: 'file_change', status: 'in_progress' } }) + '\\n');`,
+      `process.stdout.write(JSON.stringify({ type: 'item.completed', item: { id: 'item_1', type: 'file_change', status: 'completed' } }) + '\\n');`,
+      // Final agent_message — the one we expect as the reply.
+      `process.stdout.write(JSON.stringify({ type: 'item.completed', item: { id: 'item_2', type: 'agent_message', text: ${JSON.stringify(replyText)} } }) + '\\n');`,
+      `process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 42, cached_input_tokens: 17, output_tokens: 8, reasoning_output_tokens: 0 } }) + '\\n');`,
+    ].join('\n'),
+  );
+  const launcher = join(workdir, 'codex-launcher.sh');
+  writeFileSync(launcher, `#!/bin/sh\nexec ${process.execPath} ${script} "$@"\n`);
+  chmodSync(launcher, 0o755);
+  return launcher;
+}
+
 async function settle(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
@@ -317,6 +349,73 @@ describe.skipIf(process.platform === 'win32')('smoke: spawn(provider:"cc")', () 
     expect(
       (spawnReq.payload as { permissionMode?: string }).permissionMode,
     ).toBe('bypass');
+  }, 30_000);
+
+  it('round-trips codex thread_id + final agent_message through the codex factory', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'harness-codex-'));
+    const worktree = join(tmp, 'wt');
+    mkdirSync(worktree);
+    const THREAD = '019e2426-b4e1-7862-b72c-067ca5a3e4c8';
+    const REPLY = 'Done. Created src/foo.ts.';
+    const launcher = setupFakeCodex(tmp, THREAD, REPLY);
+
+    const runtime = await bootstrap({
+      provider: new ScriptedProvider(
+        spawnScript({
+          toolCallId: 'tc_codex_evt',
+          task: 'do x',
+          cwd: worktree,
+          provider: 'codex',
+        }),
+      ),
+      systemPrompt: 'sys',
+      codingAgents: { codex: { binaryPath: launcher } },
+    });
+    const seed = await runtime.store.append({
+      threadId: runtime.rootThreadId,
+      kind: 'user_turn_start',
+      payload: { text: 'go' },
+    });
+    runtime.bus.publish(seed);
+    await waitForSubtask(runtime);
+
+    const events = await runtime.store.readAll(runtime.rootThreadId);
+    const subtask = events.find((e) => e.kind === 'subtask_complete');
+    if (!subtask) throw new Error('subtask_complete event missing');
+    const payload = subtask.payload as {
+      status: string;
+      summary?: string;
+      providerSessionId?: string;
+    };
+    expect(payload.status).toBe('completed');
+    // Final agent_message wins — the intermediate "I will do the task." is dropped.
+    expect(payload.summary).toBe(REPLY);
+    expect(payload.providerSessionId).toBe(THREAD);
+
+    // Usage from turn.completed.usage flows into the registry.
+    const snap = runtime.providerUsageRegistry.get('codex');
+    if (!snap) throw new Error('codex usage snapshot missing');
+    expect(snap.lastSessionId).toBe(THREAD);
+    expect(snap.lastTokens).toEqual({
+      inputTokens: 42,
+      outputTokens: 8,
+      cacheReadInputTokens: 17,
+    });
+
+    const argv = JSON.parse(readFileSync(join(tmp, 'last-argv.json'), 'utf8')) as string[];
+    expect(argv.slice(0, 2)).toEqual(['exec', '--json']);
+    expect(argv[2]).toContain('sys');
+    expect(argv[2]).toContain('do x');
+
+    const spawnReq = events.find((e) => e.kind === 'spawn_request');
+    if (!spawnReq) throw new Error('spawn_request event missing');
+    const childThreadId = (spawnReq.payload as { childThreadId: string }).childThreadId;
+    const childEvents = await runtime.store.readAll(childThreadId as never);
+    const reasoning = childEvents.find((e) => e.kind === 'reasoning');
+    if (!reasoning) throw new Error('codex reasoning event missing');
+    expect((reasoning.payload as { text?: string }).text).toContain(
+      '[codex item.completed file_change completed]',
+    );
   }, 30_000);
 
   it('rejects spawn(provider:"cc") with no cwd via SpawnRefused', async () => {

@@ -94,6 +94,7 @@ async function main(): Promise<void> {
   const searchBackend = buildSearchBackend();
   const compactionTrigger = buildCompactionTrigger();
   const useSubagentCompactor = process.env['HARNESS_COMPACTOR'] === 'subagent';
+  const codingAgents = buildCodingAgentsConfig();
 
   const runtime = await bootstrap({
     provider,
@@ -105,6 +106,7 @@ async function main(): Promise<void> {
     ...(searchBackend !== undefined ? { searchBackend } : {}),
     ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
     ...(useSubagentCompactor ? { useSubagentCompactor: true } : {}),
+    ...(codingAgents !== undefined ? { codingAgents } : {}),
     ...(Object.keys(providerFactories).length > 0 ? { providerFactories } : {}),
     ...(providerSpec.modelInfo !== undefined ? { runtimeModelInfo: providerSpec.modelInfo } : {}),
     ...(Object.keys(providerFactoryModelInfo).length > 0 ? { providerFactoryModelInfo } : {}),
@@ -513,6 +515,32 @@ function envNumber(key: string): number | undefined {
   if (raw === undefined || raw === '') return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Read `HARNESS_CODING_AGENTS` and translate it into the `codingAgents`
+ * bootstrap option. Comma-separated list of {`cc`, `codex`}. Each named
+ * agent gets a default-options factory registration; agents not listed
+ * fall back to the bootstrap default (`cc: true`, `codex: false`).
+ *
+ * Unset or empty → return undefined so bootstrap's defaults apply.
+ * Examples:
+ *   HARNESS_CODING_AGENTS=cc,codex   → enable both
+ *   HARNESS_CODING_AGENTS=codex      → enable codex only (disable cc)
+ */
+function buildCodingAgentsConfig(): { cc?: boolean; codex?: boolean } | undefined {
+  const raw = process.env['HARNESS_CODING_AGENTS'];
+  if (raw === undefined || raw.trim().length === 0) return undefined;
+  const wanted = new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.length > 0),
+  );
+  return {
+    cc: wanted.has('cc'),
+    codex: wanted.has('codex'),
+  };
 }
 
 function buildCompactionTrigger(): { thresholdTokens: number; cooldownSamples?: number } | undefined {

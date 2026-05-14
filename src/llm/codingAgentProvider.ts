@@ -161,6 +161,42 @@ interface CcStreamEvent {
   [k: string]: unknown;
 }
 
+/**
+ * Codex `exec --json` event shapes (empirically observed against
+ * codex-cli 0.128). Codex emits a different top-level event vocabulary
+ * from cc, so the pump dispatches per `this.opts.kind`. Internal items
+ * (`file_change`, `tool_call`, `tool_output`, `reasoning`, …) are
+ * surfaced as harness reasoning trace rather than reply text.
+ */
+interface CodexThreadStarted {
+  type: 'thread.started';
+  thread_id?: string;
+}
+interface CodexTurnCompleted {
+  type: 'turn.completed';
+  usage?: {
+    input_tokens?: number;
+    cached_input_tokens?: number;
+    output_tokens?: number;
+    reasoning_output_tokens?: number;
+  };
+}
+interface CodexItem {
+  id?: string;
+  type?: string;
+  text?: string;
+  status?: string;
+  [k: string]: unknown;
+}
+interface CodexItemEnvelope {
+  type: 'item.started' | 'item.completed';
+  item?: CodexItem;
+}
+interface CodexStreamEvent {
+  type: string;
+  [k: string]: unknown;
+}
+
 function lastUserText(tail: ProjectedItem[]): string {
   for (let i = tail.length - 1; i >= 0; i--) {
     const item = tail[i];
@@ -232,6 +268,7 @@ export class CodingAgentProvider implements LlmProvider {
     let finalText: string | undefined;
     let endEmitted = false;
     let stderrBuf = '';
+    let pendingCodexAgentMessage: string | undefined;
     /**
      * Latest "blocked" rate-limit event captured during this run.
      * Tracked separately from `pushUsagePatch` because it drives a
@@ -254,6 +291,79 @@ export class CodingAgentProvider implements LlmProvider {
         }
         switch (ev.kind) {
           case 'json': {
+            if (this.opts.kind === 'codex') {
+              const ce = ev.value as CodexStreamEvent;
+              if (ce.type === 'thread.started') {
+                const thrId = (ce as unknown as CodexThreadStarted).thread_id;
+                if (typeof thrId === 'string') {
+                  this.lastSessionId = thrId;
+                  this.pushUsagePatch({ lastSessionId: thrId });
+                }
+                break;
+              }
+              if (ce.type === 'turn.started') break;
+              if (ce.type === 'item.started') {
+                const item = (ce as unknown as CodexItemEnvelope).item;
+                const trace = formatCodexItemTrace('item.started', item);
+                if (trace !== undefined) yield { kind: 'reasoning_delta', text: trace };
+                break;
+              }
+              if (ce.type === 'item.completed') {
+                const item = (ce as unknown as CodexItemEnvelope).item;
+                if (
+                  item !== undefined &&
+                  item.type === 'agent_message' &&
+                  typeof item.text === 'string'
+                ) {
+                  if (pendingCodexAgentMessage !== undefined) {
+                    yield {
+                      kind: 'reasoning_delta',
+                      text: `[codex agent_message] ${pendingCodexAgentMessage}\n`,
+                    };
+                  }
+                  // Buffer the latest agent_message; emit at turn.completed.
+                  // Mirrors cc's "intermediate assistants are dropped; only
+                  // the final reply lands as text_delta".
+                  pendingCodexAgentMessage = item.text;
+                  finalText = item.text;
+                } else {
+                  const trace = formatCodexItemTrace('item.completed', item);
+                  if (trace !== undefined) yield { kind: 'reasoning_delta', text: trace };
+                }
+                break;
+              }
+              if (ce.type === 'turn.completed') {
+                const tc = ce as unknown as CodexTurnCompleted;
+                if (tc.usage !== undefined) {
+                  const inT = tc.usage.input_tokens ?? 0;
+                  const cachedT = tc.usage.cached_input_tokens ?? 0;
+                  const outT = tc.usage.output_tokens ?? 0;
+                  this.pushUsagePatch({
+                    lastTokens: {
+                      inputTokens: inT,
+                      outputTokens: outT,
+                      cacheReadInputTokens: cachedT,
+                    },
+                  });
+                  yield {
+                    kind: 'usage',
+                    tokens: {
+                      promptTokens: inT,
+                      cachedPromptTokens: cachedT,
+                      completionTokens: outT,
+                    },
+                  };
+                }
+                if (finalText !== undefined) {
+                  yield { kind: 'text_delta', text: finalText, channel: 'reply' };
+                }
+                yield { kind: 'end', stopReason: 'end_turn' };
+                endEmitted = true;
+                break;
+              }
+              // Unknown event: drop
+              break;
+            }
             const e = ev.value as CcStreamEvent;
             if (e.type === 'system' && (e as unknown as CcSystemInit).subtype === 'init') {
               const init = e as unknown as CcSystemInit;
@@ -393,10 +503,7 @@ export class CodingAgentProvider implements LlmProvider {
       }
       return args;
     }
-    // codex: same shape, different flags. Full event/usage parity lands
-    // later; invocation permissions are wired now so headless coding
-    // spawns can actually modify owned worktrees.
-    const args: string[] = ['exec', '--json', prompt];
+    const args: string[] = ['exec', '--json', codexPrompt(prompt, request)];
     if (this.opts.providerSessionId !== undefined) {
       args.push('--session', this.opts.providerSessionId);
     }
@@ -411,6 +518,44 @@ export class CodingAgentProvider implements LlmProvider {
     }
     return args;
   }
+}
+
+function codexPrompt(prompt: string, request: SamplingRequest): string {
+  const sys = request.prefix.systemPrompt.trim();
+  if (sys.length === 0) return prompt;
+  return `${sys}\n\n# Task\n${prompt}`;
+}
+
+function formatCodexItemTrace(
+  eventType: 'item.started' | 'item.completed',
+  item: CodexItem | undefined,
+): string | undefined {
+  if (item === undefined) return undefined;
+  const itemType = typeof item.type === 'string' ? item.type : 'unknown';
+  if (itemType === 'agent_message') return undefined;
+  const status = typeof item.status === 'string' ? ` ${item.status}` : '';
+  const detail = codexItemDetail(item);
+  return `[codex ${eventType} ${itemType}${status}]${detail.length > 0 ? ` ${detail}` : ''}\n`;
+}
+
+function codexItemDetail(item: CodexItem): string {
+  const direct = ['text', 'title', 'command', 'cmd', 'output', 'diff', 'path']
+    .map((key) => item[key])
+    .filter((v): v is string => typeof v === 'string' && v.length > 0)
+    .join('\n');
+  if (direct.length > 0) return truncateForTrace(direct);
+  const copy: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(item)) {
+    if (key === 'id' || key === 'type' || key === 'status') continue;
+    copy[key] = value;
+  }
+  if (Object.keys(copy).length === 0) return '';
+  return truncateForTrace(JSON.stringify(copy));
+}
+
+function truncateForTrace(text: string): string {
+  const max = 2_000;
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 type PumpEvent =

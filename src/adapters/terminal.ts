@@ -100,6 +100,13 @@ export class TerminalAdapter implements Adapter {
   private sigintHandler: (() => void) | undefined;
   private readonly shutdownPromise: Promise<void>;
   private resolveShutdown!: () => void;
+  /**
+   * Piped stdin can hit EOF while a turn is still active. In that state
+   * readline closes itself, but the adapter must keep rendering bus
+   * output until the runner finishes; it just must not prompt again.
+   */
+  private inputClosed = false;
+  private stopped = false;
 
   constructor(opts: TerminalAdapterOptions) {
     this.store = opts.store;
@@ -128,6 +135,8 @@ export class TerminalAdapter implements Adapter {
     this.streamBus = opts.streamBus;
     this.router = opts.router;
     this.threadId = opts.threadBinding.threadId;
+    this.inputClosed = false;
+    this.stopped = false;
 
     this.attachSubscriptions();
 
@@ -168,6 +177,10 @@ export class TerminalAdapter implements Adapter {
       this.rl.on('line', (line) => {
         void this.onLine(line);
       });
+      this.rl.on('close', () => {
+        this.inputClosed = true;
+        this.rl = undefined;
+      });
       // In terminal:true mode on a real TTY, readline puts stdin into
       // raw mode and surfaces Ctrl-C as a 'SIGINT' event on the rl
       // interface — but on PassThrough inputs (tests) it doesn't, so
@@ -178,6 +191,8 @@ export class TerminalAdapter implements Adapter {
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
     this.subscription?.unsubscribe();
     this.streamSubscription?.unsubscribe();
     if (this.sigintHandler) {
@@ -188,7 +203,9 @@ export class TerminalAdapter implements Adapter {
       this.rawReader.stop();
       this.rawReader = undefined;
     }
-    this.rl?.close();
+    const rl = this.rl;
+    this.rl = undefined;
+    rl?.close();
     this.resolveShutdown();
   }
 
@@ -217,6 +234,7 @@ export class TerminalAdapter implements Adapter {
   }
 
   private writePrompt(): void {
+    if (this.stopped || this.inputClosed) return;
     if (this.rawReader) {
       this.rawReader.refresh();
     } else if (this.rl) {

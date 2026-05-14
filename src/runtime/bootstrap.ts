@@ -280,6 +280,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<Runtime> {
     ...(Object.keys(providerFactories).length > 0
       ? { providerFactories }
       : {}),
+    ...(onPromptBuilt !== undefined ? { onPromptBuilt } : {}),
     providerUsageRegistry,
   });
 
